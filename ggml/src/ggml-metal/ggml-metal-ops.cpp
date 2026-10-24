@@ -4003,8 +4003,25 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 
+        // MQA heads-as-queries (GGML_METAL_FA_MQA=4|8, deepseek41 sparse prefill: 64 heads, 1 KV head, dk = dv = 512):
+        // a threadgroup runs nqptg heads of one query row, so the row's sparse index list and every K/V load are
+        // shared by nqptg heads instead of being re-read per head (see FC_flash_attn_ext_vec_mqa)
+        bool use_mqa = false;
+        {
+            static const int env_mqa = getenv("GGML_METAL_FA_MQA") ? atoi(getenv("GGML_METAL_FA_MQA")) : 0;
+            if (use_sparse && (env_mqa == 4 || env_mqa == 8) && ne01 > 32 && ne12 == 1 && ne13 == 1 && ne03 == 1 &&
+                    ne32 == 1 && !has_bias && ne02 % env_mqa == 0 && ne00 == 512 && ne20 == 512 &&
+                    op->src[1]->type == GGML_TYPE_F16 && !use_kv_f16) {
+                use_mqa = true;
+                nqptg   = env_mqa;
+                cfg.NE  = 1;
+                nsg     = env_mqa == 8 ? 1 : 2;
+                nwg     = 1;
+            }
+        }
+
         // fall back to baseline (Q=1) if the tuned config exceeds threadgroup memory
-        if (fa_vec_smem(nsg, nqptg) > props_dev->max_theadgroup_memory_size) {
+        if (!use_mqa && fa_vec_smem(nsg, nqptg) > props_dev->max_theadgroup_memory_size) {
             cfg   = ggml_metal_tuning::fa_vec_baseline_cfg((int) ne00, (int) ne20);
             nqptg = cfg.Q;  // = 1
         }
@@ -4048,7 +4065,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.n_kv_max_padded =*/ n_kv_max_padded,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, use_mqa, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4072,7 +4089,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, use_mqa ? ne01 : (ne01 + nqptg - 1)/nqptg, use_mqa ? ne02/nqptg : (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
         } else {
             // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -4085,7 +4102,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, use_mqa ? ne01 : (ne01 + nqptg - 1)/nqptg, use_mqa ? ne02/nqptg : (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
 
             // sync the 2 kernels
             ggml_metal_op_concurrency_reset(ctx);
