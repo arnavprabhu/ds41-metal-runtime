@@ -176,6 +176,8 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;
         moe_cache_lru lru;
+        std::vector<bool> filled; // slots ever fully uploaded, independent of LRU eviction
+        size_t filled_bytes = 0;
     };
 
     struct layer {
@@ -345,6 +347,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            g.filled.assign(g.n_slots, false);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
@@ -430,7 +433,11 @@ struct llama_moe_cache::impl {
                 if (!d.buf) {
                     throw std::runtime_error("failed to allocate the MoE cache buffers");
                 }
-                ggml_backend_buffer_clear(d.buf.get(), 0);
+                const is_shared_fn is_shared = get_is_shared(d.backend);
+                // Shared Metal slots are written completely before their GPU map is published.
+                if (is_shared == nullptr || !is_shared(d.buf.get())) {
+                    ggml_backend_buffer_clear(d.buf.get(), 0);
+                }
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
@@ -478,6 +485,7 @@ struct llama_moe_cache::impl {
                     ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, n_cached_layers, (int) max_batch);
             }
         }
+        log_arena("startup");
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
             fprintf(stderr, "llama_moe_cache: group %zu: %2zu layers, %s, %5d slots (%.1f%%, %.1f slots/layer)\n", ig,
@@ -501,7 +509,21 @@ struct llama_moe_cache::impl {
         return devices[groups[layers[il].ig].id].backend;
     }
 
+    void log_arena(const char * phase) const {
+        size_t allocated = 0;
+        size_t filled = 0;
+        for (const device & d : devices) {
+            allocated += d.buf_size;
+        }
+        for (const group & g : groups) {
+            filled += g.filled_bytes;
+        }
+        fprintf(stderr, "llama_moe_cache: arena %s: allocated = %zu bytes, ever filled = %zu bytes (%.2f / %.2f MiB)\n",
+            phase, allocated, filled, filled/1024.0/1024.0, allocated/1024.0/1024.0);
+    }
+
     ~impl() {
+        log_arena("teardown");
         log_stats();
     }
 
@@ -644,6 +666,17 @@ struct llama_moe_cache::impl {
             }
             if (!jobs.empty()) {
                 llama_exps_prefetch::upload(jobs);
+            }
+        }
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * w : l.experts) {
+            slot_bytes += w->nb[2];
+        }
+        for (const auto & fill : fills) {
+            GGML_ASSERT(fill.slot >= 0 && fill.slot < g.n_slots);
+            if (!g.filled[fill.slot]) {
+                g.filled[fill.slot] = true;
+                g.filled_bytes += slot_bytes;
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
