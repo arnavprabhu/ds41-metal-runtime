@@ -144,7 +144,11 @@ kernel void kernel_unary_impl(
         }
 
         if (FC_OP == OP_UNARY_NUM_SOFTPLUS) {
-            dst_ptr[i0] = (T) select(log(1 + exp(x)), x, x > 20);
+            // max(x, 0) + log1p(exp(-|x|)): log(1 + exp(x)) rounds to 0 below x ~ -16.6 in F32. MSL has no log1p:
+            // short series for small u (no 1 + u rounding), plain log above
+            const TC u = exp(-fabs(x));
+            const TC p = u*(1.0f - u*(0.5f - u*(1.0f/3.0f - u*(0.25f - u*(0.2f - u*(1.0f/6.0f))))));
+            dst_ptr[i0] = (T) (fmax(x, (TC) 0.0f) + select(log(1.0f + u), p, u < 0.0625f));
         }
 
         if (FC_OP == OP_UNARY_NUM_EXPM1) {
