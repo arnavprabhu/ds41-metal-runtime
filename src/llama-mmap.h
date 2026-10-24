@@ -49,8 +49,9 @@ struct llama_mmap {
     using ranges = std::vector<std::pair<size_t, size_t>>;
 
     llama_mmap(const llama_mmap &) = delete;
+    // lazy_ranges are read on demand (no prefetch, random access); no_prefetch ranges are only left out of the prefetch
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {}, const ranges & no_prefetch = {});
     ~llama_mmap();
 
     size_t size() const;

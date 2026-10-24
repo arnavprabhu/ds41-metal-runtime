@@ -73,6 +73,7 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
     std::set<std::string> consumed; // weights used at load time, see consume_weight_data
+    std::set<uint32_t>    sidecars; // file indices opened by add_sidecar
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;

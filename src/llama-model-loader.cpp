@@ -943,6 +943,7 @@ void llama_model_loader::add_sidecar(const std::string & path, const std::string
     files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
     contexts.emplace_back(ctx);
     const uint16_t idx = (uint16_t) (files.size() - 1);
+    sidecars.insert(idx);
 
     int n_added = 0;
     for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
@@ -1373,6 +1374,33 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_cpu_buffer_type();
         }
 
+        // deepseek41 routed experts (~132 GB) must not be wrapped by a device buffer made from the mmap (Metal pins
+        // what it wraps: OOM / SIGBUS on 64 GB machines); keep them on the CPU (LLAMA_DSV41_EXPS_ON_DEVICE=1 allows it)
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && use_mmap && !ggml_backend_buft_is_host(buft) &&
+                (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+                 tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
+            static const bool allow = [] {
+                const char * v = getenv("LLAMA_DSV41_EXPS_ON_DEVICE");
+                return v && atoi(v) != 0;
+            }();
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_dev_props props = {};
+            if (dev) {
+                ggml_backend_dev_get_props(dev, &props);
+            }
+            if (!allow && dev && props.caps.buffer_from_host_ptr && buft == ggml_backend_dev_buffer_type(dev)) {
+                static std::once_flag once;
+                std::call_once(once, [&] {
+                    LLAMA_LOG_WARN("llama_model_loader: deepseek41 routed experts stay in host memory with mmap (not mapped into %s); "
+                            "use -ot 'ffn_(gate|up|down)_exps=CPU' to make this explicit\n", ggml_backend_buft_name(buft));
+                });
+                buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                if (!buft) {
+                    throw std::runtime_error(format("failed to find a CPU buffer type for tensor %s", tn.str().c_str()));
+                }
+            }
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1517,6 +1545,28 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
+        // DeepSeek-V4.1 memory policy: the routed experts (~132 GB) and the Engram sidecar (~110 GB) are read on
+        // demand; asking the kernel for all of it at load (WILLNEED) only thrashes the page cache
+        // (LLAMA_PREFETCH_EXPS=1 restores the full prefetch)
+        std::map<uint32_t, llama_mmap::ranges> no_prefetch;
+        const char * env_pf = getenv("LLAMA_PREFETCH_EXPS");
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && !(env_pf && atoi(env_pf) != 0)) {
+            static const std::regex exps_re("ffn_(gate|up|down|gate_up)_exps");
+            size_t n_skip = 0;
+            for (const auto & [name, w] : weights_map) {
+                if (sidecars.count(w.idx) || std::regex_search(name, exps_re)) {
+                    no_prefetch[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+                    n_skip += ggml_nbytes(w.tensor);
+                }
+            }
+            for (uint32_t idx : sidecars) {
+                no_prefetch[idx].emplace_back(0, files.at(idx)->size());
+            }
+            if (prefetch && use_mmap) {
+                LLAMA_LOG_INFO("%s: not prefetching %.2f GiB of routed experts and Engram sidecar tensors\n", __func__, n_skip/1024.0/1024.0/1024.0);
+            }
+        }
+
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {
@@ -1536,7 +1586,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), no_prefetch[idx]);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
