@@ -32,11 +32,18 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // the graph about to be computed: picks up the next-layer prediction tensors (LLAMA_DSV41_MOE_PREDICT=1)
+    void set_graph(ggml_cgraph * gf);
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// LLAMA_DSV41_MOE_PREDICT=1: decode graphs compute layer il+1's router on layer il's FFN input, and the cache
+// prefetches the predicted misses in the background (residency only, outputs unchanged)
+bool llama_moe_cache_predict_enabled();
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;

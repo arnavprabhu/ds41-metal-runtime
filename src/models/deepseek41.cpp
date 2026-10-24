@@ -1,3 +1,4 @@
+#include "llama-moe-cache.h"
 #include "models.h"
 #include "llama-impl.h"
 
@@ -1139,6 +1140,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         cur = build_hc_pre(inpL, attn_pre, il);
         cb(cur, "hc_ffn_pre", il);
+        ggml_tensor * ffn_in = cur;
 
         ggml_build_forward_expand(gf, residual);
         ggml_build_forward_expand(gf, post);
@@ -1159,6 +1161,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
         if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
             exp_probs_b = layer.ffn_exp_probs_b_vl;
+        }
+
+        // decode-only next-layer expert predictor for the MoE slot arena (LLAMA_DSV41_MOE_PREDICT=1): layer il+1's router
+        // (its ffn_norm, gate_inp, sqrt-softplus and selection bias) applied to this layer's FFN input. The cache reads it
+        // after this layer's ids and prefetches the predicted misses while the GPU computes; no output depends on it.
+        if (llama_moe_cache_predict_enabled() && n_tokens == 1 && il + 1 < n_layer) {
+            const auto & nl = model.layers[il + 1];
+            if (nl.ffn_gate_inp && nl.ffn_exp_probs_b && nl.ffn_norm && nl.ffn_gate_exps) {
+                ggml_tensor * px = build_norm(ffn_in, nl.ffn_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * pl = ggml_mul_mat(ctx0, nl.ffn_gate_inp, px);
+                ggml_prec_set_acc(pl, GGML_PREC_F32);
+                ggml_tensor * pp = ggml_add(ctx0, ggml_sqrt(ctx0, ggml_softplus(ctx0, pl)), nl.ffn_exp_probs_b);
+                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pp, hparams.n_expert_used()));
+                ggml_format_name(pred, "dsv41_moe_pred-%d", il + 1);
+                ggml_set_output(pred);
+                ggml_build_forward_expand(gf, pred);
+            }
         }
 
         // the reference normalizes only when it routes to more than one expert

@@ -9,7 +9,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -232,6 +235,154 @@ struct llama_moe_cache::impl {
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
+
+    // next-layer prediction (LLAMA_DSV41_MOE_PREDICT=1): the graph computes layer il+1's router on layer il's FFN
+    // input (tensors named dsv41_moe_pred-<il+1>); after layer il's own fill, the predicted misses of layer il+1 are
+    // pread into free slots on a background thread while the GPU computes layer il. Residency only, same bytes.
+    std::vector<ggml_tensor *> pred;  // [n_layer]
+    std::thread pred_th;
+    bool        pred_busy  = false;
+    int32_t     pred_layer = -1;
+    std::vector<int32_t> pred_ids;
+    std::vector<int32_t> pred_fill_experts;
+    std::vector<moe_cache_lru::fill> pred_fills;
+    struct pred_stats {
+        size_t launched = 0, predicted = 0, prefetched = 0, prefetched_used = 0, pred_in_actual = 0, actual = 0, bytes = 0;
+        uint64_t wait_us = 0;
+    } pst;
+
+    void pred_wait() {
+        if (pred_busy) {
+            const auto t0 = std::chrono::steady_clock::now();
+            pred_th.join();
+            pst.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            pred_busy = false;
+        }
+    }
+
+    void set_graph(ggml_cgraph * gf) {
+        if (!llama_moe_cache_predict_enabled()) {
+            return;
+        }
+        pred.assign(layers.size(), nullptr);
+        static const char prefix[] = "dsv41_moe_pred-";
+        const int n = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n; ++i) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (strncmp(t->name, prefix, sizeof(prefix) - 1) == 0) {
+                const int il = atoi(t->name + sizeof(prefix) - 1);
+                if (il >= 0 && il < (int) pred.size()) {
+                    pred[il] = t;
+                }
+            }
+        }
+    }
+
+    // called by copy(il) after layer il's own fill: prefetch layer il+1's predicted misses in the background
+    void pred_launch(ggml_backend_t backend, int32_t il) {
+        const int32_t nl = il + 1;
+        if (nl >= (int32_t) pred.size() || pred[nl] == nullptr || layers[nl].ig < 0) {
+            return;
+        }
+        const layer & L = layers[nl];
+        group & G = groups[L.ig];
+        if (devices[G.id].backend != backend) {
+            return;
+        }
+        const is_shared_fn is_shared = llama_exps_prefetch::upload_enabled() ? get_is_shared(backend) : nullptr;
+        if (!is_shared) {
+            return;
+        }
+        std::vector<int>      fds(L.experts.size());
+        std::vector<uint64_t> offs(L.experts.size());
+        for (size_t ip = 0; ip < L.experts.size(); ++ip) {
+            const ggml_tensor * w    = L.experts[ip];
+            const ggml_tensor * bank = G.banks[ip];
+            if (bank->buffer == nullptr || bank->data == nullptr || !is_shared(bank->buffer) ||
+                    !llama_exps_prefetch::lookup(w->data, ggml_nbytes(w), &fds[ip], &offs[ip])) {
+                return;
+            }
+        }
+        pred_ids.resize(ggml_nelements(pred[nl]));
+        ggml_backend_tensor_get(pred[nl], pred_ids.data(), 0, ggml_nbytes(pred[nl]));
+        for (int32_t e : pred_ids) {
+            if (e < 0 || e >= G.lru.n_expert) {
+                return;
+            }
+        }
+        size_t n_hit = 0;
+        if (!G.lru.plan(nl, pred_ids.data(), pred_ids.size(), pred_fills, n_hit)) {
+            return;
+        }
+        // the experts layer il is about to read must still be resident (victims come from the LRU head)
+        {
+            const group & Gc = groups[layers[il].ig];
+            for (int32_t e : ids) {
+                GGML_ASSERT(Gc.lru.slot_map[il][e] >= 0 && "MoE prediction evicted an expert of the running layer");
+            }
+        }
+        pst.launched++;
+        pst.predicted  += pred_ids.size();
+        pst.prefetched += pred_fills.size();
+        pred_layer = nl;
+        pred_fill_experts.clear();
+        if (pred_fills.empty()) {
+            return;
+        }
+        std::vector<llama_exps_prefetch::upload_job> pj;
+        size_t slot_bytes = 0;
+        for (size_t ip = 0; ip < L.experts.size(); ++ip) {
+            const ggml_tensor * w    = L.experts[ip];
+            ggml_tensor       * bank = G.banks[ip];
+            const size_t expert_size = w->nb[2];
+            slot_bytes += expert_size;
+            for (size_t i = 0; i < pred_fills.size();) {
+                size_t n = 1;
+                while (i + n < pred_fills.size() && pred_fills[i + n].expert == pred_fills[i].expert + (int32_t) n && pred_fills[i + n].slot == pred_fills[i].slot + (int32_t) n) {
+                    n++;
+                }
+                GGML_ASSERT(pred_fills[i].slot + (int64_t) n <= bank->ne[2]);
+                const size_t src_off = (size_t) pred_fills[i].expert*expert_size;
+                const size_t dst_off = (size_t) pred_fills[i].slot*expert_size;
+                llama_exps_prefetch::add_upload(pj, fds[ip], offs[ip] + src_off, (char *) bank->data + dst_off, n*expert_size, (const char *) w->data + src_off);
+                pst.bytes += n*expert_size;
+                i += n;
+            }
+        }
+        for (const auto & f : pred_fills) {
+            pred_fill_experts.push_back(f.expert);
+            if (!G.filled[f.slot]) {
+                G.filled[f.slot] = true;
+                G.filled_bytes += slot_bytes;
+            }
+        }
+        pred_busy = true;
+        pred_th = std::thread([jobs = std::move(pj)]() {
+            llama_exps_prefetch::upload_bg(jobs);
+        });
+    }
+
+    // called by copy(il) once layer il's real ids are known: wait for its prefetch and score the prediction
+    void pred_resolve(int32_t il) {
+        pred_wait();
+        if (pred_layer != il) {
+            return;
+        }
+        pred_layer = -1;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const int32_t e = ids[i];
+            bool dup = false;
+            for (size_t j = 0; j < i && !dup; ++j) {
+                dup = ids[j] == e;
+            }
+            if (dup) {
+                continue;
+            }
+            pst.actual++;
+            pst.pred_in_actual  += std::find(pred_ids.begin(), pred_ids.end(), e) != pred_ids.end();
+            pst.prefetched_used += std::find(pred_fill_experts.begin(), pred_fill_experts.end(), e) != pred_fill_experts.end();
+        }
+    }
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -523,8 +674,16 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        pred_wait();
         log_arena("teardown");
         log_stats();
+        if (pst.launched > 0) {
+            fprintf(stderr, "llama_moe_cache: predict: layers = %zu, predicted = %zu, prefetched = %zu (%.2f MiB), "
+                "prediction recall = %.2f%%, prefetched used = %.2f%%, prefetch wait = %.2f ms total\n",
+                pst.launched, pst.predicted, pst.prefetched, pst.bytes/1024.0/1024.0,
+                pst.actual ? 100.0*pst.pred_in_actual/pst.actual : 0.0,
+                pst.prefetched ? 100.0*pst.prefetched_used/pst.prefetched : 0.0, pst.wait_us/1000.0);
+        }
     }
 
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
@@ -620,6 +779,9 @@ struct llama_moe_cache::impl {
         ggml_backend_synchronize(backend);
         const auto t1 = std::chrono::steady_clock::now();
 
+        // the background prefetch of this layer's predicted misses must land before the plan and the GPU read
+        pred_resolve(il);
+
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
@@ -695,6 +857,10 @@ struct llama_moe_cache::impl {
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
 
+        if (llama_moe_cache_predict_enabled() && sel->ne[1] == 1) {
+            pred_launch(backend, il);
+        }
+
         return true;
     }
 
@@ -742,6 +908,18 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
 
 bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
     return pimpl->copy(backend, src, dst, graph);
+}
+
+void llama_moe_cache::set_graph(ggml_cgraph * gf) {
+    pimpl->set_graph(gf);
+}
+
+bool llama_moe_cache_predict_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_DSV41_MOE_PREDICT");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
