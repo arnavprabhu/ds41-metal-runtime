@@ -1,4 +1,6 @@
 #include "ggml-metal-common.h"
+
+#include <cstdlib>
 #include "ggml-metal-fusion.h"
 
 #include "ggml.h"
@@ -45,6 +47,13 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
+
+    // GGML_METAL_MUL_MAT_ID_MV=1: always use the mul_mv_id kernels (f32 activations and accumulation), a slow
+    // numerics reference for the f16-activation mul_mm_id path (diagnostics only)
+    static const bool force_mv = getenv("GGML_METAL_MUL_MAT_ID_MV") != NULL && atoi(getenv("GGML_METAL_MUL_MAT_ID_MV")) != 0;
+    if (force_mv) {
+        return false;
+    }
 
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
 }
