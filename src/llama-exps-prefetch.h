@@ -10,7 +10,7 @@
 //
 // env:
 //   LLAMA_DSV41_EXPS_PREFETCH=1         enable (graph unchanged when off)
-//   LLAMA_DSV41_PREFETCH_NEXT=0         do not prefetch the next MoE layer's full expert tensors in prefill
+//   LLAMA_DSV41_PREFETCH_NEXT=1         also prefetch the next MoE layer's full expert tensors in prefill (default off: it thrashes the page cache, pp512 5.96 vs 12.2 tok/s)
 //   LLAMA_DSV41_PREFETCH_NEXT_MIN=N     n_tokens threshold for the next-layer prefetch (default 32)
 //   LLAMA_DSV41_PREFETCH_THREADS=N      advise threads (default 4)
 //   LLAMA_DSV41_PREFETCH_STATS=1        print page-cache hit rate and I/O counters when the model is freed

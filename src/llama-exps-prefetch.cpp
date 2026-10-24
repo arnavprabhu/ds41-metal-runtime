@@ -365,7 +365,7 @@ void op(ggml_tensor * dst, int ith, int nth, void * userdata) {
         maps = s.mappings;
         auto it0 = s.layers.lower_bound({ ud->owner, INT_MIN });
         first_layer = it0 != s.layers.end() && it0->first.first == ud->owner && it0->first.second == ud->il;
-        static const bool next_on  = env_int("LLAMA_DSV41_PREFETCH_NEXT", 1) != 0;
+        static const bool next_on  = env_int("LLAMA_DSV41_PREFETCH_NEXT", 0) != 0;
         static const int  next_min = env_int("LLAMA_DSV41_PREFETCH_NEXT_MIN", 32);
         if (next_on && n_tokens >= next_min) {
             auto it = s.layers.upper_bound({ ud->owner, ud->il });
