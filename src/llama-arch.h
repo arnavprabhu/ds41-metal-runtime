@@ -793,6 +793,10 @@ enum llm_tensor {
     LLM_TENSOR_DSPARK_CONF_PROJ,
     LLM_TENSOR_ENGRAM_KV,
     LLM_TENSOR_ENGRAM_GATE,
+    LLM_TENSOR_ENGRAM_EMBD, // ISTA: one table per Engram layer (sidecar GGUF)
+    LLM_TENSOR_ENGRAM_WKV,  // ISTA spelling of engram_kv
+    LLM_TENSOR_ENGRAM_Q,    // ISTA: gate = q * k, folded at graph build
+    LLM_TENSOR_ENGRAM_K,
     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
     LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
     LLM_TENSOR_DFLASH_FFN_CONV_BASE,

@@ -72,6 +72,7 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    std::set<std::string> consumed; // weights used at load time, see consume_weight_data
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -221,6 +222,14 @@ struct llama_model_loader {
     const llama_tensor_weight * get_weight(const char * name) const;
 
     const llama_tensor_weight & require_weight(const char * name) const;
+
+    // read a whole (small) weight from its file and count it as used, for tensors that are consumed at load time
+    // instead of being created (e.g. integer constant tables)
+    std::vector<uint8_t> consume_weight_data(const char * name);
+
+    // open a sidecar GGUF whose tensors belong to this model (e.g. the DeepSeek-V4.1 ISTA Engram tables)
+    // match_key: a string key that must be present and equal in both files
+    void add_sidecar(const std::string & path, const std::string & expect_arch, const std::string & match_key);
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 

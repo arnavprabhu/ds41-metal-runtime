@@ -1449,6 +1449,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void load_engram_ista(llama_model_loader & ml, std::vector<uint32_t> & e_layers);
 
     // Engram hash constants, hashed on the host (ggml has no int64 mul/xor/mod)
     std::vector<int32_t>  engram_layers;
@@ -1459,7 +1460,15 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     std::vector<int32_t>  engram_token_map;
     std::vector<uint64_t> engram_mult;
     std::vector<uint64_t> engram_primes;
-    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in per_layer_token_embd
+    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in its table
+
+    // ISTA sets: one table per Engram layer (blk.N.engram_embd in a sidecar GGUF), offsets relative to that table;
+    // otherwise all layers share per_layer_tok_embd with absolute offsets
+    bool engram_per_layer = false;
+    std::vector<uint64_t>      engram_rows;  // ISTA: rows of each layer's table (engram.num_embeddings)
+    std::vector<ggml_tensor *> engram_embd;  // ISTA: each layer's table
+
+    const ggml_tensor * engram_table(int e) const { return engram_per_layer ? engram_embd[e] : per_layer_tok_embd; }
 
     int engram_index(int il) const;
     uint32_t engram_n_cols() const { return (engram_max_ngram - 1)*engram_n_head; }

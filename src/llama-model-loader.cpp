@@ -448,6 +448,11 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
 
+    template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result,        bool required);
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
+    template bool llama_model_loader::get_arr<uint32_t>   (const std::string & key, std::vector<uint32_t> & result, bool required);
+
     template<>
     bool llama_model_loader::get_key(enum llm_kv kid, enum llama_pooling_type & result, bool required) {
         uint32_t tmp;
@@ -678,6 +683,24 @@ llama_model_loader::llama_model_loader(
 
             LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
         }
+
+        // DeepSeek-V4.1 ISTA sets keep the Engram tables in a sidecar GGUF named by <arch>.engram.file, beside the
+        // first shard (LLAMA_DSV41_ENGRAM_FILE overrides the path)
+        if (llm_arch_from_string(arch_name) == LLM_ARCH_DEEPSEEK41) {
+            std::string engram_file;
+            get_key(arch_name + ".engram.file", engram_file, false);
+            const char * env_path = getenv("LLAMA_DSV41_ENGRAM_FILE");
+            if (env_path && *env_path) {
+                add_sidecar(env_path, arch_name + "-engram", arch_name + ".engram.source");
+            } else if (!engram_file.empty()) {
+                if (engram_file.find('/') != std::string::npos || engram_file.find('\\') != std::string::npos || engram_file == "..") {
+                    throw std::runtime_error(format("%s.engram.file must be a bare file name, got '%s'", arch_name.c_str(), engram_file.c_str()));
+                }
+                const size_t slash = fname.find_last_of("/\\");
+                const std::string dir = slash == std::string::npos ? std::string(".") : fname.substr(0, slash);
+                add_sidecar(dir + "/" + engram_file, arch_name + "-engram", arch_name + ".engram.source");
+            }
+        }
     } else if (file != nullptr) {
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
@@ -868,6 +891,72 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name));
     }
     return *weight;
+}
+
+std::vector<uint8_t> llama_model_loader::consume_weight_data(const char * name) {
+    const auto & w = require_weight(name);
+    if (w.idx >= files.size()) {
+        throw std::runtime_error(format("%s: tensor '%s' has no backing file", __func__, name));
+    }
+    const size_t n = ggml_nbytes(w.tensor);
+    if (n > 64*MiB) {
+        throw std::runtime_error(format("%s: tensor '%s' is too large to read at load time (%zu bytes)", __func__, name, n));
+    }
+    std::vector<uint8_t> data(n);
+    files.at(w.idx)->seek(w.offs, SEEK_SET);
+    files.at(w.idx)->read_raw(data.data(), n);
+    if (consumed.insert(name).second) {
+        n_created++;
+    }
+    return data;
+}
+
+void llama_model_loader::add_sidecar(const std::string & path, const std::string & expect_arch, const std::string & match_key) {
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+    gguf_context_ptr ctx_gguf { gguf_init_from_file(path.c_str(), params) };
+    if (!ctx_gguf) {
+        throw std::runtime_error(format("%s: failed to open sidecar GGUF %s", __func__, path.c_str()));
+    }
+    const int kid = gguf_find_key(ctx_gguf.get(), "general.architecture");
+    const std::string arch = kid >= 0 && gguf_get_kv_type(ctx_gguf.get(), kid) == GGUF_TYPE_STRING ? gguf_get_val_str(ctx_gguf.get(), kid) : "";
+    if (arch != expect_arch) {
+        throw std::runtime_error(format("%s: %s has architecture '%s', expected '%s'", __func__, path.c_str(), arch.c_str(), expect_arch.c_str()));
+    }
+    if (!match_key.empty()) {
+        // the sidecar must come from the same source as the model
+        const int k_own = gguf_find_key(metadata, match_key.c_str());
+        const int k_car = gguf_find_key(ctx_gguf.get(), match_key.c_str());
+        if (k_own < 0 || k_car < 0 || gguf_get_kv_type(metadata, k_own) != GGUF_TYPE_STRING ||
+                gguf_get_kv_type(ctx_gguf.get(), k_car) != GGUF_TYPE_STRING ||
+                strcmp(gguf_get_val_str(metadata, k_own), gguf_get_val_str(ctx_gguf.get(), k_car)) != 0) {
+            throw std::runtime_error(format("%s: %s does not match the model's %s", __func__, path.c_str(), match_key.c_str()));
+        }
+    }
+    if (files.size() >= UINT16_MAX) {
+        throw std::runtime_error(format("%s: too many files", __func__));
+    }
+
+    files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+    contexts.emplace_back(ctx);
+    const uint16_t idx = (uint16_t) (files.size() - 1);
+
+    int n_added = 0;
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+        std::string tensor_name = std::string(cur->name);
+        if (weights_map.find(tensor_name) != weights_map.end()) {
+            throw std::runtime_error(format("invalid model: sidecar tensor '%s' is duplicated", ggml_get_name(cur)));
+        }
+        n_elements += ggml_nelements(cur);
+        n_bytes    += ggml_nbytes(cur);
+        weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+        n_added++;
+    }
+    LLAMA_LOG_INFO("%s: sidecar %s (%s): %d tensors, %.2f GiB\n", __func__, path.c_str(), arch.c_str(), n_added,
+            files.back()->size()/1024.0/1024.0/1024.0);
 }
 
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
@@ -1276,7 +1365,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // the deepseek41 Engram table (~200 GB) is a CPU get_rows gather table: never put it in device memory
-        if (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && !ggml_backend_buft_is_host(buft)) {
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && (tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD || tn.tensor == LLM_TENSOR_ENGRAM_EMBD) &&
+                !ggml_backend_buft_is_host(buft)) {
             LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
                     tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                     ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
