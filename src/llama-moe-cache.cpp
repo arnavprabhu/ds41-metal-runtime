@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -547,6 +548,11 @@ struct llama_moe_cache::impl {
             fprintf(stderr, "llama_moe_cache: group %zu: %2zu layers, %s, %5d slots (%.1f%%, %.1f slots/layer)\n", ig,
                 g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
                 (double) g.n_slots/g.layers.size());
+            std::string ls;
+            for (int32_t l : g.layers) {
+                ls += " " + std::to_string(l);
+            }
+            fprintf(stderr, "llama_moe_cache: group %zu layers:%s\n", ig, ls.c_str());
         }
     }
 
