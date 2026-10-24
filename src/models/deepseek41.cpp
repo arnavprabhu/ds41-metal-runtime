@@ -469,18 +469,23 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
 // LLAMA_DSV41_DUMP_ENGRAM=path: append each token's hashed row ids (relative to its layer's table) per Engram layer,
 // one line per (token, layer): "seq pos token layer id_0 .. id_{cols-1}", for parity tests against a reference hash
 static void llama_dsv41_dump_engram(const llama_model_deepseek41 & model, const llama_ubatch & ubatch, const std::vector<std::vector<int32_t>> & ids) {
-    static const char * path = getenv("LLAMA_DSV41_DUMP_ENGRAM");
+    static const char * const path = getenv("LLAMA_DSV41_DUMP_ENGRAM");
     if (!path || !*path) {
         return;
     }
+    // several contexts (server slots, a speculative target) may call this concurrently: all state is under the lock
     static std::mutex mtx;
     static FILE * f = nullptr;
+    static bool failed = false;
     std::lock_guard<std::mutex> lock(mtx);
+    if (failed) {
+        return;
+    }
     if (!f) {
         f = fopen(path, "a");
         if (!f) {
             LLAMA_LOG_WARN("%s: cannot open %s\n", __func__, path);
-            path = nullptr;
+            failed = true;
             return;
         }
     }

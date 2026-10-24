@@ -343,6 +343,11 @@ void llama_model_saver::add_kv_from_model() {
     if (model->arch == LLM_ARCH_DEEPSEEK41) {
         const auto * m41 = dynamic_cast<const llama_model_deepseek41 *>(model);
         GGML_ASSERT(m41 != nullptr);
+        if (m41->engram_per_layer) {
+            // ISTA layout: per-layer Engram tables in a sidecar, offsets relative to each table; writing them under the
+            // ple.* keys (absolute offsets into one per_layer_token_embd) would produce a model that hashes wrongly
+            throw std::runtime_error("llama_model_saver: saving a DeepSeek-V4.1 ISTA-layout model (per-layer Engram sidecar tables) is not supported");
+        }
         std::vector<uint32_t> kv_src;
         std::vector<uint32_t> idx_src;
         for (uint32_t il = 0; il < hparams.n_layer(); ++il) {

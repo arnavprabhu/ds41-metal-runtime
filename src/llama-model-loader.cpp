@@ -689,8 +689,14 @@ llama_model_loader::llama_model_loader(
         if (llm_arch_from_string(arch_name) == LLM_ARCH_DEEPSEEK41) {
             std::string engram_file;
             get_key(arch_name + ".engram.file", engram_file, false);
+            // only the ISTA layout (<arch>.engram.file / <arch>.engram.present) has a sidecar; Unsloth-style sets keep
+            // the table in the backbone (per_layer_token_embd + ple.* keys)
+            const bool ista_layout = !engram_file.empty() || gguf_find_key(metadata, (arch_name + ".engram.present").c_str()) >= 0;
             const char * env_path = getenv("LLAMA_DSV41_ENGRAM_FILE");
-            if (env_path && *env_path) {
+            if (env_path && *env_path && !ista_layout) {
+                LLAMA_LOG_WARN("%s: ignoring LLAMA_DSV41_ENGRAM_FILE=%s: the Engram sidecar only applies to ISTA-layout sets "
+                        "(this model has no %s.engram.file / %s.engram.present)\n", __func__, env_path, arch_name.c_str(), arch_name.c_str());
+            } else if (env_path && *env_path) {
                 add_sidecar(env_path, arch_name + "-engram", arch_name + ".engram.source");
             } else if (!engram_file.empty()) {
                 if (engram_file.find('/') != std::string::npos || engram_file.find('\\') != std::string::npos || engram_file == "..") {
