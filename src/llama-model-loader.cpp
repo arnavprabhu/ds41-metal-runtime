@@ -1380,25 +1380,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = ggml_backend_cpu_buffer_type();
         }
 
-        // deepseek41 routed experts (~132 GB) must not be wrapped by a device buffer made from the mmap (Metal pins
-        // what it wraps: OOM / SIGBUS on 64 GB machines); keep them on the CPU (LLAMA_DSV41_EXPS_ON_DEVICE=1 allows it)
-        if (get_arch() == LLM_ARCH_DEEPSEEK41 && use_mmap && !ggml_backend_buft_is_host(buft) &&
+        // deepseek41 routed experts (~132 GB) never go to device memory: with mmap a device buffer made from the mapping
+        // pins what it wraps (OOM / SIGBUS on 64 GB machines), and without mmap (or with an explicit -ot onto a device
+        // buft) it is a ~132 GB device allocation. Keep them on the CPU whatever the load mode or requested placement
+        // (LLAMA_DSV41_EXPS_ON_DEVICE=1 allows it, e.g. for a machine that can hold them)
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && !ggml_backend_buft_is_host(buft) &&
                 (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
                  tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS)) {
             static const bool allow = [] {
                 const char * v = getenv("LLAMA_DSV41_EXPS_ON_DEVICE");
                 return v && atoi(v) != 0;
             }();
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            ggml_backend_dev_props props = {};
-            if (dev) {
-                ggml_backend_dev_get_props(dev, &props);
-            }
-            if (!allow && dev && props.caps.buffer_from_host_ptr && buft == ggml_backend_dev_buffer_type(dev)) {
+            if (!allow) {
                 static std::once_flag once;
                 std::call_once(once, [&] {
-                    LLAMA_LOG_WARN("llama_model_loader: deepseek41 routed experts stay in host memory with mmap (not mapped into %s); "
-                            "use -ot 'ffn_(gate|up|down)_exps=CPU' to make this explicit\n", ggml_backend_buft_name(buft));
+                    LLAMA_LOG_WARN("llama_model_loader: deepseek41 routed experts stay in host memory (not placed on %s, %s); "
+                            "use -ot 'ffn_(gate|up|down)_exps=CPU' to make this explicit, LLAMA_DSV41_EXPS_ON_DEVICE=1 to override\n",
+                            ggml_backend_buft_name(buft), use_mmap ? "mmap" : "no mmap");
                 });
                 buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                 if (!buft) {

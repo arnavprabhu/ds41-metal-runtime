@@ -360,6 +360,31 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // deepseek41: the routed experts (~132 GB) are kept in host memory (mmap). With op offload the scheduler would run
+    // MUL_MAT_ID for batches >= the device's offload threshold on the GPU and memcpy every used expert out of the mmap
+    // into an anonymous device compute buffer (~1.2 GB slot, ~all 384 experts per 512-token ubatch), defeating the
+    // "experts stay on the CPU" memory policy. Disable op offload in that case (LLAMA_DSV41_EXPS_OFFLOAD=1 keeps it,
+    // e.g. for A/B tests; an explicit MoE cache also keeps it since it serves experts from device memory)
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.op_offload && cparams.moe_cache_size == 0) {
+        const char * v = getenv("LLAMA_DSV41_EXPS_OFFLOAD");
+        const bool keep = v && atoi(v) != 0;
+        bool exps_on_host = false;
+        for (const auto & layer : model.layers) {
+            for (const ggml_tensor * t : { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
+                if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                    exps_on_host = true;
+                }
+            }
+        }
+        if (exps_on_host && !keep) {
+            cparams.op_offload = false;
+            LLAMA_LOG_INFO("%s: deepseek41 routed experts are in host memory: op offload disabled (experts are not copied to "
+                    "the device; LLAMA_DSV41_EXPS_OFFLOAD=1 to keep it)\n", __func__);
+        } else if (exps_on_host) {
+            LLAMA_LOG_WARN("%s: LLAMA_DSV41_EXPS_OFFLOAD=1: op offload kept, large-batch MUL_MAT_ID copies host experts to the device\n", __func__);
+        }
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
