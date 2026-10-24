@@ -50,6 +50,9 @@ bool upload_enabled();
 
 // file descriptor and file offset of [addr, addr + len) if it lies inside one registered mapping
 bool lookup(const void * addr, size_t len, int * fd, uint64_t * file_off);
+// same, but the fd was opened with F_NOCACHE (falls back to the cached fd): for reads whose bytes are kept elsewhere
+// (the MoE slot arena), so they do not also occupy the page cache
+bool lookup_nocache(const void * addr, size_t len, int * fd, uint64_t * file_off);
 
 struct upload_job {
     int          fd;

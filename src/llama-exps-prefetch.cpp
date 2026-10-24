@@ -65,6 +65,7 @@ struct mapping {
     const char * base;
     size_t       len;
     int          fd;
+    int          fd_nc; // same file reopened with F_NOCACHE (-1 if unavailable): reads that do not populate the page cache
 };
 
 // one page-aligned piece of a mapping, at most JOB_BYTES
@@ -240,9 +241,20 @@ void register_mapping(const void * owner, const void * addr, size_t len, int fd)
         return;
     }
     fcntl(fd2, F_SETFD, FD_CLOEXEC);
+    // F_NOCACHE is a property of the open file description (shared by dup), so reopen the path for it
+    int fd_nc = -1;
+#if defined(__APPLE__)
+    char path[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, path) == 0) {
+        fd_nc = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd_nc >= 0) {
+            fcntl(fd_nc, F_NOCACHE, 1);
+        }
+    }
+#endif
     auto & s = get();
     std::lock_guard<std::mutex> lk(s.mtx);
-    s.mappings.push_back({ owner, (const char *) addr, len, fd2 });
+    s.mappings.push_back({ owner, (const char *) addr, len, fd2, fd_nc });
 }
 
 static void print_stats(const stats & st) {
@@ -281,6 +293,20 @@ bool lookup(const void * addr, size_t len, int * fd, uint64_t * file_off) {
     for (const auto & m : s.mappings) {
         if (p >= m.base && p + len <= m.base + m.len) {
             *fd       = m.fd;
+            *file_off = (uint64_t) (p - m.base);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lookup_nocache(const void * addr, size_t len, int * fd, uint64_t * file_off) {
+    auto & s = get();
+    const char * p = (const char *) addr;
+    std::lock_guard<std::mutex> lk(s.mtx);
+    for (const auto & m : s.mappings) {
+        if (p >= m.base && p + len <= m.base + m.len) {
+            *fd       = m.fd_nc >= 0 ? m.fd_nc : m.fd;
             *file_off = (uint64_t) (p - m.base);
             return true;
         }
@@ -472,6 +498,9 @@ void unregister_owner(const void * owner) {
         for (const auto & m : s.mappings) {
             if (m.owner == owner) {
                 fds.push_back(m.fd);
+                if (m.fd_nc >= 0) {
+                    fds.push_back(m.fd_nc);
+                }
             }
         }
         if (fds.empty()) {
@@ -620,6 +649,7 @@ void * layer_userdata(const void *, int, ggml_tensor * const *, int) { return nu
 void op(ggml_tensor * dst, int, int, void *) { *(int32_t *) dst->data = 0; }
 bool upload_enabled() { return false; }
 bool lookup(const void *, size_t, int *, uint64_t *) { return false; }
+bool lookup_nocache(const void *, size_t, int *, uint64_t *) { return false; }
 void add_upload(std::vector<upload_job> &, int, uint64_t, void *, size_t, const void *) {}
 void upload(const std::vector<upload_job> &) {}
 void upload_bg(const std::vector<upload_job> &) {}

@@ -18,6 +18,16 @@
 
 namespace {
 
+// LLAMA_DSV41_MOE_FILL_NOCACHE=1: arena fills read through an F_NOCACHE fd, so the experts held in the arena are not
+// also kept in the page cache (more RAM left for the rest of the experts and Engram)
+static bool moe_fill_lookup(const void * addr, size_t len, int * fd, uint64_t * off) {
+    static const bool nc = [] {
+        const char * v = getenv("LLAMA_DSV41_MOE_FILL_NOCACHE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return nc ? llama_exps_prefetch::lookup_nocache(addr, len, fd, off) : llama_exps_prefetch::lookup(addr, len, fd, off);
+}
+
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
 struct moe_cache_lru {
     int32_t n_expert = 0;
@@ -299,7 +309,7 @@ struct llama_moe_cache::impl {
             const ggml_tensor * w    = L.experts[ip];
             const ggml_tensor * bank = G.banks[ip];
             if (bank->buffer == nullptr || bank->data == nullptr || !is_shared(bank->buffer) ||
-                    !llama_exps_prefetch::lookup(w->data, ggml_nbytes(w), &fds[ip], &offs[ip])) {
+                    !moe_fill_lookup(w->data, ggml_nbytes(w), &fds[ip], &offs[ip])) {
                 return;
             }
         }
@@ -805,7 +815,7 @@ struct llama_moe_cache::impl {
                 int      fd       = -1;
                 uint64_t file_off = 0;
                 const bool direct = is_shared != nullptr && bank->buffer != nullptr && bank->data != nullptr && is_shared(bank->buffer) &&
-                    llama_exps_prefetch::lookup(w->data, ggml_nbytes(w), &fd, &file_off);
+                    moe_fill_lookup(w->data, ggml_nbytes(w), &fd, &file_off);
                 for (size_t i = 0; i < fills.size();) {
                     size_t n = 1;
                     while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
