@@ -11117,6 +11117,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
+    // deepseek41 routed-expert shapes (n_embd 5120, n_ff_exp 2304, top-6) at prefill ubatch sizes: gate/up and down
+    for (ggml_type type_a : {GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}) {
+        for (int n : {32, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 2304, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
+        }
+    }
+
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
