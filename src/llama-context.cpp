@@ -23,6 +23,195 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <array>
+#include <cstdio>
+#include <memory>
+#include <thread>
+
+// deepseek41 prefill expert staging (LLAMA_DSV41_PREFILL_STAGE=1).
+// With large ubatches (ub 4096: ~all 384 experts of every layer are selected) the expert upload of a layer runs
+// while the GPU is idle: the router ids are read (full synchronize), the selected experts are pread into the compute
+// buffer, and only then the MUL_MAT_ID splits run. Here a background thread reads the FULL expert tensors of layer
+// i+1 (gate, up, down; same bytes as the GGUF mapping) into one of two shared Metal staging sets while the GPU
+// computes layer i. When layer i+1's splits are copied, their expert input tensor is pointed at the staging set for
+// the encode of that split (restored before the next split), so no upload is on the critical path.
+// Lossless: identical expert bytes, identical kernels; unselected experts are simply also present.
+// Safety: the reader for layer i+1 starts only after the full synchronize at the start of layer i, at which point
+// every split of layer i-1 (the previous user of that parity) has completed.
+//   LLAMA_DSV41_PREFILL_STAGE=1             enable
+//   LLAMA_DSV41_STAGE_MIN_TOKENS=N          only for ubatches with at least N tokens (default 1024)
+//   LLAMA_DSV41_STAGE_THREADS=N             reader threads (default 8)
+namespace {
+
+struct llama_prefill_stage {
+    static constexpr int N_KIND = 3; // gate, up, down
+
+    bool init_done = false;
+    bool disabled  = false;
+    int  min_tokens = 1024;
+
+    std::unordered_map<const void *, std::pair<int, int>> where; // host expert data -> (layer order index, kind)
+    std::vector<std::array<const ggml_tensor *, N_KIND>> layers;  // order index -> host expert tensors
+
+    ggml_backend_buffer_t buf[2][N_KIND] = {};
+    size_t                cap[N_KIND]    = {};
+    int                   staged[2]      = { -1, -1 }; // layer order index held (or being read) per parity
+
+    std::thread th;
+    bool        busy = false;
+
+    int  cur      = -1;    // layer order index of the current split
+    bool cur_have = false; // the staging set of cur holds cur
+
+    // the tensor repointed for the split being encoded
+    ggml_tensor *         rp_t     = nullptr;
+    ggml_backend_buffer_t rp_buf   = nullptr;
+    void *                rp_data  = nullptr;
+    const ggml_cgraph *   rp_graph = nullptr;
+
+    // stats
+    uint64_t n_staged_splits = 0, n_fallback_layers = 0, n_reads = 0, read_bytes = 0, wait_us = 0, read_us = 0;
+
+    void restore() {
+        if (rp_t) {
+            rp_t->buffer = rp_buf;
+            rp_t->data   = rp_data;
+            rp_t = nullptr;
+            rp_graph = nullptr;
+        }
+    }
+
+    void wait_bg() {
+        if (busy) {
+            const auto t0 = std::chrono::steady_clock::now();
+            th.join();
+            wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            busy = false;
+        }
+    }
+
+    bool init(const llama_model & model, ggml_backend_buffer_type_t buft, bool (*is_shared)(ggml_backend_buffer_t)) {
+        init_done = true;
+        if (const char * v = getenv("LLAMA_DSV41_STAGE_MIN_TOKENS")) {
+            min_tokens = std::max(1, atoi(v));
+        }
+        for (const auto & layer : model.layers) {
+            std::array<const ggml_tensor *, N_KIND> t = { layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps };
+            if (!t[0] || !t[1] || !t[2]) {
+                continue;
+            }
+            for (int k = 0; k < N_KIND; ++k) {
+                where[t[k]->data] = { (int) layers.size(), k };
+                cap[k] = std::max(cap[k], ggml_nbytes(t[k]));
+            }
+            layers.push_back(t);
+        }
+        if (layers.size() < 2) {
+            disabled = true;
+            return false;
+        }
+        size_t total = 0;
+        for (int p = 0; p < 2; ++p) {
+            for (int k = 0; k < N_KIND; ++k) {
+                buf[p][k] = ggml_backend_buft_alloc_buffer(buft, cap[k]);
+                if (!buf[p][k] || !is_shared(buf[p][k]) || !ggml_backend_buffer_get_base(buf[p][k])) {
+                    fprintf(stderr, "exps-prefetch stage: staging buffer allocation failed, staging disabled\n");
+                    disabled = true;
+                    return false;
+                }
+                total += cap[k];
+            }
+        }
+        fprintf(stderr, "exps-prefetch stage: on, %zu layers, 2 x %.2f GiB staging, min %d tokens\n",
+                layers.size(), total / 2.0 / (1024.0*1024.0*1024.0), min_tokens);
+        return true;
+    }
+
+    // full read of layer li into parity li&1 on the background thread
+    void start_bg(int li) {
+        GGML_ASSERT(!busy);
+        const int p = li & 1;
+        std::vector<llama_exps_prefetch::upload_job> jobs;
+        size_t bytes = 0;
+        for (int k = 0; k < N_KIND; ++k) {
+            const ggml_tensor * t = layers[li][k];
+            int      fd  = -1;
+            uint64_t off = 0;
+            if (!llama_exps_prefetch::lookup(t->data, ggml_nbytes(t), &fd, &off)) {
+                staged[p] = -1;
+                return;
+            }
+            llama_exps_prefetch::add_upload(jobs, fd, off, ggml_backend_buffer_get_base(buf[p][k]), ggml_nbytes(t), t->data);
+            bytes += ggml_nbytes(t);
+        }
+        staged[p] = li;
+        busy = true;
+        n_reads++;
+        read_bytes += bytes;
+        th = std::thread([this, jobs = std::move(jobs)]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            llama_exps_prefetch::upload_bg(jobs);
+            read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        });
+    }
+
+    void destroy() {
+        restore();
+        wait_bg();
+        if (n_reads || n_staged_splits) {
+            fprintf(stderr, "exps-prefetch stage: staged splits = %llu, fallback layers = %llu, reads = %llu (%.1f GiB, %.1f s on the reader, %.3f s exposed wait)\n",
+                    (unsigned long long) n_staged_splits, (unsigned long long) n_fallback_layers, (unsigned long long) n_reads,
+                    read_bytes / (1024.0*1024.0*1024.0), read_us / 1e6, wait_us / 1e6);
+        }
+        for (auto & pb : buf) {
+            for (auto & b : pb) {
+                if (b) {
+                    ggml_backend_buffer_free(b);
+                    b = nullptr;
+                }
+            }
+        }
+    }
+};
+
+std::unordered_map<const llama_context *, std::unique_ptr<llama_prefill_stage>> & llama_prefill_stages() {
+    static std::unordered_map<const llama_context *, std::unique_ptr<llama_prefill_stage>> m;
+    return m;
+}
+
+bool llama_prefill_stage_enabled() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_DSV41_PREFILL_STAGE");
+        return v && atoi(v) != 0;
+    }();
+    return on;
+}
+
+llama_prefill_stage * llama_prefill_stage_get(const llama_context * lctx, bool create) {
+    if (!llama_prefill_stage_enabled()) {
+        return nullptr;
+    }
+    auto & m = llama_prefill_stages();
+    auto it = m.find(lctx);
+    if (it != m.end()) {
+        return it->second.get();
+    }
+    if (!create) {
+        return nullptr;
+    }
+    return m.emplace(lctx, std::make_unique<llama_prefill_stage>()).first->second.get();
+}
+
+void llama_prefill_stage_destroy(const llama_context * lctx) {
+    auto * st = llama_prefill_stage_get(lctx, false);
+    if (st) {
+        st->destroy();
+        llama_prefill_stages().erase(lctx);
+    }
+}
+
+} // namespace
+
 
 //
 // llama_context
@@ -613,6 +802,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_prefill_stage_destroy(this);
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2790,6 +2981,11 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (auto * stg = llama_prefill_stage_get(this, false)) {
+        // the last split is encoded; layer order restarts with the next graph
+        stg->restore();
+        stg->cur = -1;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
@@ -2799,8 +2995,14 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // the previous split has been encoded, so its staging repoint can be undone
+    if (auto * stg = llama_prefill_stage_get(lctx, false); stg && stg->rp_graph != graph) {
+        stg->restore();
+    }
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
@@ -2858,6 +3060,40 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         int      fd       = -1;
         uint64_t file_off = 0;
         if (is_shared && is_shared(dst->buffer) && llama_exps_prefetch::lookup(src->data, ggml_nbytes(src), &fd, &file_off)) {
+            if (auto * stg = llama_prefill_stage_get(lctx, true); stg && !stg->disabled && ids->ne[1] >= stg->min_tokens &&
+                    (stg->init_done || stg->init(lctx->model, ggml_backend_buffer_get_type(dst->buffer), is_shared))) {
+                auto it = stg->where.find(src->data);
+                if (it != stg->where.end() && ggml_nbytes(dst) == ggml_nbytes(src)) {
+                    const int li   = it->second.first;
+                    const int kind = it->second.second;
+                    if (li != stg->cur) {
+                        // first split of a new layer: everything queued before it (incl. layer li-1) must be done
+                        // before the reader may overwrite the parity of li-1 with li+1
+                        ggml_backend_synchronize(backend);
+                        stg->wait_bg();
+                        stg->cur      = li;
+                        stg->cur_have = stg->staged[li & 1] == li;
+                        if (!stg->cur_have) {
+                            stg->n_fallback_layers++;
+                        }
+                        if (li + 1 < (int) stg->layers.size()) {
+                            stg->start_bg(li + 1);
+                        }
+                    }
+                    if (stg->cur_have) {
+                        ggml_backend_buffer_t sb = stg->buf[li & 1][kind];
+                        stg->rp_t     = dst;
+                        stg->rp_buf   = dst->buffer;
+                        stg->rp_data  = dst->data;
+                        stg->rp_graph = graph;
+                        dst->buffer   = sb;
+                        dst->data     = ggml_backend_buffer_get_base(sb);
+                        stg->n_staged_splits++;
+                        return true;
+                    }
+                }
+            }
+
             const auto t0 = std::chrono::steady_clock::now();
             ggml_backend_synchronize(backend);
             llama_exps_prefetch::upload_add_sync_us(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());

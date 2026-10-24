@@ -65,6 +65,10 @@ void add_upload(std::vector<upload_job> & jobs, int fd, uint64_t file_off, void 
 // runs the jobs on the upload pool (the caller helps) and returns when all bytes are in place
 void upload(const std::vector<upload_job> & jobs);
 
+// same as upload() on a separate pool (LLAMA_DSV41_STAGE_THREADS, default 8), callable from one background thread
+// concurrently with upload() on the scheduler thread
+void upload_bg(const std::vector<upload_job> & jobs);
+
 // time the caller spent in ggml_backend_synchronize before an upload (stats only)
 void upload_add_sync_us(uint64_t us);
 

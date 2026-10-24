@@ -379,6 +379,9 @@ struct upload_pool {
         }
     }
 
+    const char * threads_env     = "LLAMA_DSV41_UPLOAD_THREADS";
+    int          threads_default = 12;
+
     void run(const std::vector<upload_job> & jobs) {
         if (jobs.empty()) {
             return;
@@ -389,7 +392,7 @@ struct upload_pool {
         {
             std::lock_guard<std::mutex> lk(mtx);
             if (workers.empty()) {
-                const int n = std::max(0, env_int("LLAMA_DSV41_UPLOAD_THREADS", 12) - 1); // the caller is one of them
+                const int n = std::max(0, env_int(threads_env, threads_default) - 1); // the caller is one of them
                 for (int i = 0; i < n; ++i) {
                     workers.emplace_back([this] { worker(); });
                     workers.back().detach();
@@ -422,10 +425,26 @@ upload_pool & get_upload() {
     return *p;
 }
 
+// second pool for the prefill staging reader (llama-context.cpp, LLAMA_DSV41_PREFILL_STAGE=1): it runs on a
+// background thread while the scheduler thread keeps using get_upload(), so the two must not share batch state
+upload_pool & get_upload_bg() {
+    static upload_pool * p = [] {
+        auto * q = new upload_pool();
+        q->threads_env     = "LLAMA_DSV41_STAGE_THREADS";
+        q->threads_default = 8;
+        return q;
+    }();
+    return *p;
+}
+
 } // namespace
 
 void upload(const std::vector<upload_job> & jobs) {
     get_upload().run(jobs);
+}
+
+void upload_bg(const std::vector<upload_job> & jobs) {
+    get_upload_bg().run(jobs);
 }
 
 void upload_add_sync_us(uint64_t us) {
@@ -603,6 +622,7 @@ bool upload_enabled() { return false; }
 bool lookup(const void *, size_t, int *, uint64_t *) { return false; }
 void add_upload(std::vector<upload_job> &, int, uint64_t, void *, size_t, const void *) {}
 void upload(const std::vector<upload_job> &) {}
+void upload_bg(const std::vector<upload_job> &) {}
 void upload_add_sync_us(uint64_t) {}
 
 #endif
