@@ -362,6 +362,17 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
+    // deepseek41: LLAMA_DSV41_MOE_CACHE_MIB=N enables the MoE cache (a GPU slot arena for the routed experts used in
+    // decode, see llama-moe-cache.cpp) for tools that have no --moe-cache-mib flag (llama-bench, ...)
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.moe_cache_size == 0) {
+        const char * v = getenv("LLAMA_DSV41_MOE_CACHE_MIB");
+        const long long mib = v ? atoll(v) : 0;
+        if (mib > 0) {
+            cparams.moe_cache_size = (size_t) mib << 20;
+            LLAMA_LOG_INFO("%s: dsv41: MoE slot arena %lld MiB (env LLAMA_DSV41_MOE_CACHE_MIB)\n", __func__, mib);
+        }
+    }
+
     // deepseek41: the routed experts (~132 GB) are kept in host memory (mmap). With op offload the scheduler would run
     // MUL_MAT_ID for batches >= the device's offload threshold on the GPU and memcpy every used expert out of the mmap
     // into an anonymous device compute buffer (~1.2 GB slot, ~all 384 experts per 512-token ubatch), defeating the
@@ -2837,7 +2848,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // GGUF file (same bytes as the mmap), instead of a single-threaded newBufferWithBytes memcpy out of the faulting
     // mapping plus a GPU blit. The scheduler only queued async copies so far and gallocr may reuse dst's region across
     // splits, so the synchronize is required before any host write.
-    if (lctx->moe_cache == nullptr && llama_exps_prefetch::upload_enabled() && dst->buffer != nullptr && dst->data != nullptr && dst->view_src == nullptr) {
+    // With the MoE cache, the large (prefill) batches keep this path: they do not read the cache (same bytes either way),
+    // decode-sized batches read their experts from the cache banks and never reach this callback for the host experts.
+    if (llama_exps_prefetch::upload_enabled() && dst->buffer != nullptr && dst->data != nullptr && dst->view_src == nullptr) {
         using is_shared_fn = bool (*)(ggml_backend_buffer_t);
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;

@@ -1,11 +1,14 @@
 #include "llama-moe-cache.h"
 
+#include "llama-exps-prefetch.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -188,12 +191,30 @@ struct llama_moe_cache::impl {
     };
 
     struct stats {
-        size_t hits   = 0;
-        size_t misses = 0;
-        size_t bytes  = 0;
+        size_t   hits   = 0;
+        size_t   misses = 0;
+        size_t   bytes  = 0;
+        size_t   calls  = 0; // copy() calls (cached layer x ubatch)
+        size_t   tokens = 0; // sum of the ubatch sizes over the calls (/ n cached layers = tokens served)
+        size_t   pread_calls    = 0; // calls whose misses were pread into the shared bank
+        size_t   fallback_calls = 0; // calls whose misses went through ggml_backend_tensor_set_async
+        uint64_t sync_us = 0;  // waiting for the ids (the previous splits) before planning
+        uint64_t fill_us = 0;  // plan + miss upload
     };
 
-    static constexpr int64_t max_batch = 32;
+    // ubatches of at most max_batch tokens read their experts from the cache
+    // must stay below 32: Metal picks mul_mm_id (f16 activations) over mul_mv_id (f32) when ne02 <= 1024 && ne21 >= 32
+    // (ggml_metal_op_mul_mat_id_use_mm), and ne02 is the number of slots for the cache but n_expert for the host experts,
+    // so a 32-token ubatch on a bank with > 1024 slots would change the arithmetic. Below 32 both use mul_mv_id, whose
+    // kernel choice depends on the type and ne00 only (ne02 is only an address bound), so the cache is lossless.
+    static constexpr int64_t max_batch = 16;
+
+    int32_t n_cached_layers = 0;
+
+    // ggml_backend_buffer_is_metal_shared of the device of each backend, resolved on first use
+    using is_shared_fn = bool (*)(ggml_backend_buffer_t);
+    std::unordered_map<ggml_backend_t, is_shared_fn> is_shared_of;
+    std::vector<llama_exps_prefetch::upload_job> jobs;
 
     int32_t n_expert_used;
 
@@ -369,6 +390,7 @@ struct llama_moe_cache::impl {
             for (int32_t il : g.layers) {
                 layer & l = layers[il];
                 l.ig      = (int32_t) ig;
+                n_cached_layers++;
                 l.experts = llama_moe_cache_layer_experts(model.layers[il]);
                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
                     ggml_tensor * bank   = g.banks[ip];
@@ -449,6 +471,30 @@ struct llama_moe_cache::impl {
                 }
             }
         }
+        // also on stderr: llama-bench silences the llama log
+        for (const device & d : devices) {
+            if (d.host_bytes > 0) {
+                fprintf(stderr, "llama_moe_cache: arena %s %.2f MiB for %.2f MiB of host experts, %d cached layers, max_batch %d\n",
+                    ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, n_cached_layers, (int) max_batch);
+            }
+        }
+        for (size_t ig = 0; ig < groups.size(); ++ig) {
+            const group & g = groups[ig];
+            fprintf(stderr, "llama_moe_cache: group %zu: %2zu layers, %s, %5d slots (%.1f%%, %.1f slots/layer)\n", ig,
+                g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
+                (double) g.n_slots/g.layers.size());
+        }
+    }
+
+    is_shared_fn get_is_shared(ggml_backend_t backend) {
+        auto it = is_shared_of.find(backend);
+        if (it == is_shared_of.end()) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (is_shared_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_is_metal_shared") : nullptr;
+            it = is_shared_of.emplace(backend, fn).first;
+        }
+        return it->second;
     }
 
     ggml_backend_t backend(int32_t il) const {
@@ -545,9 +591,12 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        const auto t0 = std::chrono::steady_clock::now();
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        // also guarantees that no queued GPU work still reads a slot that is overwritten below
         ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
 
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -555,26 +604,60 @@ struct llama_moe_cache::impl {
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // deepseek41 fast path: the bank is a shared Metal buffer (CPU-addressable) and the backend is synchronized, so
+        // the misses of all expert tensors of the layer are pread() by the upload pool straight into the bank from the
+        // GGUF file (the same bytes as the mmap) in one batch; otherwise ggml_backend_tensor_set_async from the mmap
         size_t bytes = 0;
-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
-            const ggml_tensor * w    = l.experts[ip];
-            ggml_tensor       * bank = g.banks[ip];
-            const size_t expert_size = w->nb[2];
-            for (size_t i = 0; i < fills.size();) {
-                size_t n = 1;
-                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
-                    n++;
+        bool   pread_used    = false;
+        bool   fallback_used = false;
+        if (!fills.empty()) {
+            const is_shared_fn is_shared = llama_exps_prefetch::upload_enabled() ? get_is_shared(backend) : nullptr;
+            jobs.clear();
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * w    = l.experts[ip];
+                ggml_tensor       * bank = g.banks[ip];
+                const size_t expert_size = w->nb[2];
+                GGML_ASSERT(bank->nb[2] == expert_size);
+                int      fd       = -1;
+                uint64_t file_off = 0;
+                const bool direct = is_shared != nullptr && bank->buffer != nullptr && bank->data != nullptr && is_shared(bank->buffer) &&
+                    llama_exps_prefetch::lookup(w->data, ggml_nbytes(w), &fd, &file_off);
+                for (size_t i = 0; i < fills.size();) {
+                    size_t n = 1;
+                    while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                        n++;
+                    }
+                    // slots < n_slots, the bank has n_slots + 1 entries
+                    GGML_ASSERT(fills[i].slot + (int64_t) n <= bank->ne[2]);
+                    const size_t src_off = (size_t) fills[i].expert*expert_size;
+                    const size_t dst_off = (size_t) fills[i].slot*expert_size;
+                    if (direct) {
+                        llama_exps_prefetch::add_upload(jobs, fd, file_off + src_off, (char *) bank->data + dst_off, n*expert_size, (const char *) w->data + src_off);
+                        pread_used = true;
+                    } else {
+                        ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + src_off, dst_off, n*expert_size);
+                        fallback_used = true;
+                    }
+                    bytes += n*expert_size;
+                    i += n;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
-                bytes += n*expert_size;
-                i += n;
+            }
+            if (!jobs.empty()) {
+                llama_exps_prefetch::upload(jobs);
             }
         }
+        const auto t2 = std::chrono::steady_clock::now();
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
+        st.calls  += 1;
+        st.tokens += sel->ne[1];
+        st.pread_calls    += pread_used;
+        st.fallback_calls += fallback_used;
+        st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
@@ -583,18 +666,25 @@ struct llama_moe_cache::impl {
     }
 
     void log_stats() const {
-        auto log = [](const char * name, const stats & st) {
+        // on stderr: llama-bench silences the llama log
+        const int32_t n_layers = std::max<int32_t>(1, n_cached_layers);
+        auto log = [&](const char * name, const stats & st) {
             const size_t n = st.hits + st.misses;
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
-                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+            const double tok = std::max(1.0, (double) st.tokens/n_layers); // tokens served through the cache
+            fprintf(stderr, "llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB, "
+                "tokens = %.0f, misses/token = %.1f, MiB/token = %.2f, fill ms/token = %.2f, sync ms/token = %.2f, "
+                "calls = %zu (pread %zu, set_async fallback %zu)\n",
+                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0,
+                tok, st.misses/tok, st.bytes/1024.0/1024.0/tok, st.fill_us/1000.0/tok, st.sync_us/1000.0/tok,
+                st.calls, st.pread_calls, st.fallback_calls);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
-            LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+            fprintf(stderr, "llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
     }
 };
