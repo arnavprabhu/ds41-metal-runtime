@@ -10,10 +10,12 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-exps-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2828,6 +2830,45 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    // deepseek41 fast path: the destination is a shared Metal buffer (host memory wrapped with newBufferWithBytesNoCopy),
+    // so after a full synchronize the used expert runs can be pread() by a thread pool straight into dst->data from the
+    // GGUF file (same bytes as the mmap), instead of a single-threaded newBufferWithBytes memcpy out of the faulting
+    // mapping plus a GPU blit. The scheduler only queued async copies so far and gallocr may reuse dst's region across
+    // splits, so the synchronize is required before any host write.
+    if (lctx->moe_cache == nullptr && llama_exps_prefetch::upload_enabled() && dst->buffer != nullptr && dst->data != nullptr && dst->view_src == nullptr) {
+        using is_shared_fn = bool (*)(ggml_backend_buffer_t);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto is_shared = reg ? (is_shared_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_is_metal_shared") : nullptr;
+        int      fd       = -1;
+        uint64_t file_off = 0;
+        if (is_shared && is_shared(dst->buffer) && llama_exps_prefetch::lookup(src->data, ggml_nbytes(src), &fd, &file_off)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            ggml_backend_synchronize(backend);
+            llama_exps_prefetch::upload_add_sync_us(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+
+            st.jobs.clear();
+            for (int64_t first = 0; first < n_expert; ) {
+                if (!st.used[first]) {
+                    first++;
+                    continue;
+                }
+                int64_t last = first;
+                while (last + 1 < n_expert && st.used[last + 1]) {
+                    last++;
+                }
+                // same extent as the set_async path below (incl. the padding into the next expert)
+                const size_t offset  = first*expert_size;
+                const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+                const size_t size    = (last + 1 - first)*expert_size + padding;
+                llama_exps_prefetch::add_upload(st.jobs, fd, file_off + offset, (char *) dst->data + offset, size, (const char *) src->data + offset);
+                first = last + 1;
+            }
+            llama_exps_prefetch::upload(st.jobs);
+            return true;
+        }
     }
 
     // group consecutive experts and copy them together

@@ -2035,7 +2035,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        const bool exps_prefetch = arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled();
+        const bool exps_prefetch = arch == LLM_ARCH_DEEPSEEK41 && (llama_exps_prefetch::enabled() || llama_exps_prefetch::upload_enabled());
         for (size_t idx = 0; idx < ml.mappings.size(); ++idx) {
             auto & mapping = ml.mappings[idx];
             if (exps_prefetch && mapping) {

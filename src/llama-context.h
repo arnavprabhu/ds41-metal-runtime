@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-exps-prefetch.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
@@ -377,6 +378,7 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<llama_exps_prefetch::upload_job> jobs; // pread uploader scratch
 
         void reset() {
             ids = nullptr;

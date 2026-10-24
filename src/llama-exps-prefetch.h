@@ -14,8 +14,18 @@
 //   LLAMA_DSV41_PREFETCH_NEXT_MIN=N     n_tokens threshold for the next-layer prefetch (default 32)
 //   LLAMA_DSV41_PREFETCH_THREADS=N      advise threads (default 4)
 //   LLAMA_DSV41_PREFETCH_STATS=1        print page-cache hit rate and I/O counters when the model is freed
+//
+// Expert uploader (used by llama_context::sched_copy_experts when op offload runs MUL_MAT_ID on Metal):
+// with LLAMA_DSV41_EXPS_OFFLOAD=1 the router-selected expert runs are pread() by a pool straight into the shared
+// (CPU-addressable) Metal compute buffer instead of newBufferWithBytes memcpy + blit. Same bytes, lossless.
+//   LLAMA_DSV41_UPLOAD_PREAD=0          disable the pread uploader (fall back to ggml_backend_tensor_set_async)
+//   LLAMA_DSV41_UPLOAD_THREADS=N        upload threads (default 12)
+//   LLAMA_DSV41_UPLOAD_CHUNK_KIB=N      pread job size (default 2048)
+//   LLAMA_DSV41_PREFETCH_OFFLOADED=0    skip the batch prefetch node for offloaded (n_tokens >= offload min batch) ubatches
 
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -34,5 +44,28 @@ void * layer_userdata(const void * owner, int il, ggml_tensor * const * exps, in
 
 // ggml custom op: src[0] = selected experts I32 [n_expert_used, n_tokens], src[1..] = expert weights [.., .., n_expert]
 void op(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+// true when the mappings must be registered for the uploader (deepseek41 + LLAMA_DSV41_EXPS_OFFLOAD=1 + UPLOAD_PREAD != 0)
+bool upload_enabled();
+
+// file descriptor and file offset of [addr, addr + len) if it lies inside one registered mapping
+bool lookup(const void * addr, size_t len, int * fd, uint64_t * file_off);
+
+struct upload_job {
+    int          fd;
+    uint64_t     file_off;
+    void       * dst;
+    size_t       len;
+    const void * src; // the same bytes in the mmap (memcpy fallback if pread fails)
+};
+
+// splits [file_off, file_off + len) into chunk-sized jobs and appends them
+void add_upload(std::vector<upload_job> & jobs, int fd, uint64_t file_off, void * dst, size_t len, const void * src);
+
+// runs the jobs on the upload pool (the caller helps) and returns when all bytes are in place
+void upload(const std::vector<upload_job> & jobs);
+
+// time the caller spent in ggml_backend_synchronize before an upload (stats only)
+void upload_add_sync_us(uint64_t us);
 
 } // namespace llama_exps_prefetch

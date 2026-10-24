@@ -183,6 +183,12 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
 }
 
+// true if the buffer is a Metal buffer whose memory is CPU-addressable (newBufferWithBytesNoCopy over host memory):
+// once the backend is synchronized, the host may write the tensor data of such a buffer directly
+bool ggml_backend_buffer_is_metal_shared(ggml_backend_buffer_t buffer) {
+    return buffer != NULL && buffer->iface.free_buffer == ggml_backend_metal_buffer_shared_free_buffer;
+}
+
 //
 // buffer types
 //
@@ -945,6 +951,9 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_buffer_is_metal_shared") == 0) {
+        return (void *)ggml_backend_buffer_is_metal_shared;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

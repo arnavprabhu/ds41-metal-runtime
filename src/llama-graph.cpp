@@ -2381,7 +2381,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
-    if (slots == nullptr && arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled()) {
+    // LLAMA_DSV41_PREFETCH_OFFLOADED=0: with op offload the ubatches >= the offload min batch run MUL_MAT_ID on Metal
+    // and the pread uploader is the only reader of the experts, so the F_RDADVISE prefetch would only read twice
+    static const bool prefetch_offloaded = [] {
+        const char * v = getenv("LLAMA_DSV41_PREFETCH_OFFLOADED");
+        const char * o = getenv("LLAMA_DSV41_EXPS_OFFLOAD");
+        return !(v && atoi(v) == 0 && o && atoi(o) != 0);
+    }();
+    static const int64_t offload_min_batch = [] {
+        const char * v = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        return (int64_t) (v ? atoi(v) : 32);
+    }();
+    const bool skip_prefetch = !prefetch_offloaded && n_tokens >= offload_min_batch;
+    if (slots == nullptr && arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled() && !skip_prefetch) {
         build_moe_exps_prefetch(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
     }
 

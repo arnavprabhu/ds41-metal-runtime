@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
@@ -264,6 +265,186 @@ static void print_stats(const stats & st) {
         st.op_us / 1000.0, (unsigned long long) st.jobs_done, st.advise_us / 1000.0, (unsigned long long) st.queue_hwm);
 }
 
+//
+// expert uploader: pread pool writing straight into the destination (a shared Metal buffer)
+//
+
+bool upload_enabled() {
+    static const bool on = env_int("LLAMA_DSV41_EXPS_OFFLOAD", 0) != 0 && env_int("LLAMA_DSV41_UPLOAD_PREAD", 1) != 0;
+    return on;
+}
+
+bool lookup(const void * addr, size_t len, int * fd, uint64_t * file_off) {
+    auto & s = get();
+    const char * p = (const char *) addr;
+    std::lock_guard<std::mutex> lk(s.mtx);
+    for (const auto & m : s.mappings) {
+        if (p >= m.base && p + len <= m.base + m.len) {
+            *fd       = m.fd;
+            *file_off = (uint64_t) (p - m.base);
+            return true;
+        }
+    }
+    return false;
+}
+
+void add_upload(std::vector<upload_job> & jobs, int fd, uint64_t file_off, void * dst, size_t len, const void * src) {
+    static const size_t chunk = (size_t) std::max(64, env_int("LLAMA_DSV41_UPLOAD_CHUNK_KIB", 2048)) << 10;
+    for (size_t d = 0; d < len; d += chunk) {
+        jobs.push_back({ fd, file_off + d, (char *) dst + d, std::min(chunk, len - d), (const char *) src + d });
+    }
+}
+
+namespace {
+
+struct upload_batch {
+    const std::vector<upload_job> * jobs;
+    std::atomic<size_t> next   { 0 };
+    std::atomic<size_t> done   { 0 };
+    std::atomic<int>    active { 0 }; // workers holding a pointer to this batch
+};
+
+struct upload_stats {
+    std::atomic<uint64_t> calls     = 0;
+    std::atomic<uint64_t> jobs      = 0;
+    std::atomic<uint64_t> bytes     = 0;
+    std::atomic<uint64_t> fallbacks = 0;
+    std::atomic<uint64_t> wall_us   = 0;
+    std::atomic<uint64_t> sync_us   = 0;
+};
+
+struct upload_pool {
+    std::mutex              mtx;
+    std::condition_variable cv;      // new batch
+    std::condition_variable cv_done; // batch finished
+    upload_batch *          cur = nullptr;
+    uint64_t                gen = 0;
+    std::vector<std::thread> workers;
+    upload_stats            st;
+
+    void run_job(const upload_job & j) {
+        size_t got = 0;
+        while (got < j.len) {
+            const ssize_t r = pread(j.fd, (char *) j.dst + got, j.len - got, (off_t) (j.file_off + got));
+            if (r > 0) {
+                got += (size_t) r;
+            } else if (r < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        if (got < j.len) {
+            memcpy((char *) j.dst + got, (const char *) j.src + got, j.len - got);
+            st.fallbacks++;
+        }
+    }
+
+    // pulls jobs of b until none are left; returns the number done by this thread
+    void drain(upload_batch & b) {
+        const size_t n = b.jobs->size();
+        for (;;) {
+            const size_t i = b.next.fetch_add(1);
+            if (i >= n) {
+                break;
+            }
+            run_job((*b.jobs)[i]);
+            if (b.done.fetch_add(1) + 1 == n) {
+                std::lock_guard<std::mutex> lk(mtx);
+                cv_done.notify_all();
+            }
+        }
+    }
+
+    [[noreturn]] void worker() {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+        uint64_t seen = 0;
+        for (;;) {
+            upload_batch * b = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] { return gen != seen && cur != nullptr; });
+                seen = gen;
+                b = cur;
+                b->active++;
+            }
+            drain(*b);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                b->active--;
+                cv_done.notify_all();
+            }
+        }
+    }
+
+    void run(const std::vector<upload_job> & jobs) {
+        if (jobs.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        upload_batch b;
+        b.jobs = &jobs;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (workers.empty()) {
+                const int n = std::max(0, env_int("LLAMA_DSV41_UPLOAD_THREADS", 12) - 1); // the caller is one of them
+                for (int i = 0; i < n; ++i) {
+                    workers.emplace_back([this] { worker(); });
+                    workers.back().detach();
+                }
+            }
+            cur = &b;
+            gen++;
+        }
+        cv.notify_all();
+        drain(b);
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_done.wait(lk, [&] { return b.done.load() == jobs.size() && b.active.load() == 0; });
+            cur = nullptr;
+        }
+        size_t bytes = 0;
+        for (const auto & j : jobs) {
+            bytes += j.len;
+        }
+        st.calls++;
+        st.jobs  += jobs.size();
+        st.bytes += bytes;
+        st.wall_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+// leaked on purpose (detached workers)
+upload_pool & get_upload() {
+    static upload_pool * p = new upload_pool();
+    return *p;
+}
+
+} // namespace
+
+void upload(const std::vector<upload_job> & jobs) {
+    get_upload().run(jobs);
+}
+
+void upload_add_sync_us(uint64_t us) {
+    get_upload().st.sync_us += us;
+}
+
+static void print_upload_stats() {
+    const auto & st = get_upload().st;
+    if (st.calls == 0) {
+        return;
+    }
+    const double gib = st.bytes / 1073741824.0;
+    const double s   = st.wall_us / 1e6;
+    fprintf(stderr, "print_upload_stats: exps-prefetch upload calls=%llu jobs=%llu bytes=%.2f GiB time=%.1f ms (%.2f GB/s, %.1f MiB/call) sync=%.1f ms fallbacks=%llu\n",
+        (unsigned long long) st.calls.load(), (unsigned long long) st.jobs.load(), gib, st.wall_us / 1000.0,
+        s > 0 ? st.bytes / 1e9 / s : 0.0, st.bytes / 1048576.0 / st.calls, st.sync_us / 1000.0,
+        (unsigned long long) st.fallbacks.load());
+}
+
 void unregister_owner(const void * owner) {
     auto & s = get();
     std::vector<int> fds;
@@ -288,6 +469,7 @@ void unregister_owner(const void * owner) {
     }
     if (env_int("LLAMA_DSV41_PREFETCH_STATS", 0) == 1) {
         print_stats(s.st);
+        print_upload_stats();
     }
 }
 
@@ -417,6 +599,11 @@ void register_mapping(const void *, const void *, size_t, int) {}
 void unregister_owner(const void *) {}
 void * layer_userdata(const void *, int, ggml_tensor * const *, int) { return nullptr; }
 void op(ggml_tensor * dst, int, int, void *) { *(int32_t *) dst->data = 0; }
+bool upload_enabled() { return false; }
+bool lookup(const void *, size_t, int *, uint64_t *) { return false; }
+void add_upload(std::vector<upload_job> &, int, uint64_t, void *, size_t, const void *) {}
+void upload(const std::vector<upload_job> &) {}
+void upload_add_sync_us(uint64_t) {}
 
 #endif
 

@@ -56,6 +56,9 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// true if the buffer is a shared (CPU-addressable) Metal buffer; also available as proc address "ggml_backend_buffer_is_metal_shared"
+GGML_BACKEND_API bool ggml_backend_buffer_is_metal_shared(ggml_backend_buffer_t buffer);
+
 #ifdef __cplusplus
 }
 #endif
