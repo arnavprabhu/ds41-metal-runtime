@@ -687,6 +687,20 @@ struct llama_moe_cache::impl {
         // the background prefetch of this layer's predicted misses must land before the plan and the GPU read
         pred_resolve(il);
 
+        // LLAMA_DSV41_MOE_TRACE=path: append (il, n_ids, ids...) as int32 for every decode call (offline policy simulation)
+        {
+            static FILE * trace = [] {
+                const char * v = getenv("LLAMA_DSV41_MOE_TRACE");
+                return v && *v ? fopen(v, "wb") : (FILE *) nullptr;
+            }();
+            if (trace != nullptr && sel->ne[1] <= 8) {
+                int32_t hdr[3] = { il, (int32_t) sel->ne[1], (int32_t) ids.size() };
+                fwrite(hdr, sizeof(hdr), 1, trace);
+                fwrite(ids.data(), sizeof(int32_t), ids.size(), trace);
+                fflush(trace);
+            }
+        }
+
         size_t n_hit = 0;
         int32_t n_tok = 1;
         if (n_expert_used > 0 && ids.size() % (size_t) n_expert_used == 0) {
