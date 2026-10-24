@@ -1231,6 +1231,15 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il) const;
 
+    // DeepSeek-V4.1: async read of the selected host experts (LLAMA_DSV41_EXPS_PREFETCH=1)
+    void build_moe_exps_prefetch(
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+                     int   il) const;
+
     //
     // inputs
     //

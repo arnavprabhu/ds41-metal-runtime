@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-exps-prefetch.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2380,6 +2381,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    if (slots == nullptr && arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled()) {
+        build_moe_exps_prefetch(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2589,6 +2594,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+// a CPU op at the start of the expert split: reads the router ids and asks the OS to read the missing expert pages
+void llm_graph_context::build_moe_exps_prefetch(
+         ggml_tensor * selected_experts,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * gate_up_exps,
+                 int   il) const {
+    ggml_tensor * args[5] = { selected_experts };
+    int n_args = 1;
+    for (ggml_tensor * w : { up_exps, gate_exps, gate_up_exps, down_exps }) {
+        if (w == nullptr) {
+            continue;
+        }
+        if (w->buffer == nullptr || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_backend_buffer_is_host(w->buffer)) {
+            return;
+        }
+        if (n_args > 1 && w->ne[2] != args[1]->ne[2]) {
+            return;
+        }
+        args[n_args++] = w;
+    }
+    if (n_args == 1) {
+        return;
+    }
+
+    void * ud = llama_exps_prefetch::layer_userdata(&hparams, il, args + 1, n_args - 1);
+    ggml_tensor * pf = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, args, n_args, llama_exps_prefetch::op, 1, ud);
+    ggml_format_name(pf, "ffn_moe_prefetch-%d", il);
+    ggml_build_forward_expand(gf, pf);
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(

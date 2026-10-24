@@ -1,0 +1,38 @@
+#pragma once
+
+// DeepSeek-V4.1 routed-expert prefetch (LLAMA_DSV41_EXPS_PREFETCH=1, default off)
+//
+// The routed experts stay in the mmap'd GGUF and are read by the CPU MUL_MAT_ID through page faults
+// (synchronous 16 KiB faults at queue depth <= n_threads). Once the router ids reach the CPU split we know
+// exactly which expert slices the layer will read, so a graph op issues F_RDADVISE for the missing pages of
+// those slices from a small background pool: the reads go to the same page cache that backs the mapping
+// (outputs are bit-identical), at high queue depth, while the matmuls start right away.
+//
+// env:
+//   LLAMA_DSV41_EXPS_PREFETCH=1         enable (graph unchanged when off)
+//   LLAMA_DSV41_PREFETCH_NEXT=0         do not prefetch the next MoE layer's full expert tensors in prefill
+//   LLAMA_DSV41_PREFETCH_NEXT_MIN=N     n_tokens threshold for the next-layer prefetch (default 32)
+//   LLAMA_DSV41_PREFETCH_THREADS=N      advise threads (default 4)
+//   LLAMA_DSV41_PREFETCH_STATS=1        print page-cache hit rate and I/O counters when the model is freed
+
+#include <cstddef>
+
+struct ggml_tensor;
+
+namespace llama_exps_prefetch {
+
+bool enabled();
+
+// address range [addr, addr + len) maps file fd from offset 0; fd is dup'ed and owned by the registry
+void register_mapping(const void * owner, const void * addr, size_t len, int fd);
+
+// drops the owner's mappings and layers (waits for its in-flight advises), prints the stats if requested
+void unregister_owner(const void * owner);
+
+// remembers the expert tensors of layer il (for the next-layer prefetch) and returns the op userdata
+void * layer_userdata(const void * owner, int il, ggml_tensor * const * exps, int n_exps);
+
+// ggml custom op: src[0] = selected experts I32 [n_expert_used, n_tokens], src[1..] = expert weights [.., .., n_expert]
+void op(ggml_tensor * dst, int ith, int nth, void * userdata);
+
+} // namespace llama_exps_prefetch

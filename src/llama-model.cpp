@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-exps-prefetch.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1346,6 +1347,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    llama_exps_prefetch::unregister_owner(&hparams);
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2033,7 +2035,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
+        const bool exps_prefetch = arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled();
+        for (size_t idx = 0; idx < ml.mappings.size(); ++idx) {
+            auto & mapping = ml.mappings[idx];
+            if (exps_prefetch && mapping) {
+                llama_exps_prefetch::register_mapping(&hparams, mapping->addr(), mapping->size(), ml.files.at(idx)->file_id());
+            }
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
