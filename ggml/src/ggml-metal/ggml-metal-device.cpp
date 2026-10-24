@@ -983,6 +983,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// DS41 decode mat-vec kernels (env-gated, default off):
+//   GGML_METAL_DS41_Q5K=1 : Q5_K mat-vec x1/x2 (kernel_mul_mv_q5_K_f32_x1/_x2)
+//   GGML_METAL_DS41_IQ=1  : IQ1_M / IQ2_XXS / IQ2_XS mul_mv_id kernels (kernel_mul_mv_id_*_f32_x1)
+static bool ggml_metal_ds41_env(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
+static bool ggml_metal_ds41_q5k(void) {
+    static const bool v = ggml_metal_ds41_env("GGML_METAL_DS41_Q5K");
+    return v;
+}
+
+static bool ggml_metal_ds41_iq(void) {
+    static const bool v = ggml_metal_ds41_env("GGML_METAL_DS41_IQ");
+    return v;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1083,6 +1101,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
+                if (ggml_metal_ds41_q5k() && tsrc1 == GGML_TYPE_F32) {
+                    // x2 (row per lane group) when the 4 parallel block slots of x1 would be unbalanced
+                    const int nb = ne00/256; // QK_K
+                    if (nb < 8 && nb % 4 != 0) {
+                        nr0 = 4;
+                        suffix = "_x2";
+                    } else {
+                        nr0 = 1;
+                        suffix = "_x1";
+                    }
+                    nsg = 2;
+                }
             } break;
         case GGML_TYPE_Q6_K:
             {
@@ -1519,6 +1549,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 GGML_ABORT("not implemented");
             }
     };
+
+    if (ggml_metal_ds41_iq() && !split && tsrc1 == GGML_TYPE_F32 && ne00 % 256 == 0 && op->src[1]->nb[1] % 16 == 0) {
+        switch (tsrc0) {
+            case GGML_TYPE_IQ1_M:   nsg = 4; nr0 = 8; smem = 2048*4 + 81*8;   suffix = "_x1"; break;
+            case GGML_TYPE_IQ2_XXS: nsg = 4; nr0 = 4; smem = (256 + 128)*16;  suffix = "_x1"; break;
+            case GGML_TYPE_IQ2_XS:  nsg = 4; nr0 = 4; smem = (512 + 128)*16;  suffix = "_x1"; break;
+            default: break;
+        }
+    }
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
