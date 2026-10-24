@@ -3954,6 +3954,43 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
+        // deepseek41 sparse prefill attention on the matrix units (GGML_METAL_DSV4_SATTN=1): 64 heads over one KV
+        // head with K == V, dk = dv = 512, F16 KV, over the index lists built above (kernel_dsv4_sparse_attn_f16)
+        {
+            static const bool env_sattn = getenv("GGML_METAL_DSV4_SATTN") && atoi(getenv("GGML_METAL_DSV4_SATTN")) != 0;
+            const bool kv_same = op->src[1]->data == op->src[2]->data && op->src[1]->nb[1] == op->src[2]->nb[1] &&
+                                 op->src[1]->buffer == op->src[2]->buffer;
+            if (env_sattn && use_sparse && ne01 > 32 && ne00 == 512 && ne20 == 512 && kv_same &&
+                    op->src[1]->type == GGML_TYPE_F16 && ne12 == 1 && ne13 == 1 && ne03 == 1 && ne32 == 1 && ne33 == 1 &&
+                    ne02 % 16 == 0 && !has_bias && !has_scap && op->src[1]->nb[0] == sizeof(ggml_fp16_t)) {
+                ggml_metal_kargs_dsv4_sparse_attn sargs = {
+                    /*.ne01            =*/ (int32_t) ne01,
+                    /*.ne02            =*/ (int32_t) ne02,
+                    /*.nb01            =*/ nb01,
+                    /*.nb02            =*/ nb02,
+                    /*.nb11            =*/ op->src[1]->nb[1],
+                    /*.nb31            =*/ nb31,
+                    /*.n_kv_max_padded =*/ n_kv_max_padded,
+                    /*.scale           =*/ scale,
+                    /*.has_sinks       =*/ has_sinks ? 1 : 0,
+                };
+                auto pipeline_sa = ggml_metal_library_get_pipeline_dsv4_sparse_attn(lib);
+                ggml_metal_encoder_set_pipeline(enc, pipeline_sa);
+                ggml_metal_encoder_set_bytes   (enc, &sargs, sizeof(sargs), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_src4, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_idx,  5);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
+                const size_t smem_sa = GGML_PAD(16*512*2 + 8*16*16*4 + 16*16*2 + 128*4 + 3*16*4, 16);
+                GGML_ASSERT(smem_sa <= props_dev->max_theadgroup_memory_size);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_sa, 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02/16, 1, 32, 8, 1);
+                return 1;
+            }
+        }
+
         // note: for simplicity assume the K is larger or equal than V
         GGML_ASSERT(ne10 >= ne20);
 

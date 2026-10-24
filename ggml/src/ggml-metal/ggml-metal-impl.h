@@ -499,6 +499,19 @@ typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
+// deepseek41 sparse prefill attention on the matrix units (kernel_dsv4_sparse_attn_f16)
+typedef struct {
+    int32_t  ne01;            // query rows
+    int32_t  ne02;            // query heads
+    uint64_t nb01;            // q row stride (bytes, f32 q)
+    uint64_t nb02;            // q head stride
+    uint64_t nb11;            // k row stride (bytes, f16 k == v)
+    uint64_t nb31;            // mask row stride (bytes, f16 mask)
+    int32_t  n_kv_max_padded; // length of each per-row index list
+    float    scale;
+    int32_t  has_sinks;
+} ggml_metal_kargs_dsv4_sparse_attn;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne02;

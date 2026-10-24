@@ -155,6 +155,35 @@ struct llama_prefill_stage {
         });
     }
 
+    // free the staging sets between prompts (LLAMA_DSV41_STAGE_RELEASE, default on): they are only used by large
+    // ubatches, and during decode the 2 x ~3.7 GiB are better spent on the arena / page cache. init() re-allocates.
+    void release() {
+        restore();
+        wait_bg();
+        bool any = false;
+        for (auto & pb : buf) {
+            for (auto & b : pb) {
+                if (b) {
+                    ggml_backend_buffer_free(b);
+                    b = nullptr;
+                    any = true;
+                }
+            }
+        }
+        if (any) {
+            n_releases++;
+        }
+        staged[0] = staged[1] = -1;
+        cur = -1;
+        init_done = false;
+        layers.clear();
+        where.clear();
+        for (auto & c : cap) {
+            c = 0;
+        }
+    }
+    uint64_t n_releases = 0;
+
     void destroy() {
         restore();
         wait_bg();
@@ -2989,6 +3018,14 @@ ggml_status llama_context::graph_compute(
         // the last split is encoded; layer order restarts with the next graph
         stg->restore();
         stg->cur = -1;
+        static const bool rel = [] {
+            const char * v = getenv("LLAMA_DSV41_STAGE_RELEASE");
+            return v == nullptr || atoi(v) != 0;
+        }();
+        if (rel && !batched && stg->init_done && !stg->disabled) {
+            // a single-token (decode) graph: the prompt is done, give the staging memory back
+            stg->release();
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
