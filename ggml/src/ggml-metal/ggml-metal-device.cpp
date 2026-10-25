@@ -1552,7 +1552,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     if (ggml_metal_ds41_iq() && !split && tsrc1 == GGML_TYPE_F32 && ne00 % 256 == 0 && op->src[1]->nb[1] % 16 == 0) {
         switch (tsrc0) {
-            case GGML_TYPE_IQ1_M:   nsg = 4; nr0 = 8; smem = 2048*4 + 81*8;   suffix = "_x1"; break;
+            case GGML_TYPE_IQ1_M:   nsg = 4; nr0 = 8; smem = 2048*4 + 82*8;   suffix = "_x1"; break;
             case GGML_TYPE_IQ2_XXS: nsg = 4; nr0 = 4; smem = (256 + 128)*16;  suffix = "_x1"; break;
             case GGML_TYPE_IQ2_XS:  nsg = 4; nr0 = 4; smem = (512 + 128)*16;  suffix = "_x1"; break;
             default: break;
