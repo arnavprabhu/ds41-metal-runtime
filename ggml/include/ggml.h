@@ -2533,6 +2533,17 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Sparse K/V index lists given in the graph (src[5]) instead of being gathered from the mask: idx is I32
+    // [n_kv_max padded to the backend's list block, mask->ne[1], mask->ne[2], mask->ne[3]], each row the ascending KV
+    // indices of the row's finite mask entries, padded with -1. The mask is replaced by mask_row ([mask->ne[0]] F16),
+    // broadcast over the rows: the kernels only read the mask at listed indices, so mask_row must hold the row
+    // values there (e.g. 0 for a 0 / -inf mask). Metal only, requires n_kv_max > 0.
+    GGML_API void ggml_flash_attn_ext_set_idx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask_row);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

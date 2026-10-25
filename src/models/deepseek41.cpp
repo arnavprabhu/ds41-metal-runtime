@@ -22,7 +22,8 @@
 // ref: deepseek-ai/DeepSeek-V4.1-Flash-1017 inference/model.py, engram.py
 // compressed layers attend over [window | all compressed rows] with top-k as a mask. with flash attention the default
 // is sparse: fused indexer, FA bounded to window + top-k, decode-sized ubatches gather only the selected rows (same
-// keys and mask, different key order). LLAMA_DSV41_SPARSE=0 restores the reference path
+// keys and mask, different key order). LLAMA_DSV41_SPARSE=0 restores the reference path. LLAMA_DSV41_DEPTH=1|2 (prefill at
+// depth, exact): masks shared per top-k source, =2 hands the Metal FA its index lists built from the top-k (no dense mask)
 
 static constexpr int64_t DSV41_ENGRAM_DEAD = -1;
 
@@ -958,6 +959,25 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             GGML_ASSERT(!pick_blk || cand_pin->ne[0] == n_blk);
             GGML_ASSERT(!use_blk  || cand_n_comp == n_comp);
 
+            // LLAMA_DSV41_DEPTH: the candidate restriction folded into the indexer mask, built once for every index layer
+            // after the source. Both masks are 0 / -inf, so s + (m + b) == (s + m) + b bit for bit
+            const bool fold_blk = use_blk && fused_idx && depth >= 1 && n_blk*bs == n_comp;
+            ggml_tensor * idx_mask = ci.kq_mask;
+            if (fold_blk) {
+                if (!depth_cand_mask) {
+                    ggml_tensor * bsel = ggml_is_contiguous(cand_sel) ? cand_sel : ggml_cont(ctx0, cand_sel);
+                    const int64_t k_b = bsel->ne[0];
+                    ggml_tensor * bm    = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, n_blk, n_tok*n_stream, 1), -INFINITY);
+                    ggml_tensor * zeros = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, 1, k_b,   n_tok*n_stream, 1), 0.0f);
+                    bm = ggml_set_rows(ctx0, bm, zeros, ggml_reshape_3d(ctx0, bsel, k_b, n_tok*n_stream, 1));
+                    ggml_tensor * cm = ggml_add(ctx0, ggml_reshape_4d(ctx0, ci.kq_mask, bs, n_blk, n_tok, n_stream),
+                            ggml_reshape_4d(ctx0, bm, 1, n_blk, n_tok, n_stream));
+                    depth_cand_mask = ggml_reshape_4d(ctx0, cm, n_comp, n_tok, 1, n_stream);
+                    cb(depth_cand_mask, "cand_idx_mask", il);
+                }
+                idx_mask = depth_cand_mask;
+            }
+
             ggml_tensor * ik_p = fused_idx ? nullptr : ggml_permute(ctx0, ik, 0, 2, 1, 3);
             std::vector<ggml_tensor *> parts_top_k;
             std::vector<ggml_tensor *> parts_sel;
@@ -968,7 +988,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 };
                 ggml_tensor * score = nullptr;
                 if (fused_idx) {
-                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, ci.kq_mask);
+                    score = ggml_lightning_indexer(ctx0, iq, ik, iw, idx_mask);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * iqc = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nc, n_stream, iq->nb[1], iq->nb[2], iq->nb[3], t0*iq->nb[2]);
@@ -995,7 +1015,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     bmax = ggml_add(ctx0, ggml_reshape_4d(ctx0, bmax, n_blk, nc, 1, n_stream), rows(cand_pin));
                     cb(bmax, "cand_block_score", il);
                     parts_sel.push_back(ggml_top_k(ctx0, bmax, std::min<int64_t>(hparams.dsv41_cand_topk_blocks, n_blk)));
-                } else if (use_blk) {
+                } else if (use_blk && !fold_blk) {
                     // own scores, restricted to the source's candidate blocks: 0 inside them, -inf elsewhere
                     ggml_tensor * bsel = ggml_cont(ctx0, rows(cand_sel));
                     const int64_t k_b = bsel->ne[0];
@@ -1107,6 +1127,97 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
 
             out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+        } else if (depth >= 1 && cparams.flash_attn && !k_rot && raw_mask->type == GGML_TYPE_F16 &&
+                ci.kq_mask->type == GGML_TYPE_F16 && comp_all->type == raw_k->type && !ggml_is_quantized(raw_k->type)) {
+            // LLAMA_DSV41_DEPTH: same keys, mask values and FA op as the dense branch below. The compressed rows go
+            // into the concat straight from the strided cache view (no contiguous copy). The [window | compressed]
+            // mask is written once per top-k source: one -inf fill, the comp mask values at n_raw + top-k (-inf where
+            // top-k picked an invisible row, as fill + set_rows + add gives) and the window mask copied in front
+            ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
+                    comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], 0);
+            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+
+            const int64_t n_tok    = ci.kq_mask->ne[1];
+            const int64_t n_b      = n_tok*n_stream;
+            const int64_t n_tot    = n_raw + n_comp;
+            const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel;
+            GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == n_tok && raw_mask->ne[3] == n_stream);
+
+            // LLAMA_DSV41_DEPTH=2: the lists the Metal sparse FA would gather from the mask, built from the top-k
+            // (32 = the Metal list block, OP_FLASH_ATTN_EXT_VEC_NCPSG; the backend asserts the width)
+            if (depth >= 2 && n_kv_max % 32 == 0) {
+                ggml_tensor *& idx = depth_idx_of[topk_src];
+                if (!idx) {
+                    // integer arithmetic in F32 below is exact (|values| < 2^24); a 0 / -inf (F16) mask entry is finite
+                    // iff step(m + 1e30) == 1
+                    const int64_t L = n_kv_max;
+                    auto & wr = depth_raw_of[L];
+                    const int64_t n_r = std::min(n_raw, L);
+                    if (!wr.first) {
+                        // window part: finite positions of each row in ascending order (argsort of i - 2^20*finite), then -1
+                        ggml_tensor * fin = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, raw_mask, GGML_TYPE_F32), 1.0f, 1e30f));
+                        ggml_tensor * key = ggml_add(ctx0, ggml_scale(ctx0, fin, -1048576.0f), ggml_arange(ctx0, 0.0f, (float) n_raw, 1.0f));
+                        ggml_tensor * ord = ggml_argsort(ctx0, key, GGML_SORT_ORDER_ASC);
+                        ggml_tensor * pr  = ggml_cast(ctx0, ggml_view_4d(ctx0, ord, n_r, n_tok, 1, n_stream, ord->nb[1], ord->nb[2], ord->nb[3], 0), GGML_TYPE_F32);
+                        ggml_tensor * cnt = ggml_sum_rows(ctx0, fin);
+                        ggml_tensor * ok  = ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, cnt, pr), ggml_arange(ctx0, 0.0f, (float) n_r, 1.0f)));
+                        wr.first  = ggml_scale_bias(ctx0, ggml_mul(ctx0, ok, ggml_scale_bias(ctx0, pr, 1.0f, 1.0f)), 1.0f, -1.0f);
+                        wr.second = cnt;
+                        cb(wr.first, "comp_kv_idx_win", il);
+                    }
+
+                    // compressed part: the top-k rows in ascending order, n_raw + row where visible, else -1 (invisible rows
+                    // are >= the row's visible count, so they sort last), into slots count + rank (clamped to a spill slot L)
+                    ggml_tensor * tf  = ggml_cast(ctx0, ggml_reshape_2d(ctx0, top_k, k_sel, n_b), GGML_TYPE_F32);
+                    ggml_tensor * sv  = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, tf, 1, k_sel, n_b), ggml_argsort(ctx0, tf, GGML_SORT_ORDER_ASC));
+                    ggml_tensor * vis = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, n_b),
+                            ggml_reshape_2d(ctx0, ggml_cast(ctx0, sv, GGML_TYPE_I32), k_sel, n_b));
+                    vis = ggml_step(ctx0, ggml_scale_bias(ctx0, vis, 1.0f, 1e30f));
+                    ggml_tensor * cv = ggml_scale_bias(ctx0, ggml_mul(ctx0, vis, ggml_scale_bias(ctx0, sv, 1.0f, (float) (n_raw + 1))), 1.0f, -1.0f);
+                    ggml_tensor * cp = ggml_add(ctx0, ggml_repeat_4d(ctx0, wr.second, k_sel, n_tok, 1, n_stream), ggml_arange(ctx0, 0.0f, (float) k_sel, 1.0f));
+                    cp = ggml_cast(ctx0, ggml_clamp(ctx0, cp, 0.0f, (float) L), GGML_TYPE_I32);
+
+                    ggml_tensor * lst = ggml_concat(ctx0, wr.first,
+                            ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, L + 1 - n_r, n_tok, 1, n_stream), -1.0f), 0);
+                    lst = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, lst, 1, L + 1, n_b), ggml_reshape_3d(ctx0, cv, 1, k_sel, n_b),
+                            ggml_reshape_2d(ctx0, cp, k_sel, n_b));
+                    idx = ggml_cast(ctx0, ggml_view_4d(ctx0, lst, L, n_tok, 1, n_stream,
+                            (L + 1)*sizeof(float), (L + 1)*n_tok*sizeof(float), (L + 1)*n_tok*sizeof(float), 0), GGML_TYPE_I32);
+                    cb(idx, "comp_kv_idx", il);
+                }
+
+                // every listed entry of the dense mask is 0: a zero row stands for it
+                ggml_tensor *& zero = depth_zero_of[n_tot];
+                if (!zero) {
+                    zero = ggml_fill_inplace(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, n_tot), 0.0f);
+                }
+
+                // the mask passed here only gives the FA its shape: set_idx replaces it, it is not in the graph
+                ggml_tensor * shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_tot, n_tok, 1, n_stream);
+                out = build_attn_mha(q, k_all, k_all, nullptr, shape, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+                ggml_tensor * fa = out->src[0];
+                GGML_ASSERT(fa && fa->op == GGML_OP_FLASH_ATTN_EXT);
+                ggml_flash_attn_ext_set_idx(ctx0, fa, idx, zero);
+            } else {
+                ggml_tensor *& kq_mask = depth_mask_of[topk_src];
+                if (!kq_mask) {
+                    ggml_tensor * m = ggml_fill_inplace(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_tot, n_tok, 1, n_stream), -INFINITY);
+
+                    ggml_tensor * tk  = ggml_reshape_2d(ctx0, top_k, k_sel, n_b);
+                    ggml_tensor * val = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, ci.kq_mask, 1, n_comp, n_b), tk); // F32 0 / -inf
+                    // row ids + n_raw (exact in F32: < 2^24)
+                    ggml_tensor * pos = ggml_cast(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, tk, GGML_TYPE_F32), 1.0f, (float) n_raw), GGML_TYPE_I32);
+                    m = ggml_set_rows(ctx0, ggml_view_3d(ctx0, m, 1, n_tot, n_b, ggml_element_size(m), m->nb[1], 0), val, pos);
+
+                    ggml_tensor * mw = ggml_cpy(ctx0, raw_mask, ggml_view_4d(ctx0, m, n_raw, n_tok, 1, n_stream,
+                            n_tot*ggml_element_size(m), n_tot*n_tok*ggml_element_size(m), n_tot*n_tok*ggml_element_size(m), 0));
+                    kq_mask = ggml_view_4d(ctx0, mw, n_tot, n_tok, 1, n_stream,
+                            n_tot*ggml_element_size(m), n_tot*n_tok*ggml_element_size(m), n_tot*n_tok*ggml_element_size(m), 0);
+                    cb(kq_mask, "comp_kq_mask_depth", il);
+                }
+
+                out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+            }
         } else {
             // dense attention over [window | all compressed rows], selection applied as a mask
             ggml_tensor * comp_k = ggml_view_4d(ctx0, comp_all, n_embd_head, 1, n_comp, n_stream,
@@ -1172,6 +1283,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     static const bool sparse_env = dsv41_env_on("LLAMA_DSV41_SPARSE");
     sparse = sparse_env;
+
+    static const int depth_env = [] {
+        const char * v = getenv("LLAMA_DSV41_DEPTH");
+        return v ? std::max(0, atoi(v)) : 0;
+    }();
+    depth = sparse ? depth_env : 0;
 
     topk_of.assign(n_layer, nullptr);
     comp_row_of.assign(n_layer, nullptr);

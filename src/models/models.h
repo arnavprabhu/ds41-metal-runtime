@@ -1507,6 +1507,20 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         // the mask per top-k source (one input copy per split)
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+
+        // LLAMA_DSV41_DEPTH=1 (prefill at depth, exact): the [window | compressed] FA mask is written once per top-k
+        // source (one fill + scatter instead of fill/set_rows/add/concat per layer), the compressed K goes into the
+        // concat as a strided view, and the candidate restriction is folded once into the index layers' indexer mask
+        int depth = 0;
+        std::map<int32_t, ggml_tensor *> depth_mask_of; // FA mask per top-k source
+        ggml_tensor * depth_cand_mask = nullptr;        // comp mask + candidate blocks (index layers after the source)
+        // LLAMA_DSV41_DEPTH=2 (Metal): the FA index lists built in the graph from the top-k (no dense mask, no per-layer
+        // list builder): per top-k source, plus the zero mask row per width
+        std::map<int32_t, ggml_tensor *> depth_idx_of;
+        std::map<int64_t, ggml_tensor *> depth_zero_of;
+        // window part per list length n_kv_max: {[min(n_raw, n_kv_max), n_tok, 1, n_stream] F32 window positions or -1,
+        // [1, n_tok, 1, n_stream] F32 finite window entries per row}, shared by all layers
+        std::map<int64_t, std::pair<ggml_tensor *, ggml_tensor *>> depth_raw_of;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

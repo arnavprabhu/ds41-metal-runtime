@@ -5649,6 +5649,33 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_idx(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask_row) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 4) > 0);
+
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32 && ggml_is_contiguous(idx));
+    GGML_ASSERT(idx->ne[0] >= ggml_get_op_params_i32(a, 4));
+    GGML_ASSERT(idx->ne[1] == mask->ne[1] && idx->ne[2] == mask->ne[2] && idx->ne[3] == mask->ne[3]);
+    GGML_ASSERT(mask_row->type == GGML_TYPE_F16 && ggml_is_contiguous(mask_row));
+    GGML_ASSERT(mask_row->ne[0] == mask->ne[0] && ggml_nrows(mask_row) == 1);
+
+    // row-broadcast view of mask_row with the mask's shape
+    struct ggml_tensor * m = ggml_view_1d(ctx, mask_row, mask_row->ne[0], 0);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        m->ne[i] = mask->ne[i];
+        m->nb[i] = 0;
+    }
+
+    a->src[3] = m;
+    a->src[5] = idx;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
