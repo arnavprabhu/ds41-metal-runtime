@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cinttypes>
+#include <sys/sysctl.h>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -128,11 +129,14 @@ struct llama_prefill_stage {
     }
 
     // full read of layer li into parity li&1 on the background thread
-    void start_bg(int li) {
+    // LLAMA_DSV41_PREFILL_ARENA=1: experts resident in the MoE arena are copied from it instead of read from the file
+    uint64_t arena_experts = 0, file_experts = 0;
+    void start_bg(int li, llama_moe_cache * mc) {
         GGML_ASSERT(!busy);
         const int p = li & 1;
         std::vector<llama_exps_prefetch::upload_job> jobs;
         size_t bytes = 0;
+        static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
         for (int k = 0; k < N_KIND; ++k) {
             const ggml_tensor * t = layers[li][k];
             int      fd  = -1;
@@ -141,7 +145,31 @@ struct llama_prefill_stage {
                 staged[p] = -1;
                 return;
             }
-            llama_exps_prefetch::add_upload(jobs, fd, off, ggml_backend_buffer_get_base(buf[p][k]), ggml_nbytes(t), t->data);
+            char * dst = (char *) ggml_backend_buffer_get_base(buf[p][k]);
+            if (!(arena_env && mc != nullptr)) {
+                llama_exps_prefetch::add_upload(jobs, fd, off, dst, ggml_nbytes(t), t->data);
+            } else {
+                const int64_t n_expert = t->ne[2];
+                const size_t  es       = t->nb[2];
+                for (int64_t e = 0; e < n_expert; ) {
+                    const void * a = mc->resident_expert(t, e);
+                    int64_t n = 1;
+                    if (a) {
+                        while (e + n < n_expert && mc->resident_expert(t, e + n) == (const char *) a + n*es) {
+                            n++;
+                        }
+                        llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                        arena_experts += n;
+                    } else {
+                        while (e + n < n_expert && mc->resident_expert(t, e + n) == nullptr) {
+                            n++;
+                        }
+                        llama_exps_prefetch::add_upload(jobs, fd, off + e*es, dst + e*es, n*es, (const char *) t->data + e*es);
+                        file_experts += n;
+                    }
+                    e += n;
+                }
+            }
             bytes += ggml_nbytes(t);
         }
         staged[p] = li;
@@ -188,6 +216,9 @@ struct llama_prefill_stage {
         restore();
         wait_bg();
         if (n_reads || n_staged_splits) {
+            if (arena_experts + file_experts > 0) {
+                fprintf(stderr, "exps-prefetch stage: arena copies = %llu experts, file reads = %llu experts\n", (unsigned long long) arena_experts, (unsigned long long) file_experts);
+            }
             fprintf(stderr, "exps-prefetch stage: staged splits = %llu, fallback layers = %llu, reads = %llu (%.1f GiB, %.1f s on the reader, %.3f s exposed wait)\n",
                     (unsigned long long) n_staged_splits, (unsigned long long) n_fallback_layers, (unsigned long long) n_reads,
                     read_bytes / (1024.0*1024.0*1024.0), read_us / 1e6, wait_us / 1e6);
@@ -584,7 +615,13 @@ llama_context::llama_context(
     // decode, see llama-moe-cache.cpp) for tools that have no --moe-cache-mib flag (llama-bench, ...)
     if (model.arch == LLM_ARCH_DEEPSEEK41 && cparams.moe_cache_size == 0) {
         const char * v = getenv("LLAMA_DSV41_MOE_CACHE_MIB");
-        const long long mib = v ? atoll(v) : 0;
+        long long mib = v ? atoll(v) : 0;
+        if (v && strcmp(v, "auto") == 0) {
+            // allocated at the maximum, limited after the compute buffers are reserved (see below)
+            const char * mx = getenv("LLAMA_DSV41_MOE_CACHE_MAX_MIB");
+            mib = mx ? atoll(mx) : 40960;
+            moe_cache_auto = true;
+        }
         if (mib > 0) {
             cparams.moe_cache_size = (size_t) mib << 20;
             LLAMA_LOG_INFO("%s: dsv41: MoE slot arena %lld MiB (env LLAMA_DSV41_MOE_CACHE_MIB)\n", __func__, mib);
@@ -804,7 +841,21 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
+        if (moe_cache_auto) {
+            // the arena is wired by Metal as a whole (touched or not), so it must be allocated at its final size: reserve the
+            // graphs with a small probe arena (the compute buffers do not depend on the number of slots), size the arena,
+            // then allocate it and reserve again
+            static const long long probe_mib = [] { const char * v = getenv("LLAMA_DSV41_MOE_PROBE_MIB"); return v ? atoll(v) : 2048LL; }();
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, (size_t) probe_mib << 20);
+            sched_reserve();
+            const size_t target = moe_cache_auto_size();
+            moe_cache.reset();
+            if (target > 0) {
+                cparams.moe_cache_size = target;
+                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            }
+            sched_need_reserve = true;
+        } else if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
@@ -833,6 +884,11 @@ llama_context::~llama_context() {
     synchronize();
 
     llama_prefill_stage_destroy(this);
+    if (copy_experts.arena_experts + copy_experts.file_experts > 0) {
+        fprintf(stderr, "llama_context: prefill arena reads: %llu experts from the arena, %llu from the file (%.1f%% resident)\n",
+            (unsigned long long) copy_experts.arena_experts, (unsigned long long) copy_experts.file_experts,
+            100.0*copy_experts.arena_experts/(copy_experts.arena_experts + copy_experts.file_experts));
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -969,6 +1025,49 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_copy_nosync_callback(sched.get(), sched_copy_nosync, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+}
+
+// LLAMA_DSV41_MOE_CACHE_MIB=auto: arena = RAM*frac - (dense weights + KV + compute buffers + prefill staging + margin), in
+// [LLAMA_DSV41_MOE_CACHE_MIN_MIB (4096), LLAMA_DSV41_MOE_CACHE_MAX_MIB (40960)]. frac = LLAMA_DSV41_MOE_RAM_FRAC (0.90),
+// margin = LLAMA_DSV41_MOE_MARGIN_MIB (3072).
+static double envd0(const char * k, double d) { const char * v = getenv(k); return v ? atof(v) : d; }
+
+size_t llama_context::moe_cache_auto_size() {
+    uint64_t phys = 0;
+    size_t len = sizeof(phys);
+    if (sysctlbyname("hw.memsize", &phys, &len, nullptr, 0) != 0 || phys == 0) {
+        LLAMA_LOG_WARN("%s: cannot read hw.memsize, arena stays at its maximum\n", __func__);
+        return (size_t) (envd0("LLAMA_DSV41_MOE_CACHE_MAX_MIB", 40960.0)*1024.0*1024.0);
+    }
+    auto envd = envd0;
+    const double mib = 1024.0*1024.0;
+    const double frac = envd("LLAMA_DSV41_MOE_RAM_FRAC", 0.90);
+    const double margin = envd("LLAMA_DSV41_MOE_MARGIN_MIB", 3072.0)*mib;
+    const double lo = envd("LLAMA_DSV41_MOE_CACHE_MIN_MIB", 4096.0)*mib;
+    const double hi = envd("LLAMA_DSV41_MOE_CACHE_MAX_MIB", 40960.0)*mib;
+    double dense = 0, kv = 0, compute = 0;
+    for (const auto & [buft, size] : model.memory_breakdown()) {
+        if (!ggml_backend_buft_is_host(buft)) {
+            dense += size;
+        }
+    }
+    if (memory) {
+        for (const auto & [buft, size] : memory->memory_breakdown()) {
+            kv += size;
+        }
+    }
+    for (const auto & backend_ptr : backends) {
+        compute += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptr.get());
+    }
+    // the prefill staging sets (2 x largest gate/up/down tensors, ~7.4 GiB) coexist with the arena during prefill
+    const char * st = getenv("LLAMA_DSV41_PREFILL_STAGE");
+    const double staging = (st && atoi(st) != 0) ? 7.4*1024.0*mib : 0.0;
+    double target = (double) phys*frac - (dense + kv + compute + staging + margin);
+    target = std::min(hi, std::max(lo, target));
+    fprintf(stderr, "llama_moe_cache: auto arena: RAM %.1f GiB x %.2f - (dense %.2f + KV %.2f + compute %.2f + staging %.2f + margin %.2f GiB) = %.2f GiB -> %.2f GiB (clamp %.1f..%.1f)\n",
+        phys/(1024.0*mib), frac, dense/(1024.0*mib), kv/(1024.0*mib), compute/(1024.0*mib), staging/(1024.0*mib), margin/(1024.0*mib),
+        ((double) phys*frac - (dense + kv + compute + staging + margin))/(1024.0*mib), target/(1024.0*mib), lo/(1024.0*mib), hi/(1024.0*mib));
+    return (size_t) target;
 }
 
 void llama_context::sched_reserve() {
@@ -3158,7 +3257,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                             stg->n_fallback_layers++;
                         }
                         if (li + 1 < (int) stg->layers.size()) {
-                            stg->start_bg(li + 1);
+                            stg->start_bg(li + 1, lctx->moe_cache.get());
                         }
                     }
                     if (stg->cur_have) {
@@ -3180,6 +3279,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             llama_exps_prefetch::upload_add_sync_us(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
 
             st.jobs.clear();
+            static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
+            const bool arena_reads = arena_env && lctx->moe_cache != nullptr;
             for (int64_t first = 0; first < n_expert; ) {
                 if (!st.used[first]) {
                     first++;
@@ -3190,10 +3291,36 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                     last++;
                 }
                 // same extent as the set_async path below (incl. the padding into the next expert)
-                const size_t offset  = first*expert_size;
-                const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-                const size_t size    = (last + 1 - first)*expert_size + padding;
-                llama_exps_prefetch::add_upload(st.jobs, fd, file_off + offset, (char *) dst->data + offset, size, (const char *) src->data + offset);
+                if (!arena_reads) {
+                    const size_t offset  = first*expert_size;
+                    const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+                    const size_t size    = (last + 1 - first)*expert_size + padding;
+                    llama_exps_prefetch::add_upload(st.jobs, fd, file_off + offset, (char *) dst->data + offset, size, (const char *) src->data + offset);
+                    first = last + 1;
+                    continue;
+                }
+                // LLAMA_DSV41_PREFILL_ARENA=1: experts resident in the MoE arena are copied from it (memory speed, fd -1 =
+                // memcpy job) and only the others are read from the file; runs of consecutive experts in consecutive slots merge
+                for (int64_t e = first; e <= last; ) {
+                    const void * a = lctx->moe_cache->resident_expert(src, e);
+                    int64_t n = 1;
+                    if (a) {
+                        while (e + n <= last && lctx->moe_cache->resident_expert(src, e + n) == (const char *) a + n*expert_size) {
+                            n++;
+                        }
+                        llama_exps_prefetch::add_upload(st.jobs, -1, 0, (char *) dst->data + e*expert_size, n*expert_size, a);
+                        st.arena_experts += n;
+                    } else {
+                        while (e + n <= last && lctx->moe_cache->resident_expert(src, e + n) == nullptr) {
+                            n++;
+                        }
+                        const size_t offset  = e*expert_size;
+                        const size_t padding = (e + n - 1) < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+                        llama_exps_prefetch::add_upload(st.jobs, fd, file_off + offset, (char *) dst->data + offset, n*expert_size + padding, (const char *) src->data + offset);
+                        st.file_experts += n;
+                    }
+                    e += n;
+                }
                 first = last + 1;
             }
             llama_exps_prefetch::upload(st.jobs);

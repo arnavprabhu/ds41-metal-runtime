@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #ifndef MOE_CACHE_ASSERT
@@ -107,6 +108,12 @@ struct moe_cache_lru {
                 seed = nullptr;
             }
         }
+        if (evict == evict_kind::lfu_decay) {
+            const char * hf = std::getenv("LLAMA_DSV41_MOE_HEAT_FILE");
+            if (hf != nullptr && hf[0] != '\0' && load_heat_file(hf)) {
+                seed = hf;
+            }
+        }
         static int logged = 0;
         if (logged++ == 0) {
             std::fprintf(stderr,
@@ -134,6 +141,118 @@ struct moe_cache_lru {
             return plan_lru(il, fills, n_hit);
         }
         return plan_lfu(il, ids, n_ids, n_tokens, fills, n_hit);
+    }
+
+    // ---- speculative prefetch (LLAMA_DSV41_MOE_PREDICT) ------------------------------------------------------------------
+    // prefetch_begin: the slots of the experts layer pl is reading right now may not be taken as victims until the next
+    // prefetch_begin/prefetch_end; prefetch_take gives a slot to expert e of layer il without counting a selection (no heat
+    // bump) when it is not resident and a victim exists whose heat is below heat(e) + bonus. unmap forgets a prefetch that was
+    // cancelled before any byte was read (the slot becomes empty).
+    std::vector<char> reserved; // slots owned by an in-flight warm fill (not victims)
+    std::vector<uint32_t> prot;
+    uint32_t prot_gen = 0;
+    bool prot_active = false;
+
+    bool is_reserved(int32_t s) const {
+        return !reserved.empty() && reserved[s] != 0;
+    }
+    void reserve(int32_t s, bool on) {
+        if (reserved.empty()) {
+            reserved.assign(n_slots, 0);
+        }
+        reserved[s] = on ? 1 : 0;
+    }
+
+    // LLAMA_DSV41_MOE_HEAT_FILE: heat persisted by a previous run ("DSHT", n_layer, n_expert, f32 [n_layer][n_expert]).
+    // Replaces the profile seed; each group only uses the rows of its own layers.
+    bool load_heat_file(const char * path) {
+        std::FILE * f = std::fopen(path, "rb");
+        if (f == nullptr) {
+            return false;
+        }
+        uint32_t hdr[4] = { 0, 0, 0, 0 };
+        bool ok = std::fread(hdr, sizeof(uint32_t), 4, f) == 4 && hdr[0] == 0x54485344u && hdr[1] == (uint32_t) n_layer && hdr[2] == (uint32_t) n_expert;
+        if (ok) {
+            ok = std::fread(heat.data(), sizeof(float), heat.size(), f) == heat.size();
+        }
+        std::fclose(f);
+        return ok;
+    }
+    static bool save_heat_file(const char * path, int32_t n_layer, int32_t n_expert, const std::vector<float> & heat) {
+        const std::string tmp = std::string(path) + ".tmp";
+        std::FILE * f = std::fopen(tmp.c_str(), "wb");
+        if (f == nullptr) {
+            return false;
+        }
+        const uint32_t hdr[4] = { 0x54485344u, (uint32_t) n_layer, (uint32_t) n_expert, 0 };
+        bool ok = std::fwrite(hdr, sizeof(uint32_t), 4, f) == 4 && std::fwrite(heat.data(), sizeof(float), heat.size(), f) == heat.size();
+        ok = (std::fclose(f) == 0) && ok;
+        return ok && std::rename(tmp.c_str(), path) == 0;
+    }
+
+    void prefetch_begin(int32_t pl, const int32_t * ids, size_t n_ids) {
+        if (prot.size() != (size_t) n_slots) {
+            prot.assign(n_slots, 0);
+            prot_gen = 0;
+        }
+        if (++prot_gen == 0) {
+            std::fill(prot.begin(), prot.end(), 0);
+            prot_gen = 1;
+        }
+        prot_active = true;
+        for (size_t i = 0; i < n_ids; ++i) {
+            const int32_t s = slot_map[pl][ids[i]];
+            if (s >= 0) {
+                prot[s] = prot_gen;
+            }
+        }
+        rank_lru();
+    }
+    void prefetch_end() {
+        prot_active = false;
+    }
+    bool prefetch_take(int32_t il, int32_t e, float bonus, fill & out) {
+        int32_t * slots = slot_map[il];
+        if (slots[e] >= 0) {
+            return false;
+        }
+        int32_t best = -1;
+        float best_h = 0.0f;
+        int32_t best_r = 0;
+        bool best_empty = false;
+        for (int32_t s = 0; s < n_slots; ++s) {
+            if (prot[s] == prot_gen || is_reserved(s)) {
+                continue;
+            }
+            const int32_t key = key_of[s];
+            const bool empty = key < 0;
+            const float h = empty ? 0.0f : heat[(size_t) key];
+            const int32_t r = lru_rank.empty() ? 0 : lru_rank[s];
+            const bool better = best < 0 || (empty && !best_empty) ||
+                (empty == best_empty && (h < best_h || (h == best_h && r < best_r)));
+            if (better) {
+                best = s; best_h = h; best_r = r; best_empty = empty;
+            }
+        }
+        if (best < 0) {
+            return false;
+        }
+        if (evict == evict_kind::lfu_decay && !best_empty && heat[(size_t) il*n_expert + e] + bonus <= best_h) {
+            return false;
+        }
+        if (key_of[best] >= 0) {
+            slot_map[key_of[best] / n_expert][key_of[best] % n_expert] = -1;
+        }
+        key_of[best] = il*n_expert + e;
+        slots[e] = best;
+        prot[best] = prot_gen;
+        out = { e, best };
+        return true;
+    }
+    void unmap(int32_t il, int32_t e, int32_t slot) {
+        MOE_CACHE_ASSERT(slot_map[il][e] == slot && key_of[slot] == il*n_expert + e);
+        slot_map[il][e] = -1;
+        key_of[slot] = -1;
     }
 
 private:
@@ -305,6 +424,9 @@ private:
         int32_t best_r = 0;
         bool best_empty = false;
         for (int32_t s = 0; s < n_slots; ++s) {
+            if ((prot_active && prot[s] == prot_gen) || is_reserved(s)) {
+                continue;
+            }
             const int32_t key = key_of[s];
             const bool empty = key < 0;
             if (!empty) {

@@ -5,6 +5,7 @@
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -530,8 +531,26 @@ private:
     }
 };
 
+namespace {
+struct engram_stats_t {
+    bool on = getenv("LLAMA_DSV41_ENGRAM_STATS") != nullptr;
+    uint64_t calls = 0, tok1_calls = 0, hash_us = 0, pref_us = 0, gather_us = 0, set_us = 0;
+    ~engram_stats_t() {
+        if (on && tok1_calls > 0) {
+            fprintf(stderr, "engram stats: single-token set_input calls = %llu, hash %.1f us, readahead %.1f us, gather %.1f us, upload %.1f us (per call)\n",
+                (unsigned long long) tok1_calls, (double) hash_us/tok1_calls, (double) pref_us/tok1_calls, (double) gather_us/tok1_calls, (double) set_us/tok1_calls);
+        }
+    }
+} g_eg;
+inline uint64_t eg_now() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {
+        const bool eg_t = g_eg.on && ubatch->n_tokens == 1;
+        uint64_t eg0 = eg_t ? eg_now() : 0;
         // a token shared by several sequences has the same history in each, so its first sequence resolves it
         std::vector<llama_token> prev;
         mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
@@ -552,14 +571,19 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         llama_dsv41_dump_engram(model, *ubatch, ids);
+        uint64_t eg1 = eg_t ? eg_now() : 0;
+        if (eg_t) { g_eg.pref_us += eg1 - eg0; g_eg.tok1_calls++; }
         std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {
                 if (engram_tab[e]) {
                     // host gather: same rows and conversion as the CPU GET_ROWS
                     rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
+                    const uint64_t g0 = eg_t ? eg_now() : 0;
                     llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    const uint64_t g1 = eg_t ? eg_now() : 0;
                     ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
+                    if (eg_t) { g_eg.gather_us += g1 - g0; g_eg.set_us += eg_now() - g1; }
                 } else {
                     ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
                 }
@@ -1173,7 +1197,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 ggml_tensor * pl = ggml_mul_mat(ctx0, nl.ffn_gate_inp, px);
                 ggml_prec_set_acc(pl, GGML_PREC_F32);
                 ggml_tensor * pp = ggml_add(ctx0, ggml_sqrt(ctx0, ggml_softplus(ctx0, pl)), nl.ffn_exp_probs_b);
-                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pp, hparams.n_expert_used()));
+                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pp, llama_moe_cache_predict_k()));
                 ggml_format_name(pred, "dsv41_moe_pred-%d", il + 1);
                 ggml_set_output(pred);
                 ggml_build_forward_expand(gf, pred);

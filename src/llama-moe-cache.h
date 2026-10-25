@@ -41,6 +41,13 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // bytes of the arena slots in use, and shrinking it (before the first graph is computed) to at most target bytes
+    size_t active_bytes() const;
+    void   shrink(size_t target);
+
+    // pointer to expert e of the host tensor w inside the arena if it is resident (CPU-addressable shared memory), else nullptr
+    const void * resident_expert(const ggml_tensor * w, int64_t e);
+
     // the graph about to be computed: picks up the next-layer prediction tensors (LLAMA_DSV41_MOE_PREDICT=1)
     void set_graph(ggml_cgraph * gf);
 
@@ -54,5 +61,9 @@ private:
 // LLAMA_DSV41_MOE_PREDICT=1: decode graphs compute layer il+1's router on layer il's FFN input, and the cache
 // prefetches the predicted misses in the background (residency only, outputs unchanged)
 bool llama_moe_cache_predict_enabled();
+// 1 = old (prefetch after the fill of the layer, background thread), 2 = look-ahead into the prefetch queue at the plan of the layer
+int llama_moe_cache_predict_mode();
+// number of predicted experts per layer (LLAMA_DSV41_PREDICT_K, default 6, max 16)
+int llama_moe_cache_predict_k();
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
