@@ -705,6 +705,27 @@ typedef struct {
 } ggml_metal_kargs_snake;
 
 typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb10;   // base stride along dim 0
+    uint64_t nb11;   // base stride along dim 1 (0 when broadcast)
+    uint64_t nb1;    // dst row stride
+    float    scale;
+    float    bias;
+} ggml_metal_kargs_ds41_hc_gate;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb01;   // src row stride
+    uint64_t nb11;   // bias row stride (0 when broadcast)
+    uint64_t nb1p;   // probs (sqrt output) row stride
+    uint64_t nb1;    // dst row stride
+} ggml_metal_kargs_ds41_router;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

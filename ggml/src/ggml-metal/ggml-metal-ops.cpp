@@ -815,6 +815,15 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_ROUTER) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_router(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -4227,6 +4236,12 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
             return ggml_metal_op_snake_fused(ctx, idx);
         }
 
+        // DeepSeek-V4 hc gate: mul -> add -> sigmoid -> scale
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_HC_GATE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_hc_gate(ctx, idx);
+        }
+
         // MoE output reduction: experts * weights -> weighted sum
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MOE_REDUCE) {
             ctx->count_fusions(fusion);
@@ -5177,6 +5192,99 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
 
     return 5;
+}
+
+// Dispatch the fused DeepSeek-V4 hc gate from the matched mul -> add -> sigmoid -> scale chain.
+int ggml_metal_op_ds41_hc_gate(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mul = ctx->node(idx + 0);
+    const ggml_tensor * add = ctx->node(idx + 1);
+    ggml_tensor *       scl = ctx->node(idx + 3);
+
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * s = mul->src[1];
+    const ggml_tensor * b = add->src[1];
+
+    // the encode loop pre-checked the leading mul only, check the rest of the chain
+    for (int i = 1; i < 4; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_hc_gate args = {
+        /*.ne0   =*/ (int32_t) scl->ne[0],
+        /*.ne1   =*/ (int32_t) scl->ne[1],
+        /*.nb00  =*/ x->nb[0],
+        /*.nb01  =*/ x->nb[1],
+        /*.nb10  =*/ b->nb[0],
+        /*.nb11  =*/ b->ne[1] == 1 ? 0 : b->nb[1],
+        /*.nb1   =*/ scl->nb[1],
+        /*.scale =*/ ggml_get_op_params_f32(scl, 0),
+        /*.bias  =*/ ggml_get_op_params_f32(scl, 1),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_hc_gate(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scl), 4);
+
+    const int n   = args.ne0*args.ne1;
+    const int nth = std::min(n, 256);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 4;
+}
+
+// Dispatch the fused DeepSeek-V4 router scores from the matched softplus -> sqrt -> add chain (writes sqrt and add).
+int ggml_metal_op_ds41_router(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * sp  = ctx->node(idx + 0);
+    ggml_tensor *       sq  = ctx->node(idx + 1);
+    ggml_tensor *       add = ctx->node(idx + 2);
+
+    const ggml_tensor * x = sp->src[0];
+    const ggml_tensor * b = add->src[1];
+
+    for (int i = 1; i < 3; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_router args = {
+        /*.ne0  =*/ (int32_t) add->ne[0],
+        /*.ne1  =*/ (int32_t) add->ne[1],
+        /*.nb01 =*/ x->nb[1],
+        /*.nb11 =*/ b->ne[1] == 1 ? 0 : b->nb[1],
+        /*.nb1p =*/ sq->nb[1],
+        /*.nb1  =*/ add->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_router(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sq),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add), 4);
+
+    const int n   = args.ne0*args.ne1;
+    const int nth = std::min(n, 256);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 3;
 }
 
 int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
