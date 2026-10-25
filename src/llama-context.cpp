@@ -60,6 +60,16 @@
 //                                           F_NOCACHE fd into the page-aligned buffer base and the tensor data is pointed at
 //                                           base + off % 16 KiB (same bytes). =2: same widening on the cached fd.
 //                                           0 = off (default). Lossless (identical bytes).
+//   LLAMA_DSV41_STAGE_UNION=1               predicted-union staging: the reader of layer i+1 reads only a predicted expert
+//                                           set P = layer i's selection (same ubatch) | layer i+1's selection in the previous
+//                                           staged ubatch (=2: the previous ubatch's alone when available), runs separated
+//                                           by <= LLAMA_DSV41_STAGE_UNION_GAP (2) experts merged; if |P| > n_expert x
+//                                           LLAMA_DSV41_STAGE_UNION_MAX_FRAC (0.85) the full tensors are read. At the first
+//                                           split of layer i+1 (ids known) the selected experts not in P are read
+//                                           synchronously on the upload pool before any split of the layer is encoded.
+//                                           MUL_MAT_ID only reads the selected experts' slices, so the unread ones are never
+//                                           touched. LLAMA_DSV41_STAGE_UNION_RESET=1 drops the previous-ubatch prediction at
+//                                           a ubatch starting at pos 0 (default: kept across prompts). Lossless.
 namespace {
 
 struct llama_prefill_stage {
@@ -113,6 +123,10 @@ struct llama_prefill_stage {
             if (it == where.end() || it->second.first != sr.li) {
                 return nullptr;
             }
+            // union mode: only experts whose bytes were staged (seed_take picks selected experts, which are all present)
+            if (!have[p].empty() && (e >= (int64_t) have[p].size() || !have[p][e])) {
+                return nullptr;
+            }
             return (const char *) stage_data(p, it->second.second) + (size_t) e*t->nb[2];
         });
     }
@@ -137,6 +151,144 @@ struct llama_prefill_stage {
     uint64_t widen_jobs = 0, widen_extra_bytes = 0, widen_tail_clamped = 0, widen_fallback = 0;
     char * stage_data(int p, int k) const {
         return (char *) ggml_backend_buffer_get_base(buf[p][k]) + head[p][k];
+    }
+
+    // predicted-union staging (LLAMA_DSV41_STAGE_UNION)
+    static int union_mode() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_STAGE_UNION"); return v ? std::max(0, atoi(v)) : 0; }();
+        return n;
+    }
+    static double union_max_frac() {
+        static const double f = [] { const char * v = getenv("LLAMA_DSV41_STAGE_UNION_MAX_FRAC"); return v ? atof(v) : 0.85; }();
+        return f;
+    }
+    static int union_gap() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_STAGE_UNION_GAP"); return v ? std::max(0, atoi(v)) : 2; }();
+        return n;
+    }
+    static bool union_reset() {
+        static const bool on = [] { const char * v = getenv("LLAMA_DSV41_STAGE_UNION_RESET"); return v && atoi(v) != 0; }();
+        return on;
+    }
+    std::vector<bool>              have[2];    // experts whose bytes are in the staging set of the parity (empty = all)
+    std::vector<std::vector<bool>> un_prev_ub; // [layer order index] selection of the previous staged-size ubatch
+    uint64_t un_layers = 0, un_capped = 0, un_pred_bytes = 0, un_full_bytes = 0;
+    uint64_t un_miss_layers = 0, un_miss_experts = 0, un_miss_bytes = 0, un_miss_us = 0;
+
+    // predicted expert set of layer li from cur_used (layer li-1's selection) and li's selection in the previous ubatch,
+    // gaps of <= union_gap() experts filled so the reads stay large; false: read the full tensors
+    bool union_predict(int li, const std::vector<bool> & cur_used, std::vector<bool> & want) const {
+        const int64_t n_expert = layers[li][0]->ne[2];
+        if ((int64_t) cur_used.size() != n_expert) {
+            return false;
+        }
+        const std::vector<bool> * pu = li < (int) un_prev_ub.size() && (int64_t) un_prev_ub[li].size() == n_expert ? &un_prev_ub[li] : nullptr;
+        want.assign(n_expert, false);
+        int64_t n = 0, last = -1;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const bool w = union_mode() == 2 && pu ? (bool) (*pu)[e] : (cur_used[e] || (pu && (*pu)[e]));
+            if (!w) {
+                continue;
+            }
+            if (last >= 0 && e - last - 1 <= union_gap()) {
+                for (int64_t g = last + 1; g < e; ++g) {
+                    want[g] = true;
+                    n++;
+                }
+            }
+            want[e] = true;
+            n++;
+            last = e;
+        }
+        return n <= union_max_frac()*n_expert;
+    }
+
+    // jobs for the experts sel[] of host tensor t into dst (its staging data), as runs of consecutive experts; with mc
+    // (PREFILL_ARENA) the resident ones are copied from the arena. File runs carry the per-expert path's padding (up to
+    // 512 bytes of the next expert; Metal's MUL_MAT_ID never reads it). Returns the number of experts.
+    int64_t add_expert_runs(std::vector<llama_exps_prefetch::upload_job> & jobs, const ggml_tensor * t, int fd, uint64_t off, char * dst,
+            const std::vector<bool> & sel, llama_moe_cache * mc) {
+        const int64_t n_expert = t->ne[2];
+        const size_t  es       = t->nb[2];
+        int64_t n_sel = 0;
+        for (int64_t first = 0; first < n_expert; ) {
+            if (!sel[first]) {
+                first++;
+                continue;
+            }
+            int64_t last = first;
+            while (last + 1 < n_expert && sel[last + 1]) {
+                last++;
+            }
+            for (int64_t e = first; e <= last; ) {
+                const void * a = mc ? mc->resident_expert(t, e) : nullptr;
+                int64_t n = 1;
+                if (a) {
+                    while (e + n <= last && mc->resident_expert(t, e + n) == (const char *) a + n*es) {
+                        n++;
+                    }
+                    llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                    arena_experts += n;
+                } else {
+                    while (e + n <= last && (mc == nullptr || mc->resident_expert(t, e + n) == nullptr)) {
+                        n++;
+                    }
+                    const size_t padding = e + n < n_expert ? std::min<size_t>(es, 512) : 0;
+                    add_file_read(jobs, fd, off + e*es, dst + e*es, n*es + padding, (const char *) t->data + e*es);
+                    file_experts += n;
+                }
+                e += n;
+            }
+            n_sel += last + 1 - first;
+            first  = last + 1;
+        }
+        return n_sel;
+    }
+
+    // first split of layer li (after the synchronize and wait_bg): the experts selected at li that the reader did not stage
+    // are read now on the upload pool (critical path), before any split of li is encoded
+    void union_fill_missing(int li, const std::vector<bool> & used, llama_moe_cache * mc) {
+        const int p = li & 1;
+        std::vector<bool> & hv = have[p];
+        if (hv.empty() || staged[p] != li) {
+            return;
+        }
+        const int64_t n_expert = (int64_t) hv.size();
+        std::vector<bool> miss(n_expert, false);
+        int64_t n_miss = 0;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            // a size mismatch (never expected) reads every expert not yet staged
+            miss[e] = ((int64_t) used.size() != n_expert || used[e]) && !hv[e];
+            n_miss += miss[e];
+        }
+        if (n_miss == 0) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<llama_exps_prefetch::upload_job> jobs;
+        size_t bytes = 0;
+        for (int k = 0; k < N_KIND; ++k) {
+            const ggml_tensor * t = layers[li][k];
+            int      fd  = -1;
+            uint64_t off = 0;
+            if (!llama_exps_prefetch::lookup(t->data, ggml_nbytes(t), &fd, &off)) {
+                staged[p] = -1; // cannot complete the set: the layer takes the fallback upload
+                hv.clear();
+                return;
+            }
+            add_expert_runs(jobs, t, fd, off, stage_data(p, k), miss, mc);
+            bytes += (size_t) n_miss*t->nb[2];
+        }
+        llama_exps_prefetch::upload(jobs);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (miss[e]) {
+                hv[e] = true;
+            }
+        }
+        un_miss_layers++;
+        un_miss_experts += n_miss;
+        un_miss_bytes   += bytes;
+        un_miss_us      += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     }
 
     // selected-expert union stats (LLAMA_DSV41_STAGE_STATS)
@@ -407,18 +559,24 @@ struct llama_prefill_stage {
     void start_bg(int li, llama_moe_cache * mc) {
         start_bg(li, mc, seed_req());
     }
-    void start_bg(int li, llama_moe_cache * mc, seed_req sr) {
+    void start_bg(int li, llama_moe_cache * mc, seed_req sr, const std::vector<bool> * cur_used = nullptr) {
         GGML_ASSERT(!busy);
         const int p = li & 1;
         std::vector<llama_exps_prefetch::upload_job> jobs;
         size_t bytes = 0;
         static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
+        // LLAMA_DSV41_STAGE_UNION: only the predicted experts have[p] (empty = the full tensors)
+        const bool un = cur_used != nullptr && union_mode() != 0 && union_predict(li, *cur_used, have[p]);
+        if (!un) {
+            have[p].clear();
+        }
         for (int k = 0; k < N_KIND; ++k) {
             const ggml_tensor * t = layers[li][k];
             int      fd  = -1;
             uint64_t off = 0;
             if (!llama_exps_prefetch::lookup(t->data, ggml_nbytes(t), &fd, &off)) {
                 staged[p] = -1;
+                have[p].clear();
                 return;
             }
             char * base = (char *) ggml_backend_buffer_get_base(buf[p][k]);
@@ -426,6 +584,11 @@ struct llama_prefill_stage {
             // offset modulo the page and any file range can be widened to whole pages in place
             head[p][k] = widen ? (size_t) (off % WPAGE) : 0;
             char * dst = base + head[p][k];
+            if (un) {
+                bytes += (size_t) add_expert_runs(jobs, t, fd, off, dst, have[p], arena_env ? mc : nullptr)*t->nb[2];
+                un_full_bytes += ggml_nbytes(t);
+                continue;
+            }
             if (!(arena_env && mc != nullptr)) {
                 add_file_read(jobs, fd, off, dst, ggml_nbytes(t), t->data);
             } else {
@@ -458,6 +621,11 @@ struct llama_prefill_stage {
         busy = true;
         n_reads++;
         read_bytes += bytes;
+        if (cur_used != nullptr && union_mode() != 0) {
+            un_layers++;
+            un_capped     += un ? 0 : 1;
+            un_pred_bytes += un ? bytes : 0;
+        }
         th = std::thread([this, mc, jobs = std::move(jobs), sr = std::move(sr)]() {
             const auto t0 = std::chrono::steady_clock::now();
             llama_exps_prefetch::upload_bg(jobs);
@@ -486,6 +654,8 @@ struct llama_prefill_stage {
             n_releases++;
         }
         staged[0] = staged[1] = -1;
+        have[0].clear();
+        have[1].clear();
         cur = -1;
         init_done = false;
         layers.clear();
@@ -514,6 +684,13 @@ struct llama_prefill_stage {
             fprintf(stderr, "exps-prefetch stage: staged splits = %llu, fallback layers = %llu, reads = %llu (%.1f GiB, %.1f s on the reader, %.3f s exposed wait)\n",
                     (unsigned long long) n_staged_splits, (unsigned long long) n_fallback_layers, (unsigned long long) n_reads,
                     read_bytes / (1024.0*1024.0*1024.0), read_us / 1e6, wait_us / 1e6);
+            if (un_layers > 0) {
+                const double GiB = 1024.0*1024.0*1024.0;
+                fprintf(stderr, "exps-prefetch stage: union reads = %llu layers (%llu full: > %.2f of the experts), predicted %.1f GiB of %.1f GiB full, "
+                                "miss = %.2f GiB (%llu experts in %llu layers, %.3f s exposed)\n",
+                        (unsigned long long) un_layers, (unsigned long long) un_capped, union_max_frac(), un_pred_bytes / GiB, un_full_bytes / GiB,
+                        un_miss_bytes / GiB, (unsigned long long) un_miss_experts, (unsigned long long) un_miss_layers, un_miss_us / 1e6);
+            }
         }
         for (auto & pb : buf) {
             for (auto & b : pb) {
@@ -2356,6 +2533,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (hs) { hs_t3 = host_now_ms(); }
+    if (llama_prefill_stage::union_mode() != 0 && llama_prefill_stage::union_reset() && ubatch.n_tokens > 1 && ubatch.pos && ubatch.pos[0] == 0) {
+        // LLAMA_DSV41_STAGE_UNION_RESET: a new prompt, the previous ubatch's selections are not a continuation
+        if (auto * stg = llama_prefill_stage_get(this, false)) {
+            stg->un_prev_ub.clear();
+        }
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (hs) {
         const double t4 = host_now_ms();
@@ -3667,6 +3850,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         // before the reader may overwrite the parity of li-1 with li+1
                         ggml_backend_synchronize(backend);
                         stg->wait_bg();
+                        static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
+                        if (llama_prefill_stage::union_mode() != 0) {
+                            // the selected experts of li that the predicted read missed, before the repoint below
+                            stg->union_fill_missing(li, st.used, arena_env ? lctx->moe_cache.get() : nullptr);
+                        }
                         if (llama_prefill_stage::stats_on()) {
                             // before cur is updated: cur == -1 marks the first layer of a graph (ubatch)
                             stg->stats_layer(li, st.used, ids->ne[1], stg->staged[li & 1] == li);
@@ -3690,9 +3878,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                             sr.n_rows = (int32_t) (ids->ne[1] - r0);
                         }
                         if (li + 1 < (int) stg->layers.size()) {
-                            stg->start_bg(li + 1, lctx->moe_cache.get(), std::move(sr));
+                            stg->start_bg(li + 1, lctx->moe_cache.get(), std::move(sr), llama_prefill_stage::union_mode() != 0 ? &st.used : nullptr);
                         } else if (sr.li >= 0) {
                             stg->start_seed_bg(lctx->moe_cache.get(), std::move(sr));
+                        }
+                        if (llama_prefill_stage::union_mode() != 0) {
+                            // prediction for layer li of the next staged ubatch
+                            if (stg->un_prev_ub.size() < stg->layers.size()) {
+                                stg->un_prev_ub.resize(stg->layers.size());
+                            }
+                            stg->un_prev_ub[li] = st.used;
                         }
                     }
                     if (stg->cur_have) {
