@@ -13,9 +13,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -99,6 +101,8 @@ struct llama_moe_cache::impl {
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
         ggml_tensor * slot_map_h = nullptr; // overlap mode (LLAMA_DSV41_MOE_OVERLAP): hit map, slots of the experts resident before the fill, else -1
         ggml_tensor * slot_map_m = nullptr; // overlap mode: level 1 the full map, level 2 the map of the experts the fill brings
+        ggml_tensor * map_d = nullptr;      // GPU-resident mode: the resident slot map, a device weight in the arena (shared memory)
+        ggml_tensor * map_f = nullptr;      // GPU-resident mode: the fill map (experts the last plan brought, else -1), device weight
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
     };
 
@@ -223,6 +227,50 @@ struct llama_moe_cache::impl {
     int32_t overlap_il = -1;
     size_t  overlap_pending_bytes = 0;
     std::vector<int32_t> overlap_before; // slot map of the layer before the plan
+
+    // GPU-resident mode (LLAMA_DSV41_MOE_GPURES=1, on top of overlap level 2): the resident slot map of each layer is a
+    // device weight in the arena (shared memory) that the LFU updates in place, so the lookups start no scheduler split
+    // and the decode token is one Metal split. Per layer the graph signals a GPU->host event after the hit-map lookup
+    // (GGML_OP_DSV41_EVENT), runs the shared expert and the hit pass, and waits for a host->GPU event before the fill-map
+    // lookup. A worker thread plans the layers in order as their signals arrive (same plan calls as copy_h, so the same
+    // victims), preads the misses, writes the fill map and signals; a hit-only layer costs the GPU only the event round
+    // trip, hidden behind its hit pass. Safety: while layer il is planned the GPU has completed everything before the
+    // signal of il (layers < il) and cannot start anything after the wait of il (layers > il), so the only arena reads in
+    // flight are layer il's hits, which the plan never evicts (it excludes the experts of the call).
+    using dsv41_init_fn   = bool     (*)(ggml_backend_t);
+    using dsv41_base_fn   = void     (*)(ggml_backend_t, uint64_t);
+    using dsv41_value_fn  = uint64_t (*)(ggml_backend_t);
+    using dsv41_signal_fn = void     (*)(ggml_backend_t, uint64_t);
+    bool gpures = false;
+    ggml_backend_t  gr_backend     = nullptr;
+    dsv41_base_fn   gr_set_base    = nullptr;
+    dsv41_value_fn  gr_gpu_value   = nullptr;
+    dsv41_signal_fn gr_host_signal = nullptr;
+    struct gr_item {
+        int32_t il;
+        const ggml_tensor * ids; // selected experts, [n_ids] I32 (src[1] of the signal node)
+        const ggml_tensor * hit; // the GPU's hit-map lookup, [n_ids] I32 (src[0] of the signal node)
+    };
+    std::vector<gr_item> gr_job;
+    uint64_t gr_epoch = 0;
+    uint64_t gr_base  = 0;
+    std::thread gr_th;
+    std::mutex gr_mu;
+    std::condition_variable gr_cv;
+    bool gr_run  = false; // a job is posted and not finished
+    bool gr_stop = false;
+    std::vector<int32_t> gr_ids;
+    std::vector<int32_t> gr_hit;
+    std::vector<moe_cache_lru::fill> gr_fills;
+    std::vector<llama_exps_prefetch::upload_job> gr_jobs;
+    struct gr_stats {
+        size_t graphs = 0, layers = 0, hit_only = 0;
+        uint64_t gpu_wait_us = 0;  // worker waiting for the GPU's signal (GPU busy before the layer's lookup)
+        uint64_t plan_us     = 0;  // from the GPU's signal seen to the host signal, hit-only layers
+        uint64_t fill_us     = 0;  // same, layers with misses (plan + pread)
+        uint64_t plan_max_us = 0;
+        uint64_t fill_max_us = 0;
+    } grs;
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
@@ -596,6 +644,9 @@ struct llama_moe_cache::impl {
     }
 
     void set_graph(ggml_cgraph * gf) {
+        if (gpures) {
+            gr_begin(gf);
+        }
         if (!llama_moe_cache_predict_enabled()) {
             return;
         }
@@ -610,6 +661,178 @@ struct llama_moe_cache::impl {
                     pred[il] = t;
                 }
             }
+        }
+    }
+
+    // GPU-resident mode ---------------------------------------------------------------------------------------------------
+
+    // the previous graph's layers are all planned and signaled (its GPU work may still run, it reads no slot we change)
+    void gr_wait_idle() {
+        std::unique_lock<std::mutex> lk(gr_mu);
+        gr_cv.wait(lk, [&] { return !gr_run; });
+    }
+
+    // the graph about to be computed: hand its signal nodes (in layer order) to the worker, with a new event base
+    void gr_begin(ggml_cgraph * gf) {
+        gr_wait_idle();
+        gr_job.clear();
+        const int n = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n; ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            const int32_t * params = (const int32_t *) t->op_params; // {mode, id}
+            if (t->op != GGML_OP_DSV41_EVENT || params[0] != GGML_DSV41_EVENT_SIGNAL) {
+                continue;
+            }
+            const int32_t il = params[1];
+            GGML_ASSERT(il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 && layers[il].map_f != nullptr);
+            GGML_ASSERT(t->src[0] != nullptr && t->src[1] != nullptr && ggml_nelements(t->src[0]) == ggml_nelements(t->src[1]));
+            gr_job.push_back({ il, t->src[1], t->src[0] });
+        }
+        if (gr_job.empty()) {
+            return;
+        }
+        // the GPU runs the layers in order (each layer's lookup depends on the previous layer's output)
+        std::sort(gr_job.begin(), gr_job.end(), [](const gr_item & a, const gr_item & b) { return a.il < b.il; });
+        // event values only grow: base + il + 1 with il < 255
+        gr_epoch++;
+        gr_base = gr_epoch << 8;
+        gr_set_base(gr_backend, gr_base);
+        grs.graphs++;
+        {
+            std::lock_guard<std::mutex> lk(gr_mu);
+            gr_run = true;
+        }
+        gr_cv.notify_all();
+    }
+
+    void gr_loop() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(gr_mu);
+                gr_cv.wait(lk, [&] { return gr_run || gr_stop; });
+                if (!gr_run) {
+                    return;
+                }
+            }
+            for (const gr_item & it : gr_job) {
+                gr_layer(it);
+            }
+            {
+                std::lock_guard<std::mutex> lk(gr_mu);
+                gr_run = false;
+            }
+            gr_cv.notify_all();
+        }
+    }
+
+    void gr_shutdown() {
+        if (!gr_th.joinable()) {
+            return;
+        }
+        gr_wait_idle();
+        {
+            std::lock_guard<std::mutex> lk(gr_mu);
+            gr_stop = true;
+        }
+        gr_cv.notify_all();
+        gr_th.join();
+    }
+
+    // one layer on the worker: wait for the GPU's signal, plan exactly like copy_h, pread the misses, publish the fill map
+    // (built from the GPU's own hit lookup, so every selected row is computed exactly once), signal the GPU
+    void gr_layer(const gr_item & it) {
+        const int32_t  il = it.il;
+        const uint64_t v  = gr_base + (uint64_t) il + 1;
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (uint32_t spin = 0; gr_gpu_value(gr_backend) < v; ++spin) {
+            if (spin >= 2048) {
+                std::this_thread::yield();
+                if ((spin & 0xffff) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+                    GGML_ABORT("LLAMA_DSV41_MOE_GPURES: no GPU signal for layer %d after 30 s (graph aborted?)", il);
+                }
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+
+        const size_t n_ids = ggml_nelements(it.ids);
+        GGML_ASSERT(it.ids->data != nullptr && it.hit->data != nullptr && ggml_is_contiguous(it.ids) && ggml_is_contiguous(it.hit));
+        gr_ids.resize(n_ids);
+        gr_hit.resize(n_ids);
+        memcpy(gr_ids.data(), it.ids->data, n_ids*sizeof(int32_t));
+        memcpy(gr_hit.data(), it.hit->data, n_ids*sizeof(int32_t));
+
+        size_t n_hit = 0;
+        int32_t n_tok = 1;
+        if (n_expert_used > 0 && n_ids % (size_t) n_expert_used == 0) {
+            n_tok = (int32_t) (n_ids / (size_t) n_expert_used);
+        }
+        if (!g.lru.plan(il, gr_ids.data(), n_ids, gr_fills, n_hit, n_tok)) {
+            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        size_t bytes = 0;
+        if (!gr_fills.empty()) {
+            overlap_start_fill(l, g, gr_fills, gr_jobs, bytes);
+            if (!gr_jobs.empty()) {
+                llama_exps_prefetch::upload_end();
+            }
+        }
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * w : l.experts) {
+            slot_bytes += w->nb[2];
+        }
+        for (const auto & fill : gr_fills) {
+            GGML_ASSERT(fill.slot >= 0 && fill.slot < g.n_slots);
+            if (!g.filled[fill.slot]) {
+                g.filled[fill.slot] = true;
+                g.filled_bytes += slot_bytes;
+            }
+        }
+
+        // the fill map: the slot of every selected expert the GPU's lookup did not find, -1 elsewhere
+        const int32_t n_expert = g.lru.n_expert;
+        const int32_t * now = g.lru.slot_map[il];
+        int32_t * out = (int32_t *) l.map_f->data;
+        std::fill(out, out + n_expert, -1);
+        for (size_t i = 0; i < n_ids; ++i) {
+            const int32_t e = gr_ids[i];
+            if (gr_hit[i] < 0) {
+                out[e] = now[e];
+            } else {
+                GGML_ASSERT(now[e] == gr_hit[i] && "LLAMA_DSV41_MOE_GPURES: a slot read by the hit pass was evicted");
+            }
+        }
+        // the slot map, the fill map and the expert bytes are in shared memory: visible to the work after the GPU's wait
+        gr_host_signal(gr_backend, v);
+        const auto t2 = std::chrono::steady_clock::now();
+
+        const uint64_t wait_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        const uint64_t work_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        grs.layers++;
+        grs.gpu_wait_us += wait_us;
+        if (gr_fills.empty()) {
+            grs.hit_only++;
+            grs.plan_us += work_us;
+            grs.plan_max_us = std::max(grs.plan_max_us, work_us);
+        } else {
+            grs.fill_us += work_us;
+            grs.fill_max_us = std::max(grs.fill_max_us, work_us);
+        }
+
+        stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits   += n_hit;
+        st.misses += gr_fills.size();
+        st.bytes  += bytes;
+        st.calls  += 1;
+        st.tokens += n_tok;
+        st.pread_calls += !gr_fills.empty();
+        st.sync_us += wait_us;
+        st.fill_us += work_us;
+        if (&st == &stats_small) {
+            tok_add(il, n_tok, n_hit, gr_fills.size(), bytes, work_us, wait_us);
         }
     }
 
@@ -830,6 +1053,43 @@ struct llama_moe_cache::impl {
             }
             const char * nt = getenv("LLAMA_DSV41_MOE_OVERLAP_NT");
             overlap_max_tokens = nt != nullptr && atoi(nt) != 0 ? max_batch : 1;
+
+            // LLAMA_DSV41_MOE_GPURES=1: GPU-resident slot maps and event-chained misses (see gr_layer)
+            const char * gr = getenv("LLAMA_DSV41_MOE_GPURES");
+            gpures = gr != nullptr && atoi(gr) != 0;
+            if (gpures) {
+                const char * why = nullptr;
+                if (overlap_level < 2) {
+                    why = "needs LLAMA_DSV41_MOE_OVERLAP=2";
+                } else if (llama_moe_cache_predict_mode() != 0) {
+                    why = "does not support LLAMA_DSV41_MOE_PREDICT"; // a second agent changing residency would change the victims
+                } else if (warm_enabled()) {
+                    why = "does not support LLAMA_DSV41_MOE_WARM";
+                } else if (model.hparams.no_alloc) {
+                    why = "no_alloc";
+                } else {
+                    for (const group & g : groups) {
+                        if (gr_backend == nullptr) {
+                            gr_backend = devices[g.id].backend;
+                        } else if (devices[g.id].backend != gr_backend) {
+                            why = "needs all cached layers on one device";
+                        }
+                    }
+                    ggml_backend_dev_t dev = gr_backend ? ggml_backend_get_device(gr_backend) : nullptr;
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    auto init       = reg ? (dsv41_init_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_dsv41_init")        : nullptr;
+                    gr_set_base     = reg ? (dsv41_base_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_dsv41_set_base")    : nullptr;
+                    gr_gpu_value    = reg ? (dsv41_value_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_dsv41_gpu_value")   : nullptr;
+                    gr_host_signal  = reg ? (dsv41_signal_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_dsv41_host_signal") : nullptr;
+                    if (why == nullptr && (!init || !gr_set_base || !gr_gpu_value || !gr_host_signal || !init(gr_backend))) {
+                        why = "needs the Metal backend's shared events";
+                    }
+                }
+                if (why != nullptr) {
+                    fprintf(stderr, "llama_moe_cache: LLAMA_DSV41_MOE_GPURES %s, disabled\n", why);
+                    gpures = false;
+                }
+            }
         }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
@@ -848,7 +1108,7 @@ struct llama_moe_cache::impl {
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
             g.filled.assign(g.n_slots, false);
-            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+            n_tensors[g.id] += g.ref.size()*(1 + g.layers.size()) + (gpures ? 2*g.layers.size() : 0);
             n_tensors_host  += g.layers.size()*(overlap_level != 0 ? 3 : 1);
         }
         if (n_tensors_host == 0) {
@@ -917,6 +1177,13 @@ struct llama_moe_cache::impl {
                     layer_of_m[l.slot_map_m] = il;
                     buf_host_size += 2*GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
                 }
+                if (gpures) {
+                    // device weights in the arena: the lookups read them in place, no scheduler split, no copy callback
+                    l.map_d = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.map_d, "moe_cache.map_d-%d", il);
+                    l.map_f = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.map_f, "moe_cache.map_f-%d", il);
+                }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -975,6 +1242,10 @@ struct llama_moe_cache::impl {
                     fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
                     overlap_level = 0;
                 }
+                if (!all_shared && gpures) {
+                    fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_GPURES disabled\n", ggml_backend_name(d.backend));
+                    gpures = false;
+                }
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
@@ -987,10 +1258,20 @@ struct llama_moe_cache::impl {
             }
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
+            if (gpures) {
+                for (const layer & l : layers) {
+                    if (l.map_d != nullptr) {
+                        memset(l.map_d->data, 0xff, ggml_nbytes(l.map_d)); // all slots are -1
+                        memset(l.map_f->data, 0xff, ggml_nbytes(l.map_f));
+                    }
+                }
+                fprintf(stderr, "llama_moe_cache: GPU-resident slot maps, event-chained misses (LLAMA_DSV41_MOE_GPURES)\n");
+            }
+
             for (group & g : groups) {
                 for (int32_t il : g.layers) {
                     if (layers[il].slot_map != nullptr) {
-                        g.lru.slot_map[il] = (int32_t *) layers[il].slot_map->data;
+                        g.lru.slot_map[il] = resident_map(il);
                     }
                 }
             }
@@ -1048,6 +1329,16 @@ struct llama_moe_cache::impl {
             }
             fprintf(stderr, "llama_moe_cache: group %zu layers:%s\n", ig, ls.c_str());
         }
+        if (gpures) {
+            gr_th = std::thread([this] { gr_loop(); });
+        }
+    }
+
+    // the slot map the LFU updates: the host map, or in GPU-resident mode the device map (shared memory). The old copy
+    // callback paths publish this array, so both modes keep one residency state
+    int32_t * resident_map(int32_t il) const {
+        const layer & l = layers[il];
+        return (int32_t *) (gpures && l.map_d != nullptr ? l.map_d->data : l.slot_map->data);
     }
 
     // bytes of the slots in use (the buffer itself may be larger after shrink())
@@ -1085,8 +1376,11 @@ struct llama_moe_cache::impl {
             g.filled.assign(n, false);
             for (int32_t il : g.layers) {
                 if (layers[il].slot_map != nullptr && layers[il].slot_map->data != nullptr) {
-                    g.lru.slot_map[il] = (int32_t *) layers[il].slot_map->data;
-                    memset(layers[il].slot_map->data, 0xff, ggml_nbytes(layers[il].slot_map));
+                    g.lru.slot_map[il] = resident_map(il);
+                    memset(g.lru.slot_map[il], 0xff, ggml_nbytes(layers[il].slot_map));
+                    if (gpures) {
+                        memset(layers[il].map_f->data, 0xff, ggml_nbytes(layers[il].map_f));
+                    }
                 }
             }
         }
@@ -1143,6 +1437,7 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        gr_shutdown();
         tok_flush();
         overlap_drain();
         pf_flush();
@@ -1166,6 +1461,14 @@ struct llama_moe_cache::impl {
         }
         log_arena("teardown");
         log_stats();
+        if (grs.layers > 0) {
+            const size_t n_fill = grs.layers - grs.hit_only;
+            fprintf(stderr, "llama_moe_cache: gpures: graphs = %zu, layers = %zu, hit-only = %zu (%.1f%%), worker wait for GPU ms/graph = %.2f, "
+                "host turnaround us/layer: hit-only %.1f (max %.0f), with misses %.1f (max %.0f)\n",
+                grs.graphs, grs.layers, grs.hit_only, 100.0*grs.hit_only/grs.layers, grs.gpu_wait_us/1000.0/std::max<size_t>(1, grs.graphs),
+                (double) grs.plan_us/std::max<size_t>(1, grs.hit_only), (double) grs.plan_max_us,
+                (double) grs.fill_us/std::max<size_t>(1, n_fill), (double) grs.fill_max_us);
+        }
         if (pst.launched > 0) {
             fprintf(stderr, "llama_moe_cache: predict: layers = %zu, predicted = %zu, prefetched = %zu (%.2f MiB), "
                 "prediction recall = %.2f%%, prefetched used = %.2f%%, prefetch wait = %.2f ms total\n",
@@ -1195,6 +1498,16 @@ struct llama_moe_cache::impl {
         }
         *h = layers[il].slot_map_h;
         *m = layers[il].slot_map_m;
+        return true;
+    }
+
+    // GPU-resident mode: the device slot map and fill map of layer il, false if the layer does not use the mode
+    bool get_gpures_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** map, ggml_tensor ** fill) const {
+        if (!gpures || !overlap_usable(il, n_tokens) || get_slot_map(il, n_tokens, n_expert_used) == nullptr || layers[il].map_d == nullptr) {
+            return false;
+        }
+        *map  = layers[il].map_d;
+        *fill = layers[il].map_f;
         return true;
     }
 
@@ -1333,7 +1646,7 @@ struct llama_moe_cache::impl {
     }
 
     // the experts missing from the arena are read by the upload pool into the free slots: starts the reads and returns
-    void overlap_start_fill(ggml_backend_t backend, const layer & l, group & g, size_t & bytes) {
+    void overlap_start_fill(const layer & l, group & g, const std::vector<moe_cache_lru::fill> & fills, std::vector<llama_exps_prefetch::upload_job> & jobs, size_t & bytes) {
         jobs.clear();
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
@@ -1357,7 +1670,6 @@ struct llama_moe_cache::impl {
                 i += n;
             }
         }
-        (void) backend;
         if (!jobs.empty()) {
             llama_exps_prefetch::upload_begin(jobs);
         }
@@ -1430,7 +1742,7 @@ struct llama_moe_cache::impl {
         size_t bytes = 0;
         const auto tu0 = std::chrono::steady_clock::now();
         if (!fills.empty()) {
-            overlap_start_fill(backend, l, g, bytes);
+            overlap_start_fill(l, g, fills, jobs, bytes);
         }
         const auto tu1 = std::chrono::steady_clock::now();
         size_t slot_bytes = 0;
@@ -1703,11 +2015,14 @@ struct llama_moe_cache::impl {
         }
 
         // the next copy synchronizes the backend before it changes the slot map again
+        // (the LFU's array is src->data, or the GPU-resident map with LLAMA_DSV41_MOE_GPURES)
+        const int32_t * map = g.lru.slot_map[il];
+        GGML_ASSERT(map != nullptr && ggml_nbytes(src) == (size_t) g.lru.n_expert*sizeof(int32_t));
         if (direct_map) {
             // the GPU has been idle since the sync above (nothing was submitted by the plan or the fill)
-            memcpy(dst->data, src->data, ggml_nbytes(src));
+            memcpy(dst->data, map, ggml_nbytes(src));
         } else {
-            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+            ggml_backend_tensor_set_async(backend, dst, map, 0, ggml_nbytes(src));
         }
 
         if (llama_moe_cache_predict_enabled() && sel->ne[1] == 1) {
@@ -1761,6 +2076,10 @@ bool llama_moe_cache::get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expe
 
 int llama_moe_cache::overlap_level() const {
     return pimpl->overlap_level;
+}
+
+bool llama_moe_cache::get_gpures_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** map, ggml_tensor ** fill) const {
+    return pimpl->get_gpures_maps(il, n_tokens, n_expert_used, map, fill);
 }
 
 int64_t llama_moe_cache::overlap_max_tokens() const {

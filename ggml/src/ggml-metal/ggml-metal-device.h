@@ -91,6 +91,11 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// GGML_OP_DSV41_EVENT: ends the compute encoder, encodes a signal (mode 0, GPU->host event) or a wait (mode 1, host->GPU
+// event) for value on the command buffer and continues in a new compute encoder of the same kind
+struct ggml_metal_device;
+void ggml_metal_encoder_dsv41_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, struct ggml_metal_device * dev, int mode, uint64_t value, bool concurrent);
+
 //
 // MTLLibrary wrapper
 //
@@ -362,6 +367,16 @@ int ggml_metal_spin_us(void);
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
+
+// DS41 GPU-resident MoE arena (LLAMA_DSV41_MOE_GPURES): two MTLSharedEvents per device, GPU->host (signaled by
+// GGML_OP_DSV41_EVENT signal nodes) and host->GPU (awaited by wait nodes), values base + id + 1. dsv41_init creates them
+// (false if unavailable); base is read when a graph is encoded
+bool     ggml_metal_device_dsv41_init      (ggml_metal_device_t dev);
+bool     ggml_metal_device_dsv41_ready     (ggml_metal_device_t dev); // init was called and succeeded
+void     ggml_metal_device_dsv41_set_base  (ggml_metal_device_t dev, uint64_t base);
+uint64_t ggml_metal_device_dsv41_get_base  (ggml_metal_device_t dev);
+uint64_t ggml_metal_device_dsv41_gpu_value (ggml_metal_device_t dev);
+void     ggml_metal_device_dsv41_host_signal(ggml_metal_device_t dev, uint64_t value);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 

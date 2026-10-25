@@ -918,6 +918,11 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // GGML_OP_DSV41_EVENT (LLAMA_DSV41_MOE_GPURES), created by ggml_metal_device_dsv41_init
+    id<MTLSharedEvent> dsv41_ev_gpu;  // GPU -> host
+    id<MTLSharedEvent> dsv41_ev_host; // host -> GPU
+    _Atomic uint64_t   dsv41_base;
 };
 
 //
@@ -1387,6 +1392,15 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
             dev->mtl_queue = nil;
         }
 
+        if (dev->dsv41_ev_gpu) {
+            [dev->dsv41_ev_gpu release];
+            dev->dsv41_ev_gpu = nil;
+        }
+        if (dev->dsv41_ev_host) {
+            [dev->dsv41_ev_host release];
+            dev->dsv41_ev_host = nil;
+        }
+
         if (dev->mtl_device) {
             [dev->mtl_device release];
             dev->mtl_device = nil;
@@ -1394,6 +1408,60 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     }
 
     free(dev);
+}
+
+void ggml_metal_encoder_dsv41_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf_raw, struct ggml_metal_device * dev, int mode, uint64_t value, bool concurrent) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    GGML_ASSERT(dev->dsv41_ev_gpu != nil && dev->dsv41_ev_host != nil);
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    if (mode == 0) {
+        // signaled once every command encoded before it has completed
+        [cmd_buf encodeSignalEvent:dev->dsv41_ev_gpu value:value];
+    } else {
+        // nothing encoded after it starts before the host sets the event to value
+        [cmd_buf encodeWaitForEvent:dev->dsv41_ev_host value:value];
+    }
+
+    if (concurrent) {
+        encoder->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [cmd_buf computeCommandEncoder];
+    }
+
+    [encoder->obj retain];
+}
+
+bool ggml_metal_device_dsv41_init(ggml_metal_device_t dev) {
+    if (dev->dsv41_ev_gpu == nil) {
+        dev->dsv41_ev_gpu  = [dev->mtl_device newSharedEvent];
+        dev->dsv41_ev_host = [dev->mtl_device newSharedEvent];
+        atomic_store_explicit(&dev->dsv41_base, 0, memory_order_relaxed);
+    }
+    return dev->dsv41_ev_gpu != nil && dev->dsv41_ev_host != nil;
+}
+
+bool ggml_metal_device_dsv41_ready(ggml_metal_device_t dev) {
+    return dev->dsv41_ev_gpu != nil && dev->dsv41_ev_host != nil;
+}
+
+void ggml_metal_device_dsv41_set_base(ggml_metal_device_t dev, uint64_t base) {
+    atomic_store_explicit(&dev->dsv41_base, base, memory_order_release);
+}
+
+uint64_t ggml_metal_device_dsv41_get_base(ggml_metal_device_t dev) {
+    return atomic_load_explicit(&dev->dsv41_base, memory_order_acquire);
+}
+
+uint64_t ggml_metal_device_dsv41_gpu_value(ggml_metal_device_t dev) {
+    return dev->dsv41_ev_gpu.signaledValue;
+}
+
+void ggml_metal_device_dsv41_host_signal(ggml_metal_device_t dev, uint64_t value) {
+    dev->dsv41_ev_host.signaledValue = value;
 }
 
 void * ggml_metal_device_get_obj(ggml_metal_device_t dev) {
@@ -1851,6 +1919,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->type         == GGML_TYPE_F32 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_DSV41_EVENT:
+            return dev->dsv41_ev_gpu != nil && dev->dsv41_ev_host != nil;
         case GGML_OP_DSV4_HC_POST:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_F32 &&

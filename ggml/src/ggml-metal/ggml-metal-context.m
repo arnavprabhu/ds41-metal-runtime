@@ -1066,6 +1066,20 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->n_nodes_per_cb = 0;
         } else {
             ctx->n_nodes_0      = MIN(n_main, gf->n_nodes);
+
+            // DS41 GPU-resident MoE arena (GGML_OP_DSV41_EVENT): end the first command buffer just after a wait node, so
+            // that no layer's router, slot lookup and GPU->host signal straddle the two command buffers (the host reads
+            // what the signal's own command buffer computed before it). Only with n_cb == 1 (the default)
+            if (ctx->n_cb == 1 && ggml_metal_device_dsv41_ready(ctx->dev)) {
+                for (int i = ctx->n_nodes_0; i < gf->n_nodes; ++i) {
+                    const struct ggml_tensor * node = gf->nodes[i];
+                    if (node->op == GGML_OP_DSV41_EVENT && ((const int32_t *) node->op_params)[0] == GGML_DSV41_EVENT_WAIT) {
+                        ctx->n_nodes_0 = i + 1;
+                        break;
+                    }
+                }
+            }
+
             ctx->n_nodes_1      = gf->n_nodes - ctx->n_nodes_0;
 
             ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
