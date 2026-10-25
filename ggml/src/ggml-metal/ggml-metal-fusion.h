@@ -46,6 +46,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_DS41_HC_GATE, // MUL + ADD + UNARY(sigmoid) + SCALE (DeepSeek-V4 hc pre/post gates, GGML_METAL_DS41_FUSE)
     GGML_METAL_FUSION_DS41_ROUTER,  // UNARY(softplus) + SQRT + ADD (DeepSeek-V4 sqrt-softplus router scores + bias, GGML_METAL_DS41_FUSE)
     GGML_METAL_FUSION_DS41_MOE_W,   // GET_ROWS + SUM_ROWS + SCALE + DIV + SCALE (MoE weight gather + normalize, GGML_METAL_DS41_FUSE)
+    GGML_METAL_FUSION_DS41_MM_PERM, // MUL_MAT + PERMUTE + CONT (mat-mat store in the cont layout, GGML_METAL_DS41_PFUSE)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

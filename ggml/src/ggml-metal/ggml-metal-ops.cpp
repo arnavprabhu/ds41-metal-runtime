@@ -2867,6 +2867,45 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
 
+        // MUL_MAT + PERMUTE + CONT (GGML_METAL_DS41_PFUSE): store into the cont layout with the permuted strides
+        int n_fuse = 1;
+        uint64_t nbd1 = (uint64_t) ne0;
+        uint64_t nbd2 = (uint64_t) ne0*ne1;
+        const ggml_tensor * dst_t = op;
+        if (ctx->use_fusion() && idx + 1 < ctx->n_nodes()) {
+            int n = 1;
+            const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+            if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_MM_PERM && n == 2) {
+                const ggml_tensor * cont = ctx->node(idx + 1);
+                const ggml_tensor * perm = cont->src[0];
+                const int32_t * ax = (const int32_t *) perm->op_params;
+
+                // element strides of the contiguous copy of the permuted view; dim i of the product is at axis ax[i]
+                const uint64_t vs[4] = {
+                    1,
+                    (uint64_t) perm->ne[0],
+                    (uint64_t) perm->ne[0]*perm->ne[1],
+                    (uint64_t) perm->ne[0]*perm->ne[1]*perm->ne[2],
+                };
+                const uint64_t s1 = vs[ax[1]];
+                const uint64_t s2 = vs[ax[2]];
+
+                // float4 / simdgroup stores need 16-byte aligned rows
+                if (s1 % 4 == 0 && s2 % 4 == 0) {
+                    nbd1   = s1;
+                    nbd2   = s2;
+                    dst_t  = cont;
+                    n_fuse = 2;
+
+                    ctx->count_fusions(fusion);
+
+                    if (!ggml_metal_op_concurrency_check(ctx, cont)) {
+                        ggml_metal_op_concurrency_reset(ctx);
+                    }
+                }
+            }
+        }
+
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
             /*.ne02 =*/ ne02,
@@ -2882,13 +2921,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.r2   =*/ r2,
             /*.r3   =*/ r3,
+            /*.nbd1 =*/ nbd1,
+            /*.nbd2 =*/ nbd2,
         };
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst_t),      3);
 
         const size_t smem = pipeline.smem;
 
@@ -2899,6 +2940,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg = pipeline.nsg;
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+
+        return n_fuse;
     } else {
         return ggml_metal_op_mul_mat_mv(ctx, idx);
     }

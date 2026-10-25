@@ -528,6 +528,8 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    uint64_t nbd1;  // dst stride of a src1 row (ne1 index), in floats: ne0 unless a permute + cont is fused
+    uint64_t nbd2;  // dst stride of a batch (ne2*ne3 index), in floats: ne0*ne1 unless fused
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {

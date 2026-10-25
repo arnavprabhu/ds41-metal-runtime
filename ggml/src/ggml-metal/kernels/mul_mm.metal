@@ -140,9 +140,10 @@ kernel void kernel_mul_mm(
     const int tileM = min(NRA, M - ra);
     const int tileN = min(NRB, N - rb);
 
-    device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
+    // dst row/batch strides in floats: M and N*M, or the layout of a fused permute + cont (GGML_METAL_DS41_PFUSE)
+    device float * dstTile = (device float *)dst + (uint64_t) im * args.nbd2 + (uint64_t) rb * args.nbd1 + ra;
 
-    auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, M}));
+    auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, (int) args.nbd1}));
     cT.store(tD);
 }
 
@@ -324,10 +325,10 @@ kernel void kernel_mul_mm(
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (r1 + 16*(sgitg >> 1)) * args.nbd1 + im*args.nbd2;
 
         for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.nbd1*(i/4), args.nbd1, 0, false);
         }
     } else {
         // block is smaller than 64x32, we should avoid writing data outside of the matrix
@@ -343,7 +344,7 @@ kernel void kernel_mul_mm(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.nbd1 + im*args.nbd2;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = temp_str + (j*NR0);

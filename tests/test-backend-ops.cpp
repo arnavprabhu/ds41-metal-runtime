@@ -4779,6 +4779,46 @@ struct test_ds41_hc_post_moe : public test_dsv4_hc {
     }
 };
 
+// DS41 prefill (iter 013k): attention wo_a = grouped MUL_MAT over a permuted input, then PERMUTE + CONT to
+// [o_lora_rank*n_groups, tokens]. With GGML_METAL_DS41_PFUSE=1 the Metal mat-mat kernel stores straight into the
+// cont layout (MUL_MAT + PERMUTE + CONT fusion); the graph is the same either way.
+struct test_ds41_wo_a : public test_case {
+    const ggml_type type;
+    const int64_t   k;        // n_head/n_groups*n_embd_head
+    const int64_t   m;        // o_lora_rank
+    const int64_t   n_groups;
+    const int64_t   n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_WO_A";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, m, n_groups, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_ds41_wo_a(ggml_type type = GGML_TYPE_Q5_K, int64_t k = 256, int64_t m = 64, int64_t n_groups = 8, int64_t n_tokens = 33)
+        : type(type), k(k), m(m), n_groups(n_groups), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type, k, m, n_groups);
+        ggml_set_name(w, "wo_a");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_groups, n_tokens);
+        ggml_set_name(x, "attn");
+
+        ggml_tensor * xp = ggml_permute(ctx, x, 0, 2, 1, 3);           // [k, tokens, groups]
+        ggml_tensor * oa = ggml_mul_mat(ctx, w, xp);                   // [m, tokens, groups]
+        ggml_tensor * out = ggml_cont_2d(ctx, ggml_permute(ctx, oa, 0, 2, 1, 3), m*n_groups, n_tokens);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // DS41 prefill (iter 013k): ggml_dsv4_hc_mix = mul_mat(w, rms_norm(x)) in one F32 pass (numeric tier: other order).
 // ref = true builds rms_norm + mul_mat (the current graph) for a perf baseline.
 struct test_ds41_hc_mix : public test_dsv4_hc {
@@ -10059,6 +10099,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ds41_hc_post_moe(128, 1, 9));
     test_cases.emplace_back(new test_ds41_hc_post_moe(128, 8, 9));
     test_cases.emplace_back(new test_ds41_hc_mix(512, 8, 40));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q5_K, 256,  64, 8, 33));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_F16,  256,  64, 8, 200));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q8_0, 256, 128, 4, 129));
     test_cases.emplace_back(new test_ds41_hc_mix(512, 32, 40));
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
@@ -12465,6 +12508,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
             test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, n, true));
             // plain hc_post (attention site) for the mapping
             test_cases.emplace_back(new test_dsv4_hc_post(5120, n));
+            // attention wo_a + permute + cont (fused store with GGML_METAL_DS41_PFUSE=1)
+            test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q5_K, 4096, 1024, 8, n));
             // q / indexer-q / attention-output RoPE of the 64-channel slice, copy vs in place (the in-place slice
             // dispatch needs GGML_METAL_DS41_PFUSE=1); forward = false is ROPE_BACK
             for (bool fwd : { true, false }) {

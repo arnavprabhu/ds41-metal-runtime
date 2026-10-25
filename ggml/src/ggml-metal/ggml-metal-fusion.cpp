@@ -913,6 +913,50 @@ static bool ggml_metal_fusion_check_ds41_router(
 }
 
 
+// MUL_MAT + PERMUTE + CONT (GGML_METAL_DS41_PFUSE=1): the mat-mat kernel writes each element straight to its place in
+// the contiguous copy of the permuted product (DS41 attention wo_a: [1024, tokens, 8 groups] -> [1024*8, tokens]), so the
+// product is never materialized in its own layout. The encoder fuses only on the mat-mat (mul_mm) path.
+static bool ggml_metal_fusion_check_ds41_mm_perm(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    if (!ggml_metal_ds41_pfuse()) {
+        return false;
+    }
+
+    const ggml_tensor * mm   = nodes[0];
+    const ggml_tensor * cont = nodes[1];
+
+    const int r = node_idxs[idx];
+    if (node_idxs[idx + 1] != r + 2 || r + 2 >= gf->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * perm = gf->nodes[r + 1];
+    if (perm->op != GGML_OP_PERMUTE || perm->src[0] != mm || cont->src[0] != perm) {
+        return false;
+    }
+
+    if (mm->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 || mm->ne[3] != 1 ||
+            !ggml_is_contiguous(mm) || !ggml_is_contiguous(cont) || ggml_nelements(cont) != ggml_nelements(mm)) {
+        return false;
+    }
+
+    const int32_t * ax = (const int32_t *) perm->op_params;
+    if (ax[0] != 0 || ax[3] != 3) {
+        return false;
+    }
+
+    const int raw[3]     = { r, r + 1, r + 2 };
+    const int outputs[1] = { r + 2 };
+    return ggml_can_fuse_subgraph_ext(gf, raw, 3, fusion->ops_all.data(), outputs, 1);
+}
+
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_norm_mul_add     = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP_SCALE };
@@ -962,6 +1006,8 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_ds41_mm_perm = { GGML_OP_MUL_MAT, GGML_OP_PERMUTE, GGML_OP_CONT };
+
 static const std::vector<ggml_op> ops_ds41_hc_gate = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_ds41_router  = { GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_ds41_moe_w   = {
@@ -999,6 +1045,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_DS41_HC_GATE,   ops_ds41_hc_gate,           {},     false, ggml_metal_fusion_check_ds41_hc_gate },
     { GGML_METAL_FUSION_DS41_ROUTER,    ops_ds41_router,            {1},    false, ggml_metal_fusion_check_ds41_router },
     { GGML_METAL_FUSION_DS41_MOE_W,     ops_ds41_moe_w,             {},     true,  ggml_metal_fusion_check_ds41_moe_w },
+    { GGML_METAL_FUSION_DS41_MM_PERM,   ops_ds41_mm_perm,           {},     true,  ggml_metal_fusion_check_ds41_mm_perm },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1050,6 +1097,10 @@ void ggml_metal_fusion_add_alloc_deps(
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
             if ((int) fusion.ops_all.size() <= best_raw) {
+                continue;
+            }
+            // keep the default allocation unchanged when the DS41 prefill fusions are off
+            if (fusion.id == GGML_METAL_FUSION_DS41_MM_PERM && !ggml_metal_ds41_pfuse()) {
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {
