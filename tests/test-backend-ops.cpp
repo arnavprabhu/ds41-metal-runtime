@@ -7030,6 +7030,10 @@ struct test_rope : public test_case {
                 } else {
                     out = ggml_rope_ext(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
                 }
+            } else if (inplace) {
+                // in-place ROPE_BACK as deepseek41 builds it (GGML_METAL_DS41_PFUSE): the in-place op with the back op
+                out = ggml_rope_ext_inplace(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
+                out->op = GGML_OP_ROPE_BACK;
             } else {
                 out = ggml_rope_ext_back(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
