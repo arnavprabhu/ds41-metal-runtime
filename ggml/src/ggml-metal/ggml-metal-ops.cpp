@@ -3426,7 +3426,8 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
 
     const int n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
 
-    if (n_kv_max <= 0) {
+    // index lists given in the graph (ggml_flash_attn_ext_set_idx): no scratch
+    if (n_kv_max <= 0 || op->src[5]) {
         return 0;
     }
 
@@ -3522,6 +3523,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_idx = bid_kv_f16;
     bid_idx.offs += ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
+
+    // index lists given in the graph (ggml_flash_attn_ext_set_idx): the mask is a row-broadcast view, only the sparse
+    // kernels can use it
+    const bool has_idx = op->src[5] != nullptr;
+    if (has_idx) {
+        GGML_ASSERT(use_sparse && "FLASH_ATTN_EXT index lists need the sparse path");
+        GGML_ASSERT(op->src[5]->type == GGML_TYPE_I32 && op->src[5]->ne[0] == n_kv_max_padded);
+        GGML_ASSERT(ne30 == ne11);
+        bid_idx = ggml_metal_get_buffer_id(op->src[5]);
+    }
 
     ggml_metal_buffer_id bid_k = bid_src1;
     ggml_metal_buffer_id bid_v = bid_src2;
@@ -3898,7 +3909,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         const bool has_kvpad = !use_sparse && ne11 % ncpsg != 0;
 
-        if (use_sparse) {
+        if (use_sparse && !has_idx) {
             assert(ggml_metal_op_flash_attn_ext_extra_idx(op) != 0);
 
             GGML_ASSERT(ne30 == ne11);
