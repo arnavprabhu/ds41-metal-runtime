@@ -2110,6 +2110,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (hs) { hs_t3 = host_now_ms(); }
+    ubatch_has_output = false;
+    for (uint32_t i = 0; i < ubatch.n_tokens && ubatch.output && !ubatch_has_output; ++i) {
+        ubatch_has_output = ubatch.output[i] != 0;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (hs) {
         const double t4 = host_now_ms();
@@ -3427,7 +3431,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                             stg->n_fallback_layers++;
                         }
                         llama_prefill_stage::seed_req sr;
-                        if (stg->cur_have && lctx->moe_cache && llama_prefill_stage::seed_n() > 0) {
+                        // LLAMA_DSV41_MOE_SEED_LAST=1 (default): only the ubatch that requests an output (a prompt's last
+                        // ubatch; mid-prompt ubatches would churn the arena with experts the next ubatch evicts again)
+                        static const bool seed_last = [] { const char * v = getenv("LLAMA_DSV41_MOE_SEED_LAST"); return v == nullptr || atoi(v) != 0; }();
+                        if (stg->cur_have && lctx->moe_cache && llama_prefill_stage::seed_n() > 0 && (!seed_last || lctx->ubatch_has_output)) {
                             // the selections of the ubatch's last rows (ids [n_expert_used, n_tokens], read above)
                             sr.li = li;
                             sr.counts.assign(n_expert, 0.0f);
