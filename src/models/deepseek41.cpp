@@ -1252,9 +1252,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         }
 
         // MoE cache overlap: the shared expert is built between the two lookups of the layer (it needs no routed expert), so
-        // that it runs while the missing experts are read
+        // that it runs while the missing experts are read (single-token decode; LLAMA_DSV41_MOE_OVERLAP_NT=1: up to 16 tokens)
         ggml_tensor * ffn_shexp = nullptr;
-        if (moe_cache != nullptr && moe_cache->overlap_level() != 0 && n_tokens == 1) {
+        if (moe_cache != nullptr && n_tokens >= 1 && n_tokens <= moe_cache->overlap_max_tokens()) {
             moe_overlap_hook = [&]() {
                 ffn_shexp = build_ffn(cur,
                         layer.ffn_up_shexp, nullptr, nullptr,
