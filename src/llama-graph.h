@@ -1285,7 +1285,11 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // FA only: ggml_flash_attn_ext_set_idx(kv_idx, kv_idx_mask_row), applied before the FA is expanded into
+            // the graph; kq_mask then only gives the mask shape
+            ggml_tensor * kv_idx          = nullptr,
+            ggml_tensor * kv_idx_mask_row = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

@@ -32,6 +32,13 @@ static bool dsv41_env_on(const char * name) {
     return !v || atoi(v) != 0;
 }
 
+// LLAMA_DSV41_DEPTH=2 hands the FA index lists only the Metal sparse FA reads (src[5]): the layer's attention must run on
+// a Metal device (KV and attention offloaded), else the layer keeps the DEPTH=1 mask
+static bool dsv41_fa_on_metal(const llama_model & model, int il, bool offload_kqv) {
+    ggml_backend_dev_t dev = offload_kqv ? model.dev_layer(il) : nullptr;
+    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && strncmp(ggml_backend_dev_name(dev), "MTL", 3) == 0;
+}
+
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_model_deepseek4::load_arch_hparams(ml);
 
@@ -1130,8 +1137,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             GGML_ASSERT(raw_mask->ne[0] == n_raw && raw_mask->ne[1] == n_tok && raw_mask->ne[3] == n_stream);
 
             // LLAMA_DSV41_DEPTH=2: the lists the Metal sparse FA would gather from the mask, built from the top-k
-            // (32 = the Metal list block, OP_FLASH_ATTN_EXT_VEC_NCPSG; the backend asserts the width)
-            if (depth >= 2 && n_kv_max % 32 == 0) {
+            // (32 = the Metal list block, OP_FLASH_ATTN_EXT_VEC_NCPSG; the backend asserts the width); layers whose
+            // attention is not on Metal fall back to the DEPTH=1 mask below
+            if (depth >= 2 && n_kv_max % 32 == 0 && dsv41_fa_on_metal(model, il, cparams.offload_kqv)) {
                 ggml_tensor *& idx = depth_idx_of[topk_src];
                 if (!idx) {
                     // integer arithmetic in F32 below is exact (|values| < 2^24); a 0 / -inf (F16) mask entry is finite
@@ -1178,12 +1186,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     zero = ggml_fill_inplace(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F16, n_tot), 0.0f);
                 }
 
-                // the mask passed here only gives the FA its shape: set_idx replaces it, it is not in the graph
+                // the mask passed here only gives the FA its shape: set_idx replaces it (inside build_attn_mha, before
+                // the FA is expanded, so the lists and the zero row are in the graph), it is not in the graph
                 ggml_tensor * shape = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_tot, n_tok, 1, n_stream);
-                out = build_attn_mha(q, k_all, k_all, nullptr, shape, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
-                ggml_tensor * fa = out->src[0];
-                GGML_ASSERT(fa && fa->op == GGML_OP_FLASH_ATTN_EXT);
-                ggml_flash_attn_ext_set_idx(ctx0, fa, idx, zero);
+                out = build_attn_mha(q, k_all, k_all, nullptr, shape, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il, idx, zero);
+                GGML_ASSERT(out->src[0] && out->src[0]->op == GGML_OP_FLASH_ATTN_EXT && out->src[0]->src[5] == idx);
             } else {
                 ggml_tensor *& kq_mask = depth_mask_of[topk_src];
                 if (!kq_mask) {

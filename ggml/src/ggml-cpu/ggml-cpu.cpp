@@ -494,6 +494,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_FLASH_ATTN_EXT:
+            // index lists given in the graph (ggml_flash_attn_ext_set_idx, src[5]) are Metal only: the CPU kernel would
+            // read the broadcast mask row as the full mask
+            return op->src[5] == nullptr;
         default:
             return true;
     }

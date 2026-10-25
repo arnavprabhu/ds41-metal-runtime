@@ -3126,7 +3126,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_idx,
+         ggml_tensor * kv_idx_mask_row) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -3169,6 +3171,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+        // the lists and the mask row must be in place before the expand below: a src set on an already expanded node
+        // is never visited (not in the graph, no backend: ggml_backend_sched_split_graph asserts)
+        if (kv_idx) {
+            ggml_flash_attn_ext_set_idx(ctx0, cur, kv_idx, kv_idx_mask_row);
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -3188,6 +3196,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        GGML_ASSERT(kv_idx == nullptr && "FA index lists need flash attention");
+
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
