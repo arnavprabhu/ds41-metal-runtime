@@ -149,6 +149,14 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht              (ggml_metal_library_t lib, int n, enum ggml_type tsrc);
 
+// run-to-run deterministic variants (default off). GGML_METAL_DET=1 turns all of them on; GGML_METAL_DET_<X>=0|1
+// overrides one of them (bisection):
+//   GGML_METAL_DET_TOPK : radix top-k writes its indices in ascending order, ties lowest index first (no atomic order)
+//   GGML_METAL_DET_FUSE : a fused group waits for the producers of the sources of all of its nodes, not only the
+//                         first and the last node (concurrent dispatch)
+bool ggml_metal_det_topk(void);
+bool ggml_metal_det_fuse(void);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix       (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);

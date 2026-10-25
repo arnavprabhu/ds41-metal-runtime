@@ -238,6 +238,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             if (fusion) {
                 // fused kernels write to the last node of the group, not necessarily to the first node's dst
                 is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+                // GGML_METAL_DET_FUSE: the fused kernel also reads the sources of the inner nodes (e.g. the third
+                // operand of an ADD chain) and writes the extra outputs; their producers may still be running
+                if (ggml_metal_det_fuse()) {
+                    for (int i = 1; i < n_fuse - 1 && is_concurrent; ++i) {
+                        is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + i));
+                    }
+                }
             }
         }
 

@@ -247,6 +247,11 @@ static inline uint ggml_top_k_f2ui(float x) {
     return y;
 }
 
+// DET (kernel_top_k_f32_i32_det, GGML_METAL_DET / GGML_METAL_DET_TOPK): the compaction below writes the indices in
+// ascending order and takes the ties at the threshold lowest index first, instead of in atomic (scheduling) order.
+// The set is the same unless there are more ties than free places; the order matters to consumers that gather the
+// selected rows (deepseek41 decode attention over [window | selected]: the FA accumulation follows the key order)
+template<bool DET>
 kernel void kernel_top_k_f32_i32(
         constant   ggml_metal_kargs_top_k & args,
         device   const char * src0,
@@ -257,7 +262,10 @@ kernel void kernel_top_k_f32_i32(
         threadgroup atomic_uint * out_count [[threadgroup(3)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
+    threadgroup uint sh_sg[32]; // DET: per-simdgroup counts of one step
 
     const uint ncols = args.ne00;
     const uint top_k = args.top_k;
@@ -316,13 +324,53 @@ kernel void kernel_top_k_f32_i32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    // emit everything above the threshold, then fill the rest from ties
+    const uint threshold = prefix;
+
+    if (DET) {
+        // ordered compaction: per step of ntg_x entries, a simdgroup prefix sum plus the counts of the simdgroups before
+        // give each selected entry its place (base, off and all are uniform over the threadgroup)
+        const uint nsg = (ntg_x + N_SIMDWIDTH - 1)/N_SIMDWIDTH;
+        uint base = 0;
+        for (short pass = 0; pass < 2; ++pass) {
+            for (uint i0 = 0; i0 < ncols && base < top_k; i0 += ntg_x) {
+                const uint i = i0 + tid;
+                uint f = 0;
+                if (i < ncols) {
+                    const uint key = ggml_top_k_f2ui(src0_row[i]);
+                    f = pass == 0 ? (key > threshold ? 1u : 0u) : (key == threshold ? 1u : 0u);
+                }
+                const uint pre = simd_prefix_exclusive_sum(f);
+                const uint cnt = simd_sum(f);
+                if (tiisg == 0) {
+                    sh_sg[sgitg] = cnt;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                uint off = 0;
+                uint all = 0;
+                for (uint s = 0; s < nsg; ++s) {
+                    const uint c = sh_sg[s];
+                    off += s < sgitg ? c : 0u;
+                    all += c;
+                }
+                const uint pos = base + off + pre;
+                if (f != 0 && pos < top_k) {
+                    dst_row[pos] = (int32_t) i;
+                }
+                base += all;
+
+                // sh_sg is rewritten by the next step
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        return;
+    }
+
     if (tid == 0) {
         atomic_store_explicit(out_count, 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // emit everything above the threshold, then fill the rest from ties
-    const uint threshold = prefix;
 
     for (uint i = tid; i < ncols; i += ntg_x) {
         if (ggml_top_k_f2ui(src0_row[i]) > threshold) {
@@ -341,6 +389,11 @@ kernel void kernel_top_k_f32_i32(
         }
     }
 }
+
+typedef decltype(kernel_top_k_f32_i32<false>) kernel_top_k_f32_i32_t;
+
+template [[host_name("kernel_top_k_f32_i32")]]     kernel kernel_top_k_f32_i32_t kernel_top_k_f32_i32<false>;
+template [[host_name("kernel_top_k_f32_i32_det")]] kernel kernel_top_k_f32_i32_t kernel_top_k_f32_i32<true>;
 
 // fused SOFT_MAX + top-k + GET_ROWS (+ optional norm/scale) for MoE routing.
 // One SIMDgroup handles one token row; n_expert is limited to 1024 by the host.
