@@ -12166,6 +12166,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// DeepSeek-V4.1-Flash decode shapes (DS41_CASES=1 selects only these, in test and perf mode)
+static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
+    std::vector<std::unique_ptr<test_case>> test_cases;
+    const char * nenv = getenv("DS41_N");
+    std::vector<int64_t> ns = { 1 };
+    if (nenv) { ns.clear(); for (const char * c = nenv; *c; ) { ns.push_back(strtoll(c, (char **) &c, 10)); if (*c == ',') c++; } }
+    for (int64_t n : ns) {
+        // dense Q5_K: attn_q_b, attn_output_a (8 groups), attn_output_b, shexp gate/up, shexp down, output head
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32768, n, 1280, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  1024, n, 4096, {8, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  5120, n, 8192, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  2304, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  5120, n, 2304, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 129280, n, 5120, {1, 1}, {1, 1}));
+        // dense Q8_0: attn_q_a, attn_kv
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  1280, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   512, n, 5120, {1, 1}, {1, 1}));
+        // routed experts, 6 of 64 (kernel is identical for 6 of 384)
+        for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 6, false, 2304, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 6, false, 5120, n, 2304));
+        }
+    }
+    return test_cases;
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
@@ -12860,10 +12886,10 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         case MODE_TEST:
         case MODE_GRAD:
         case MODE_SUPPORT:
-            test_cases = make_test_cases_eval();
+            test_cases = getenv("DS41_CASES") ? make_test_cases_ds41() : make_test_cases_eval();
             break;
         case MODE_PERF:
-            test_cases = make_test_cases_perf();
+            test_cases = getenv("DS41_CASES") ? make_test_cases_ds41() : make_test_cases_perf();
             break;
         }
     } else {
