@@ -9,6 +9,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -58,6 +59,8 @@ int main(int argc, char ** argv) {
     if (!hint || atoi(hint) != 0) {
         llama_set_prompt_total(ctx, 0, n_prompt);
     }
+    // DeepSeek-V4.1 Engram prefetch (LLAMA_DSV41_ENGRAM_AHEAD=1): the coming tokens
+    llama_set_prompt_tokens(ctx, 0, toks.data(), n_prompt, 0);
 
     llama_batch_ext * batch = llama_batch_ext_init(ctx);
     std::vector<float> rows;
@@ -97,6 +100,7 @@ int main(int argc, char ** argv) {
     if (n_chunk > 0 && !forced.empty()) {
         std::vector<llama_token> all(n_prompt, 0);
         all.insert(all.end(), forced.begin(), forced.end());
+        llama_set_prompt_tokens(ctx, 0, forced.data(), std::min<int>(n_gen, (int) forced.size()), n_prompt);
         for (int k0 = 0; k0 < n_gen; k0 += n_chunk) {
             const int k1 = std::min(n_gen, k0 + n_chunk);
             llama_batch_ext_clear(batch);

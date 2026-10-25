@@ -542,6 +542,7 @@ public:
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
+    uint32_t n_ubatch = 0; // cparams.n_ubatch: length of the next ubatch predicted from a prompt hint
 
     const llama_model_deepseek41 & model;
     const llama_kv_cache_dsv4_context * mctx;
@@ -620,6 +621,126 @@ bool engram_pread_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_i
     }
     return ok.load();
 }
+
+// LLAMA_DSV41_ENGRAM_AHEAD=1 (multi-token ubatches, host-gathered Engram rows): when the tokens of the next ubatch are
+// known - the next ubatch of this batch, or the prompt hint (llama_set_prompt_tokens) for the first ubatch of the next
+// batch - a background thread hashes them and gathers their rows into a staging buffer while the current ubatch
+// computes. set_input still hashes every ubatch from the cache's token history and takes a token's rows from the
+// staging buffer only if all of its row ids match the staged ones (same ids, same tables, same conversion: bitwise
+// identical rows); the other tokens are gathered as before. 0 = off (default).
+// LLAMA_DSV41_ENGRAM_AHEAD_THREADS: pread threads of the background gather (default LLAMA_DSV41_ENGRAM_PREAD, else 16)
+bool engram_ahead_on() {
+    static const bool on = [] { const char * v = getenv("LLAMA_DSV41_ENGRAM_AHEAD"); return v && atoi(v) != 0; }();
+    return on;
+}
+
+int engram_ahead_threads() {
+    static const int n = [] {
+        const char * v = getenv("LLAMA_DSV41_ENGRAM_AHEAD_THREADS");
+        const int n = v ? atoi(v) : engram_pread_threads();
+        return n > 0 ? n : 16;
+    }();
+    return n;
+}
+
+// staged rows of positions pos0 .. pos0 + n - 1 of seq; owned by the KV cache (joined before the model is freed)
+struct engram_ahead_t : llama_kv_cache_dsv4::aux_state {
+    std::thread th;
+    llama_seq_id seq = -1;
+    llama_pos pos0 = 0;
+    int64_t n = 0;
+    std::vector<llama_token> win;           // tokens of positions pos0 - n_prev .. pos0 + n - 1 the job hashed
+    std::vector<std::vector<int32_t>> ids;  // [Engram layer] n*n_cols staged row ids, empty = layer not staged
+    std::vector<std::vector<float>>   rows; // [Engram layer] n*n_cols*head_dim
+    double job_ms = 0;
+
+    ~engram_ahead_t() override { wait(); }
+    void wait() {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+    void release() {
+        wait();
+        n = 0;
+        win.clear();
+        std::vector<std::vector<int32_t>>().swap(ids);
+        std::vector<std::vector<float>>().swap(rows);
+    }
+    bool layer_staged(size_t e) const { return n > 0 && e < ids.size() && (int64_t) ids[e].size() > 0; }
+};
+
+engram_ahead_t * engram_ahead_get(const llama_kv_cache_dsv4_context * mctx, bool create) {
+    auto * kv = mctx ? mctx->get_kv() : nullptr;
+    if (!kv) {
+        return nullptr;
+    }
+    auto & aux = kv->get_aux();
+    if (!aux && create) {
+        aux = std::make_unique<engram_ahead_t>();
+    }
+    return dynamic_cast<engram_ahead_t *>(aux.get());
+}
+
+// a ubatch of text tokens of one sequence at consecutive positions: seq, else -1
+llama_seq_id engram_ahead_contig(const llama_ubatch & ub) {
+    if (!ub.token || ub.embd || ub.is_mixed() || ub.n_tokens == 0 || !ub.pos || !ub.n_seq_id || !ub.seq_id) {
+        return -1;
+    }
+    const llama_seq_id seq = ub.seq_id[0][0];
+    for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+        if (ub.n_seq_id[i] != 1 || ub.seq_id[i][0] != seq || ub.pos[i] != ub.pos[0] + (llama_pos) i) {
+            return -1;
+        }
+    }
+    return seq;
+}
+
+// start the background hash + gather of win (n_prev history tokens, then the n tokens at p0 ..) for the given tables
+void engram_ahead_launch(engram_ahead_t & ah, const llama_model_deepseek41 & model, std::vector<const ggml_tensor *> tabs,
+        llama_seq_id seq, llama_pos p0, std::vector<llama_token> win) {
+    ah.wait();
+    const int64_t n_prev = model.engram_max_ngram - 1;
+    ah.seq  = seq;
+    ah.pos0 = p0;
+    ah.n    = (int64_t) win.size() - n_prev;
+    ah.win  = std::move(win);
+    ah.ids.resize(tabs.size());
+    ah.rows.resize(tabs.size());
+    for (size_t e = 0; e < tabs.size(); ++e) {
+        ah.ids[e].clear(); // filled by the job; empty = not staged
+    }
+    ah.th = std::thread([&ah, &model, tabs = std::move(tabs), n_prev] {
+        const uint64_t t0 = eg_now();
+        const int64_t n = ah.n;
+        std::vector<llama_token> tok(ah.win.begin() + n_prev, ah.win.end());
+        std::vector<llama_pos>   pos(n);
+        std::vector<llama_token> prev(n*n_prev);
+        for (int64_t i = 0; i < n; ++i) {
+            pos[i] = ah.pos0 + (llama_pos) i;
+            for (int64_t j = 0; j < n_prev; ++j) {
+                prev[i*n_prev + j] = ah.win[i + j]; // position pos[i] - (n_prev - j), as get_prev_tokens
+            }
+        }
+        llama_ubatch ub = {};
+        ub.n_tokens = (uint32_t) n;
+        ub.token    = tok.data();
+        ub.pos      = pos.data();
+        std::vector<int32_t> ids;
+        for (size_t e = 0; e < tabs.size(); ++e) {
+            if (!tabs[e]) {
+                continue;
+            }
+            model.engram_hash((int) e, ub, prev, ids);
+            ah.rows[e].resize(ids.size()*tabs[e]->ne[0]);
+            if (!engram_pread_rows(tabs[e], ids.data(), (int64_t) ids.size(), ah.rows[e].data(), engram_ahead_threads())) {
+                llm_graph_host_get_rows(tabs[e], ids.data(), (int64_t) ids.size(), ah.rows[e].data());
+            }
+            ah.ids[e].swap(ids);
+        }
+        ah.job_ms = (eg_now() - t0)/1000.0;
+    });
+}
 } // namespace
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
@@ -655,18 +776,91 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         llama_dsv41_dump_engram(model, *ubatch, ids);
         uint64_t eg1 = (eg_t || eg_m) ? eg_now() : 0;
         if (eg_t) { g_eg.pref_us += eg1 - eg0; g_eg.tok1_calls++; }
+
+        // LLAMA_DSV41_ENGRAM_AHEAD: rows staged by the background job of the previous ubatch
+        engram_ahead_t * ah = nullptr;
+        llama_seq_id ah_seq = -1;
+        uint64_t eg_wait = 0;
+        size_t eg_staged = 0;
+        double eg_job = 0;
+        if (engram_ahead_on() && std::any_of(engram_tab.begin(), engram_tab.end(), [](const ggml_tensor * t) { return t != nullptr; })) {
+            ah = engram_ahead_get(mctx, ubatch->n_tokens > 1);
+            if (ah && ubatch->n_tokens == 1) {
+                if (ah->n > 0 || ah->th.joinable()) {
+                    ah->release(); // decode after the prompt: drop what was staged in vain
+                }
+                ah = nullptr;
+            }
+            if (ah) {
+                const uint64_t w0 = eg_now();
+                ah->wait();
+                eg_wait = eg_now() - w0;
+                eg_job  = ah->n > 0 ? ah->job_ms : 0.0;
+                ah_seq  = engram_ahead_contig(*ubatch);
+            }
+        }
+        const int64_t n_cols = model.engram_n_cols();
+
         std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {
                 if (engram_tab[e]) {
                     // host gather: same rows and conversion as the CPU GET_ROWS
-                    rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
+                    const int64_t hd = engram_tab[e]->ne[0];
+                    const int64_t nt = ubatch->n_tokens;
                     const uint64_t g0 = (eg_t || eg_m) ? eg_now() : 0;
-                    if (!eg_pread || !engram_pread_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data(), engram_pread_threads())) {
-                        llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    // tokens whose staged row ids all match: their rows are taken from the staging buffer
+                    std::vector<int64_t> miss;
+                    int64_t off = 0;
+                    if (ah && ah_seq >= 0 && ah_seq == ah->seq && ah->layer_staged(e)) {
+                        off = ubatch->pos[0] - ah->pos0;
+                        for (int64_t i = 0; i < nt; ++i) {
+                            const int64_t s = off + i;
+                            if (s < 0 || s >= ah->n || memcmp(ids[e].data() + i*n_cols, ah->ids[e].data() + s*n_cols, n_cols*sizeof(int32_t)) != 0) {
+                                miss.push_back(i);
+                            }
+                        }
+                    } else {
+                        miss.resize(nt);
+                        for (int64_t i = 0; i < nt; ++i) {
+                            miss[i] = i;
+                        }
+                    }
+                    eg_staged += nt - miss.size();
+                    const float * src = nullptr;
+                    if (miss.empty()) {
+                        src = ah->rows[e].data() + off*n_cols*hd;
+                    } else if ((int64_t) miss.size() == nt) {
+                        rows.resize(ids[e].size()*hd);
+                        if (!eg_pread || !engram_pread_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data(), engram_pread_threads())) {
+                            llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                        }
+                        src = rows.data();
+                    } else {
+                        // some tokens staged: gather the others into their slots
+                        rows.resize(ids[e].size()*hd);
+                        std::vector<int32_t> mids(miss.size()*n_cols);
+                        for (size_t k = 0; k < miss.size(); ++k) {
+                            memcpy(mids.data() + k*n_cols, ids[e].data() + miss[k]*n_cols, n_cols*sizeof(int32_t));
+                        }
+                        std::vector<float> mrows(mids.size()*hd);
+                        if (!eg_pread || !engram_pread_rows(engram_tab[e], mids.data(), (int64_t) mids.size(), mrows.data(), engram_pread_threads())) {
+                            llm_graph_host_get_rows(engram_tab[e], mids.data(), (int64_t) mids.size(), mrows.data());
+                        }
+                        const size_t tok_floats = (size_t) (n_cols*hd);
+                        size_t k = 0;
+                        for (int64_t i = 0; i < nt; ++i) {
+                            if (k < miss.size() && miss[k] == i) {
+                                memcpy(rows.data() + i*tok_floats, mrows.data() + k*tok_floats, tok_floats*sizeof(float));
+                                ++k;
+                            } else {
+                                memcpy(rows.data() + i*tok_floats, ah->rows[e].data() + (off + i)*tok_floats, tok_floats*sizeof(float));
+                            }
+                        }
+                        src = rows.data();
                     }
                     const uint64_t g1 = (eg_t || eg_m) ? eg_now() : 0;
-                    ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
+                    ggml_backend_tensor_set(engram_ids[e], src, 0, ids[e].size()*hd*sizeof(float));
                     if (eg_t) { g_eg.gather_us += g1 - g0; g_eg.set_us += eg_now() - g1; }
                     if (eg_m) { eg_gather += g1 - g0; eg_set += eg_now() - g1; eg_rows += ids[e].size(); }
                 } else {
@@ -674,9 +868,63 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
                 }
             }
         }
+
+        // LLAMA_DSV41_ENGRAM_AHEAD: start the gather of the next ubatch (this batch's next one, else the prompt hint)
+        if (ah) {
+            const int64_t n_prev = model.engram_max_ngram - 1;
+            const llama_pos q0 = ah_seq >= 0 ? ubatch->pos[0] + (llama_pos) ubatch->n_tokens : 0;
+            llama_pos hp0 = 0;
+            const std::vector<llama_token> * hint = ah_seq >= 0 && mctx->get_kv() ? mctx->get_kv()->get_prompt_tokens(ah_seq, hp0) : nullptr;
+            // token at position p of ah_seq: this ubatch, the hint, else unknown (the first rows then just miss)
+            const auto tok_at = [&](llama_pos p) -> llama_token {
+                if (p >= ubatch->pos[0] && p < q0) {
+                    return ubatch->token[p - ubatch->pos[0]];
+                }
+                if (hint && p >= hp0 && p < hp0 + (llama_pos) hint->size()) {
+                    return (*hint)[p - hp0];
+                }
+                return LLAMA_TOKEN_NULL;
+            };
+            std::vector<llama_token> win;
+            if (ah_seq >= 0) {
+                const llama_ubatch * nx = mctx->peek_next_ubatch();
+                if (nx && engram_ahead_contig(*nx) == ah_seq && nx->pos[0] == q0) {
+                    for (int64_t j = n_prev; j > 0; --j) {
+                        win.push_back(tok_at(q0 - (llama_pos) j));
+                    }
+                    win.insert(win.end(), nx->token, nx->token + nx->n_tokens);
+                } else if (!nx && hint && q0 >= hp0 && q0 < hp0 + (llama_pos) hint->size()) {
+                    const int64_t n = std::min<int64_t>(n_ubatch > 0 ? n_ubatch : ubatch->n_tokens, hp0 + (int64_t) hint->size() - q0);
+                    for (int64_t j = n_prev; j > 0; --j) {
+                        win.push_back(tok_at(q0 - (llama_pos) j));
+                    }
+                    win.insert(win.end(), hint->begin() + (q0 - hp0), hint->begin() + (q0 - hp0) + n);
+                }
+            }
+            const int64_t n_next = (int64_t) win.size() - n_prev;
+            bool covered = false;
+            if (n_next > 0 && ah->n > 0 && ah->seq == ah_seq && q0 >= ah->pos0 && q0 + n_next <= ah->pos0 + ah->n) {
+                // the staged range already holds these tokens (a prompt-skip head split of a hinted range)
+                covered = std::equal(win.begin(), win.end(), ah->win.begin() + (q0 - ah->pos0));
+                for (size_t e = 0; covered && e < engram_tab.size(); ++e) {
+                    covered = !engram_tab[e] || ah->layer_staged(e);
+                }
+            }
+            if (n_next > 0 && !covered) {
+                engram_ahead_launch(*ah, model, engram_tab, ah_seq, q0, std::move(win));
+            } else if (n_next <= 0) {
+                ah->release();
+            }
+        }
+
         if (eg_m) {
-            fprintf(stderr, "engram stats: ubatch %u tokens: rows = %zu, hash+readahead %.2f ms, gather %.2f ms, upload %.2f ms, total %.2f ms\n",
+            fprintf(stderr, "engram stats: ubatch %u tokens: rows = %zu, hash+readahead %.2f ms, gather %.2f ms, upload %.2f ms, total %.2f ms",
                 ubatch->n_tokens, eg_rows, (eg1 - eg0)/1000.0, eg_gather/1000.0, eg_set/1000.0, (eg_now() - eg0)/1000.0);
+            if (ah) {
+                fprintf(stderr, ", ahead: staged %zu/%zu token-layers, wait %.2f ms, job %.2f ms, next %s",
+                    eg_staged, (size_t) ubatch->n_tokens*engram_tab.size(), eg_wait/1000.0, eg_job, ah->th.joinable() ? "launched" : ah->n > 0 ? "staged" : "none");
+            }
+            fputc('\n', stderr);
         }
     }
 
@@ -1180,6 +1428,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     }();
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
+    inp41->n_ubatch = cparams.n_ubatch;
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
     for (size_t e = 0; ubatch.token && !engram_off && e < model.engram_layers.size(); ++e) {
         const int32_t il = model.engram_layers[e];

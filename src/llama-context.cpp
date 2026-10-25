@@ -1545,6 +1545,20 @@ void llama_context::set_prompt_total(llama_seq_id seq_id, int32_t n_total) {
     }
 }
 
+// LLAMA_DSV41_ENGRAM_AHEAD=1: the memory keeps the hint for the graph inputs (deepseek41 Engram prefetch)
+void llama_context::set_prompt_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens, llama_pos pos0) {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_DSV41_ENGRAM_AHEAD");
+        return v && atoi(v) != 0;
+    }();
+    if (!on) {
+        return;
+    }
+    if (auto * kv_dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get())) {
+        kv_dsv4->set_prompt_tokens(seq_id, tokens, n_tokens, pos0);
+    }
+}
+
 // DeepSeek-V4.1 long-prompt layer skip (idea: Strata src/dsv41/ds4_model.cu "YOCO" prompt skip, MIT).
 // From the skip layer Y (first layer whose compressed attention is fed by Y alone) every layer reads earlier rows only
 // through Y's compressed rows / index keys and its own sliding window of `win` raw K rows. A prompt of n rows therefore
@@ -5377,6 +5391,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_set_prompt_total(llama_context * ctx, llama_seq_id seq_id, int32_t n_total) {
     ctx->set_prompt_total(seq_id, n_total);
+}
+
+void llama_set_prompt_tokens(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens, llama_pos pos0) {
+    ctx->set_prompt_tokens(seq_id, tokens, n_tokens, pos0);
 }
 
 int32_t llama_prompt_skip_ckpt_min_pos(const llama_context * ctx, int32_t n_total) {

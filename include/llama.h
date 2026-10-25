@@ -1106,6 +1106,13 @@ extern "C" {
     // state checkpoints (llama_state_seq_get_data) at positions before n_total - 127 other than the final one.
     LLAMA_API void llama_set_prompt_total(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_total);
 
+    // DeepSeek-V4.1 Engram prefetch (LLAMA_DSV41_ENGRAM_AHEAD=1, no effect otherwise): the tokens at positions
+    // pos0 .. pos0 + n_tokens - 1 of sequence seq_id that the coming batches will decode (a prompt). While a ubatch
+    // computes, the Engram rows of the next one are then gathered by a background thread. A hint only: rows are used
+    // only if the ubatch's hashed row ids match. Pass it before the batch whose last ubatch precedes them; n_tokens <= 0
+    // clears it.
+    LLAMA_API void llama_set_prompt_tokens(struct llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens, llama_pos pos0);
+
     // With the skip active for a prompt of n_total tokens: the first position at which a state checkpoint is exact
     // (the sliding-window rings of the skipped layers hold wrong rows before it). -1 = no restriction (skip off, or
     // the prompt is too short to skip anything).

@@ -126,6 +126,19 @@ public:
     // ubatches, which the graph runs through the layers before the skip layer only. One-shot.
     void set_prompt_head_rows(uint32_t n) { prompt_head_rows = n; }
 
+    // the tokens of a prompt (positions pos0 .. pos0 + n - 1 of seq_id), so the model's host inputs of a later ubatch
+    // can be prepared while the current one computes (deepseek41 LLAMA_DSV41_ENGRAM_AHEAD); a hint only: users
+    // validate what they precompute. n <= 0 clears it
+    void set_prompt_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n, llama_pos pos0);
+    const std::vector<llama_token> * get_prompt_tokens(llama_seq_id seq_id, llama_pos & pos0) const;
+
+    // opaque per-cache state of the model's graph inputs (deepseek41 Engram prefetch thread); destroyed with the cache,
+    // i.e. before the model whose tables it reads
+    struct aux_state {
+        virtual ~aux_state() = default;
+    };
+    std::unique_ptr<aux_state> & get_aux() const { return aux; }
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -172,6 +185,10 @@ private:
     const uint32_t n_rs_seq;
 
     uint32_t prompt_head_rows = 0;
+
+    std::map<llama_seq_id, std::pair<llama_pos, std::vector<llama_token>>> prompt_tokens;
+
+    mutable std::unique_ptr<aux_state> aux;
 
     std::vector<uint32_t> rs_idx;
 
@@ -383,6 +400,11 @@ public:
 
     // the current ubatch is a prompt head: layers >= the skip layer are not run, the skip layer only compresses
     bool is_prompt_head() const { return i_next < head_flags.size() && head_flags[i_next]; }
+
+    // the ubatch after the current one in this batch, nullptr for the last
+    const llama_ubatch * peek_next_ubatch() const { return i_next + 1 < ubatches.size() ? &ubatches[i_next + 1] : nullptr; }
+    // the cache this context was made from (nullptr for the update / full contexts)
+    llama_kv_cache_dsv4 * get_kv() const { return kv; }
     void set_head_flags(std::vector<uint8_t> flags) { head_flags = std::move(flags); }
 
     const comp_plan & get_csa_plan() const;
@@ -395,6 +417,8 @@ public:
 
 private:
     size_t i_next = 0;
+
+    llama_kv_cache_dsv4 * kv = nullptr;
 
     std::vector<llama_ubatch> ubatches;
     std::vector<uint8_t>      head_flags;
