@@ -4155,6 +4155,17 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
+                    // long-prompt layer skip (LLAMA_DSV41_PROMPT_SKIP=1): the context needs the final prompt length; only
+                    // completions (last-row logits) qualify. Checkpoints taken before the exact position would hold wrong
+                    // sliding-window rings in the upper layers, so none is created there. Short new-token spans keep their
+                    // mid-prompt checkpoints instead: the skip needs >= LLAMA_SERVER_SKIP_MIN_NEW (16384) uncached tokens.
+                    static const int64_t skip_min_new = [] { const char * e = getenv("LLAMA_SERVER_SKIP_MIN_NEW"); return e ? atoll(e) : (int64_t) 16384; }();
+                    const int32_t skip_total = slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.need_embd() &&
+                            !has_mtmd && !input_tokens.has_mtmd && alora_scale <= 0 &&
+                            (int64_t) slot.task->n_tokens() - (int64_t) slot.stats.n_prompt_cached >= skip_min_new ? (int32_t) slot.task->n_tokens() : 0;
+                    llama_set_prompt_total(ctx_tgt, slot.id, skip_total);
+                    const int32_t skip_ckpt_min = skip_total > 0 ? llama_prompt_skip_ckpt_min_pos(ctx_tgt, skip_total) : -1;
+
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
@@ -4194,6 +4205,11 @@ private:
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
+
+                    // not inside the region the long-prompt skip leaves inexact
+                    if (skip_ckpt_min >= 0 && (int32_t) n_tokens_start < skip_ckpt_min) {
+                        do_checkpoint = false;
+                    }
 
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (

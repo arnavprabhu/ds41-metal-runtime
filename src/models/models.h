@@ -1493,7 +1493,8 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 ggml_tensor * cand_pin,
-                int il);
+                int il,
+                bool kv_only = false); // kv_only: compressor and index keys only, returns nullptr
 
         std::vector<ggml_tensor *> topk_of; // top-k of each index source layer
         std::vector<ggml_tensor *> comp_row_of; // [n_layer] new compressed rows of each kv source (for mirrors)
