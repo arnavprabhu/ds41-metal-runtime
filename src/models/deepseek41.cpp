@@ -3,8 +3,12 @@
 #include "llama-impl.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-exps-prefetch.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <unistd.h>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -562,6 +566,60 @@ struct engram_stats_t {
 inline uint64_t eg_now() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// LLAMA_DSV41_ENGRAM_PREAD=N (multi-token ubatches): the Engram rows are pread from the GGUF file by N threads straight
+// into a row buffer and converted like llm_graph_host_get_rows (same bytes, same conversion: lossless), instead of one
+// madvise(WILLNEED) per row range on the main thread followed by page faults in an 8-thread gather. 0 = off (default).
+int engram_pread_threads() {
+    static const int n = [] { const char * v = getenv("LLAMA_DSV41_ENGRAM_PREAD"); return v ? std::max(0, atoi(v)) : 0; }();
+    return n;
+}
+
+bool engram_pread_rows(const ggml_tensor * tab, const int32_t * ids, int64_t n_ids, float * dst, int n_thr) {
+    int fd = -1;
+    uint64_t base = 0;
+    if (!llama_exps_prefetch::lookup(tab->data, ggml_nbytes(tab), &fd, &base) || fd < 0) {
+        return false;
+    }
+    const int64_t nc = tab->ne[0];
+    const size_t row_bytes = ggml_row_size(tab->type, nc);
+    const ggml_to_float_t to_float = tab->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(tab->type)->to_float;
+    std::atomic<bool> ok{true};
+    auto run = [&](int64_t i0, int64_t i1) {
+        std::vector<char> buf(row_bytes);
+        for (int64_t i = i0; i < i1 && ok.load(std::memory_order_relaxed); ++i) {
+            const int64_t r = ids[i];
+            GGML_ASSERT(r >= 0 && r < tab->ne[1]);
+            const uint64_t off = base + (uint64_t) r*tab->nb[1];
+            size_t got = 0;
+            while (got < row_bytes) {
+                const ssize_t n = pread(fd, buf.data() + got, row_bytes - got, (off_t) (off + got));
+                if (n <= 0) {
+                    ok = false;
+                    return;
+                }
+                got += (size_t) n;
+            }
+            if (to_float) {
+                to_float(buf.data(), dst + i*nc, nc);
+            } else {
+                memcpy(dst + i*nc, buf.data(), nc*sizeof(float));
+            }
+        }
+    };
+    n_thr = (int) std::max<int64_t>(1, std::min<int64_t>(n_thr, n_ids/64 + 1));
+    std::vector<std::thread> workers;
+    const int64_t per = (n_ids + n_thr - 1)/n_thr;
+    for (int t = 1; t < n_thr; ++t) {
+        const int64_t i0 = std::min<int64_t>(n_ids, t*per);
+        workers.emplace_back(run, i0, std::min<int64_t>(n_ids, i0 + per));
+    }
+    run(0, std::min<int64_t>(n_ids, per));
+    for (auto & w : workers) {
+        w.join();
+    }
+    return ok.load();
+}
 } // namespace
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
@@ -578,9 +636,12 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
         std::vector<std::vector<int32_t>> ids(engram_ids.size());
         std::vector<int32_t> all;
+        const bool eg_pread = engram_pread_threads() > 0 && ubatch->n_tokens > 1;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             model.engram_hash((int) e, *ubatch, prev, ids[e]);
-            if (model.engram_per_layer) {
+            if (eg_pread) {
+                // read below by the pread gather, no readahead
+            } else if (model.engram_per_layer) {
                 if (model.can_prefetch.count(model.engram_table((int) e))) {
                     llama_prefetch_rows(model.engram_table((int) e), ids[e].data(), ids[e].size());
                 }
@@ -588,7 +649,7 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
                 all.insert(all.end(), ids[e].begin(), ids[e].end());
             }
         }
-        if (!model.engram_per_layer && model.can_prefetch.count(model.per_layer_tok_embd)) {
+        if (!eg_pread && !model.engram_per_layer && model.can_prefetch.count(model.per_layer_tok_embd)) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         llama_dsv41_dump_engram(model, *ubatch, ids);
@@ -601,7 +662,9 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
                     // host gather: same rows and conversion as the CPU GET_ROWS
                     rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
                     const uint64_t g0 = (eg_t || eg_m) ? eg_now() : 0;
-                    llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    if (!eg_pread || !engram_pread_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data(), engram_pread_threads())) {
+                        llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
+                    }
                     const uint64_t g1 = (eg_t || eg_m) ? eg_now() : 0;
                     ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
                     if (eg_t) { g_eg.gather_us += g1 - g0; g_eg.set_us += eg_now() - g1; }
