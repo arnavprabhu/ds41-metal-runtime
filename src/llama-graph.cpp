@@ -2390,6 +2390,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * slots_m = nullptr;
     ggml_tensor * overlap_map_m = nullptr;
     int overlap = 0;
+    // LLAMA_DSV41_MOE_GPURES=1: the maps are device weights read in place; the hit-map lookup is followed by a GPU->host
+    // signal and the fill-map lookup is preceded by a host->GPU wait (GGML_OP_DSV41_EVENT), so the token is one split
+    ggml_tensor * gr_map_f = nullptr;
+    ggml_tensor * gr_ids   = nullptr;
+    ggml_tensor * gr_sig   = nullptr;
     if (moe_overlap_hook && moe_cache != nullptr && arch == LLM_ARCH_DEEPSEEK41 && n_tokens >= 1 && n_tokens <= moe_cache->overlap_max_tokens() &&
             gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr &&
             up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
@@ -2403,7 +2408,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         if (ok) {
             overlap = moe_cache->overlap_level();
-            slots_h = build_moe_cache_lookup(map_h, selected_experts, il);
+            ggml_tensor * map_d = nullptr;
+            ggml_tensor * map_f = nullptr;
+            if (overlap >= 2 && moe_cache->get_gpures_maps(il, n_tokens, n_expert_used, &map_d, &map_f)) {
+                gr_ids = selected_experts;
+                if (!ggml_is_contiguous(gr_ids)) {
+                    gr_ids = ggml_cont(ctx0, gr_ids);
+                }
+                gr_ids = ggml_reshape_1d(ctx0, gr_ids, ggml_nelements(gr_ids));
+                ggml_tensor * s = ggml_get_rows(ctx0, map_d, gr_ids); // [1, n_expert_used*n_tokens]
+                ggml_backend_sched_set_tensor_backend(sched, s, moe_cache->backend(il));
+                cb(s, "ffn_moe_slots", il);
+                // the host reads the ids and the GPU's lookup once this signal is seen, plans and fills the layer
+                gr_sig = ggml_dsv41_event(ctx0, s, gr_ids, nullptr, nullptr, GGML_DSV41_EVENT_SIGNAL, il);
+                ggml_backend_sched_set_tensor_backend(sched, gr_sig, moe_cache->backend(il));
+                ggml_format_name(gr_sig, "dsv41_gpures_sig-%d", il);
+                ggml_build_forward_expand(gf, gr_sig);
+                slots_h  = ggml_reshape_2d(ctx0, gr_sig, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+                gr_map_f = map_f;
+            } else {
+                slots_h = build_moe_cache_lookup(map_h, selected_experts, il);
+            }
             moe_overlap_hook();
             moe_overlap_hook = nullptr;
             // the lookup of the fill map starts the second split: level 1 builds it now, level 2 after its first pass
@@ -2464,7 +2489,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(d1, "ffn_moe_down_hit", il);
         ggml_build_forward_expand(gf, d1);
 
-        slots_m = build_moe_cache_lookup(overlap_map_m, selected_experts, il);
+        if (gr_map_f != nullptr) {
+            // the fill pass starts once the host has planned the layer and the misses are in their slots; the wait keeps
+            // the ids and the hit lookup alive until then (the host reads them) and comes after the hit pass, which runs
+            // while the host plans
+            ggml_tensor * w = ggml_dsv41_event(ctx0, gr_map_f, gr_ids, gr_sig, d1, GGML_DSV41_EVENT_WAIT, il);
+            ggml_backend_sched_set_tensor_backend(sched, w, moe_cache->backend(il));
+            ggml_format_name(w, "dsv41_gpures_wait-%d", il);
+            ggml_tensor * s = ggml_get_rows(ctx0, w, gr_ids);
+            ggml_backend_sched_set_tensor_backend(sched, s, moe_cache->backend(il));
+            cb(s, "ffn_moe_slots", il);
+            ggml_build_forward_expand(gf, s);
+            slots_m = ggml_reshape_2d(ctx0, s, selected_experts->ne[0], selected_experts->ne[1]);
+        } else {
+            slots_m = build_moe_cache_lookup(overlap_map_m, selected_experts, il);
+        }
         slots   = slots_m;
 
         ggml_tensor * g2 = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr, slots_m, g1);

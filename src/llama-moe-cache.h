@@ -29,6 +29,12 @@ public:
     // slot map; level 2: it only holds the experts the fill brings, the hit map the experts already in the arena
     bool get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** h, ggml_tensor ** m) const;
     int  overlap_level() const;
+
+    // LLAMA_DSV41_MOE_GPURES=1 (on top of overlap level 2): the resident slot map and the fill map of layer il as device
+    // weights in the arena, read in place by the graph (no scheduler split); the graph orders the hit pass, the host plan
+    // and the fill pass with GGML_OP_DSV41_EVENT nodes (signal id il after the hit-map lookup, wait id il before the
+    // fill-map lookup). False if the layer does not use the mode (then get_slot_maps applies)
+    bool get_gpures_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** map, ggml_tensor ** fill) const;
     // the largest ubatch the overlap mode splits: 0 if it is off, 1 by default, 16 with LLAMA_DSV41_MOE_OVERLAP_NT=1
     int64_t overlap_max_tokens() const;
 
