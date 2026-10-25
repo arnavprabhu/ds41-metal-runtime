@@ -368,6 +368,39 @@ struct llama_prefill_stage {
         return true;
     }
 
+    // file read job(s) for [fo, fo + len) -> dst (src = the same bytes in the mapping). With WIDEN, dst must be congruent
+    // to fo modulo WPAGE (see head[][]): the read is widened to [align_down(fo), align_up(fo + len)) on the F_NOCACHE fd
+    // (=2: cached fd), so file offset, length and destination are all page multiples. The bytes in the widened margins
+    // are the file's own bytes, written into staging slack or onto neighbouring experts' identical bytes.
+    void add_file_read(std::vector<llama_exps_prefetch::upload_job> & jobs, int fd, uint64_t fo, char * dst, size_t len, const void * src) {
+        if (widen) {
+            const size_t   h    = (size_t) (fo % WPAGE);
+            const char *   wsrc = (const char *) src - h; // the mapping starts at file offset 0
+            size_t         wlen = GGML_PAD(h + len, WPAGE);
+            int            wfd  = -1;
+            uint64_t       woff = 0;
+            auto lk = [&](size_t l) {
+                return widen_mode() == 2 ? llama_exps_prefetch::lookup(wsrc, l, &wfd, &woff)
+                                         : llama_exps_prefetch::lookup_nocache(wsrc, l, &wfd, &woff);
+            };
+            bool ok = ((uintptr_t) dst % WPAGE) == h && lk(wlen);
+            if (!ok && ((uintptr_t) dst % WPAGE) == h) {
+                // the rounded end is past the end of the file (last tensor): keep the exact end
+                wlen = h + len;
+                ok   = lk(wlen);
+                widen_tail_clamped += ok;
+            }
+            if (ok && woff == fo - h) {
+                llama_exps_prefetch::add_upload(jobs, wfd, woff, dst - h, wlen, wsrc);
+                widen_jobs++;
+                widen_extra_bytes += wlen - len;
+                return;
+            }
+            widen_fallback++;
+        }
+        llama_exps_prefetch::add_upload(jobs, fd, fo, dst, len, src);
+    }
+
     // full read of layer li into parity li&1 on the background thread
     // LLAMA_DSV41_PREFILL_ARENA=1: experts resident in the MoE arena are copied from it instead of read from the file
     uint64_t arena_experts = 0, file_experts = 0;
@@ -389,43 +422,12 @@ struct llama_prefill_stage {
                 return;
             }
             char * base = (char *) ggml_backend_buffer_get_base(buf[p][k]);
-            head[p][k] = 0;
-            char * dst = base;
+            // WIDEN: the tensor sits at base + off % 16 KiB, so every destination address is congruent to its file
+            // offset modulo the page and any file range can be widened to whole pages in place
+            head[p][k] = widen ? (size_t) (off % WPAGE) : 0;
+            char * dst = base + head[p][k];
             if (!(arena_env && mc != nullptr)) {
-                bool done = false;
-                if (widen) {
-                    // page-widened read: [off - h, align_up(off + n)) into base, the tensor at base + h; the file
-                    // offset, the length and the destination are 16 KiB multiples, so F_NOCACHE reads stay direct
-                    const size_t   n    = ggml_nbytes(t);
-                    const size_t   h    = (size_t) (off % WPAGE);
-                    const char *   wsrc = (const char *) t->data - h; // the mapping starts at file offset 0
-                    size_t         wlen = GGML_PAD(h + n, WPAGE);
-                    int            wfd  = -1;
-                    uint64_t       woff = 0;
-                    auto lk = [&](size_t len) {
-                        return widen_mode() == 2 ? llama_exps_prefetch::lookup(wsrc, len, &wfd, &woff)
-                                                 : llama_exps_prefetch::lookup_nocache(wsrc, len, &wfd, &woff);
-                    };
-                    bool ok = lk(wlen);
-                    if (!ok) {
-                        // the rounded end is past the end of the file (last tensor): keep the exact end
-                        wlen = h + n;
-                        ok   = lk(wlen);
-                        widen_tail_clamped += ok;
-                    }
-                    if (ok && woff == off - h) {
-                        llama_exps_prefetch::add_upload(jobs, wfd, woff, base, wlen, wsrc);
-                        head[p][k] = h;
-                        widen_jobs++;
-                        widen_extra_bytes += wlen - n;
-                        done = true;
-                    } else {
-                        widen_fallback++;
-                    }
-                }
-                if (!done) {
-                    llama_exps_prefetch::add_upload(jobs, fd, off, dst, ggml_nbytes(t), t->data);
-                }
+                add_file_read(jobs, fd, off, dst, ggml_nbytes(t), t->data);
             } else {
                 const int64_t n_expert = t->ne[2];
                 const size_t  es       = t->nb[2];
@@ -442,7 +444,9 @@ struct llama_prefill_stage {
                         while (e + n < n_expert && mc->resident_expert(t, e + n) == nullptr) {
                             n++;
                         }
-                        llama_exps_prefetch::add_upload(jobs, fd, off + e*es, dst + e*es, n*es, (const char *) t->data + e*es);
+                        // widened: the page pieces that overlap the neighbouring experts are written with the same
+                        // bytes the arena copies write there (the arena holds exact copies of the file bytes)
+                        add_file_read(jobs, fd, off + e*es, dst + e*es, n*es, (const char *) t->data + e*es);
                         file_experts += n;
                     }
                     e += n;
@@ -500,7 +504,7 @@ struct llama_prefill_stage {
         }
         if (n_reads || n_staged_splits) {
             if (widen_jobs + widen_fallback > 0) {
-                fprintf(stderr, "exps-prefetch stage: widened reads = %llu tensors (%.1f MiB extra, %llu tail-clamped), not widened = %llu\n",
+                fprintf(stderr, "exps-prefetch stage: widened reads = %llu ranges (%.1f MiB extra, %llu tail-clamped), not widened = %llu\n",
                         (unsigned long long) widen_jobs, widen_extra_bytes / (1024.0*1024.0), (unsigned long long) widen_tail_clamped,
                         (unsigned long long) widen_fallback);
             }
