@@ -1001,6 +1001,12 @@ static bool ggml_metal_ds41_iq(void) {
     return v;
 }
 
+// GGML_METAL_DS41_IQ1M=1 : IQ1_M mul_mv_id v2 (grid word decoded with integer ops, no value table; iter 011k)
+static bool ggml_metal_ds41_iq1m(void) {
+    static const bool v = ggml_metal_ds41_env("GGML_METAL_DS41_IQ1M");
+    return v;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1559,6 +1565,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             case GGML_TYPE_IQ2_XXS: nsg = 4; nr0 = x2 ?  8 : 4; smem = (256 + 128)*16;  suffix = x2 ? "_x2" : "_x1"; break;
             case GGML_TYPE_IQ2_XS:  nsg = 4; nr0 = x2 ? 16 : 4; smem = (512 + 128)*16;  suffix = x2 ? "_x2" : "_x1"; break;
             default: break;
+        }
+    }
+
+    // v2a: 6 rows per simdgroup, 2 simdgroups, grid from constant memory (12 rows per threadgroup)
+    // v2b: 4 row groups of 8 lanes x 4 rows, 4 simdgroups, grid in threadgroup memory (64 rows per threadgroup)
+    if (ggml_metal_ds41_iq1m() && tsrc0 == GGML_TYPE_IQ1_M && !split && tsrc1 == GGML_TYPE_F32 && ne00 % 256 == 0 && op->src[1]->nb[1] % 16 == 0) {
+        const bool x2 = (ne00/32) % 32 != 0;
+        if (!x2 && ne01 % 12 == 0) {
+            nsg = 2; nr0 =  6; smem = 0;      suffix = "_v2a";
+        } else if (x2 && (ne00/32) % 8 == 0 && ne01 % 64 == 0) {
+            nsg = 4; nr0 = 16; smem = 2048*4; suffix = "_v2b";
         }
     }
 
