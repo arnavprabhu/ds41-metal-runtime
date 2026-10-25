@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <future>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -1121,6 +1123,50 @@ struct llama_sampler * llama_sampler_init_greedy() {
 
 // dist
 
+// Gumbel-max noise for llama_sampler_init_dist_gumbel: a counter-based stream, draw d of key k is a pure function of
+// (k, d), so the noise of the next draw can be generated on a worker thread while the graph of the current one runs
+static uint64_t llama_dist_gumbel_mix(uint64_t & s) {
+    uint64_t z = (s += 0x9e3779b97f4a7c15ull); // splitmix64
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+static uint64_t llama_dist_gumbel_key(uint32_t seed_cur) {
+    uint64_t s = 0x5851f42d4c957f2dull ^ (uint64_t) seed_cur;
+    return llama_dist_gumbel_mix(s);
+}
+
+static void llama_dist_gumbel_fill(float * dst, size_t n, uint64_t key, uint64_t draw) {
+    uint64_t s0 = key ^ (draw * 0xd1342543de82ef95ull);
+    uint64_t s  = llama_dist_gumbel_mix(s0);
+
+    for (size_t i = 0; i < n; ++i) {
+        // u in (0, 1) from 52 random bits: both ends excluded and exactly representable, so g stays finite
+        // (|g| <= 36.7) and -log(u) keeps full precision near u = 1, where the large g that decide the argmax live
+        const double u = ((double) (llama_dist_gumbel_mix(s) >> 12) + 0.5) * 0x1.0p-52;
+        dst[i] = (float) -std::log(-std::log(u));
+    }
+}
+
+struct llama_dist_gumbel_noise {
+    std::vector<float> buf;
+    uint64_t key  = 0;
+    uint64_t draw = UINT64_MAX; // buf holds the noise of (key, draw) once fut is joined
+
+    std::future<void> fut;
+
+    ~llama_dist_gumbel_noise() {
+        join();
+    }
+
+    void join() {
+        if (fut.valid()) {
+            fut.get();
+        }
+    }
+};
+
 struct llama_sampler_dist : public llama_sampler_backend {
     const uint32_t seed;
           uint32_t seed_cur;
@@ -1138,6 +1184,16 @@ struct llama_sampler_dist : public llama_sampler_backend {
     // inputs for the current sampling graph
     std::vector<ggml_tensor *> inp_uniforms;
 
+    // Gumbel-max backend sampling (llama_sampler_init_dist_gumbel): the graph computes argmax(logits + g) with
+    // g_i = -log(-log(u_i)), an exact sample of softmax(logits), and only the token id is copied back
+    const bool gumbel;
+          bool gumbel_active; // set by .backend_init(): gumbel and one output per sequence (no transactional draws)
+      uint64_t gumbel_key;
+      uint64_t gumbel_draw;   // next draw of the noise stream
+
+    std::vector<ggml_tensor *> inp_gumbel;
+    std::unique_ptr<llama_dist_gumbel_noise> gumbel_noise;
+
     void copy_state(const llama_sampler_dist & src) {
         // note: inp_uniforms and backend_transactional belong to the current sampling graph
         seed_cur                  = src.seed_cur;
@@ -1145,6 +1201,8 @@ struct llama_sampler_dist : public llama_sampler_backend {
         rng_backend               = src.rng_backend;
         n_backend_draws_generated = src.n_backend_draws_generated;
         n_backend_draws_committed = src.n_backend_draws_committed;
+        gumbel_key                = src.gumbel_key;
+        gumbel_draw               = src.gumbel_draw;
     }
 };
 
@@ -1235,11 +1293,15 @@ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     ctx->rng_backend = ctx->rng;
     ctx->n_backend_draws_generated = 0;
     ctx->n_backend_draws_committed = 0;
+    ctx->gumbel_key  = llama_dist_gumbel_key(ctx->seed_cur);
+    ctx->gumbel_draw = 0;
 }
+
+static struct llama_sampler * llama_sampler_init_dist_impl(uint32_t seed, bool gumbel);
 
 static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
-    auto * result = llama_sampler_init_dist(ctx->seed);
+    auto * result = llama_sampler_init_dist_impl(ctx->seed, ctx->gumbel);
 
     // copy the state
     {
@@ -1251,6 +1313,8 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         result_ctx->rng_backend               = ctx->rng_backend;
         result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
         result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+        result_ctx->gumbel_key                = ctx->gumbel_key;
+        result_ctx->gumbel_draw               = ctx->gumbel_draw;
     }
 
     return result;
@@ -1265,6 +1329,13 @@ static bool llama_sampler_dist_backend_init(
         ggml_backend_buffer_type_t   buft,
         uint32_t                     n_outputs_max_per_seq) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+
+    // the Gumbel graph replaces the inverse-CDF one only with one draw per graph: several outputs per sequence keep
+    // the transactional uniforms (and their probabilities) of the inverse-CDF graph
+    sctx->gumbel_active = sctx->gumbel && n_outputs_max_per_seq == 1;
+    if (sctx->gumbel_active && !sctx->gumbel_noise) {
+        sctx->gumbel_noise.reset(new llama_dist_gumbel_noise());
+    }
 
     const bool res = llama_sampler_backend_support(smpl, buft);
 
@@ -1285,6 +1356,35 @@ static void llama_sampler_dist_backend_apply(
     GGML_UNUSED(gf);
 
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+
+    if (sctx->gumbel_active) {
+        // Gumbel-max: argmax(logits + g) is distributed as softmax(logits); no softmax, no cumsum, and neither the
+        // logits nor the probabilities leave the device
+        ggml_tensor * inp_noise = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ggml_nelements(data->logits));
+        ggml_format_name(inp_noise, "gumbel_%zu", sctx->inp_gumbel.size());
+        ggml_set_input(inp_noise);
+        sctx->inp_gumbel.push_back(inp_noise);
+
+        struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+
+        struct ggml_tensor * perturbed = ggml_add(ctx, logits, inp_noise);
+        ggml_set_name(perturbed, "gumbel_perturbed");
+
+        struct ggml_tensor * sampled_token = ggml_argmax(ctx, perturbed);
+        ggml_set_name(sampled_token, "gumbel_argmax");
+
+        if (data->candidates != nullptr) {
+            struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
+
+            sampled_token = ggml_get_rows(ctx, candidates, sampled_token);
+            ggml_set_name(sampled_token, "gumbel_sampled_token");
+        }
+
+        data->sampled = sampled_token;
+        data->logits  = nullptr;
+        data->probs   = nullptr;
+        return;
+    }
 
     ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
@@ -1344,6 +1444,43 @@ static void llama_sampler_dist_backend_apply(
 static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
 
+    if (sctx->gumbel_active) {
+        GGML_ASSERT(!sctx->inp_gumbel.empty());
+        GGML_ASSERT(sctx->gumbel_noise);
+
+        auto & nz = *sctx->gumbel_noise;
+
+        const uint64_t key = sctx->gumbel_key;
+
+        for (auto * inp_noise : sctx->inp_gumbel) {
+            const size_t   n    = ggml_nelements(inp_noise);
+            const uint64_t draw = sctx->gumbel_draw++;
+
+            nz.join();
+            if (nz.key != key || nz.draw != draw || nz.buf.size() != n) {
+                // no prefetched draw (first draw, reset, other vocab size): generate it now
+                nz.buf.resize(n);
+                llama_dist_gumbel_fill(nz.buf.data(), n, key, draw);
+            }
+
+            ggml_backend_tensor_set(inp_noise, nz.buf.data(), 0, n*sizeof(float));
+
+            // generate the next draw while the graph runs
+            nz.key  = key;
+            nz.draw = draw + 1;
+            try {
+                nz.fut = std::async(std::launch::async, [&nz, n, key, draw]() {
+                    nz.buf.resize(n);
+                    llama_dist_gumbel_fill(nz.buf.data(), n, key, draw + 1);
+                });
+            } catch (const std::exception &) {
+                nz.draw = UINT64_MAX;
+            }
+        }
+
+        return;
+    }
+
     GGML_ASSERT(!sctx->inp_uniforms.empty());
 
     // We sample in double precision and cast to float to match rnd numbers of
@@ -1370,6 +1507,7 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_dist *) smpl->ctx;
     sctx->inp_uniforms.clear();
+    sctx->inp_gumbel.clear();
 }
 
 static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
@@ -1402,12 +1540,12 @@ static struct llama_sampler_i llama_sampler_dist_i = {
     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
 };
 
-struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+static struct llama_sampler * llama_sampler_init_dist_impl(uint32_t seed, bool gumbel) {
     auto seed_cur = get_rng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_dist_i,
         /* .ctx   = */ new llama_sampler_dist {
-            ("dist"),
+            (gumbel ? "dist-gumbel" : "dist"),
             /* .seed                      = */ seed,
             /* .seed_cur                  = */ seed_cur,
             /* .rng                       = */ std::mt19937(seed_cur),
@@ -1416,8 +1554,22 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
             /* .n_backend_draws_generated = */ 0,
             /* .n_backend_draws_committed = */ 0,
             /* .inp_uniforms              = */ {},
+            /* .gumbel                    = */ gumbel,
+            /* .gumbel_active             = */ false,
+            /* .gumbel_key                = */ llama_dist_gumbel_key(seed_cur),
+            /* .gumbel_draw               = */ 0,
+            /* .inp_gumbel                = */ {},
+            /* .gumbel_noise              = */ nullptr,
         }
     );
+}
+
+struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+    return llama_sampler_init_dist_impl(seed, false);
+}
+
+struct llama_sampler * llama_sampler_init_dist_gumbel(uint32_t seed) {
+    return llama_sampler_init_dist_impl(seed, true);
 }
 
 void llama_sampler_backend_begin(llama_sampler * sampler) {

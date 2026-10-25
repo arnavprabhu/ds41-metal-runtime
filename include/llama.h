@@ -1492,6 +1492,13 @@ extern "C" {
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
 
+    /// @details Same distribution as llama_sampler_init_dist. When offloaded with llama_set_sampler and one output per
+    ///          sequence, the graph samples with the Gumbel-max trick, argmax(logits + g) with g_i = -log(-log(u_i)),
+    ///          and only the token id is copied back (no logits, no probabilities). The token sequence for a given seed
+    ///          differs from llama_sampler_init_dist's. On the CPU, or with several outputs per sequence, it behaves
+    ///          like llama_sampler_init_dist.
+    LLAMA_API struct llama_sampler * llama_sampler_init_dist_gumbel(uint32_t seed);
+
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop
     LLAMA_API struct llama_sampler * llama_sampler_init_top_k      (int32_t k);

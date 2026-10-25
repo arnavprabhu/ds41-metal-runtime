@@ -357,6 +357,9 @@ private:
 
         // optimization
         std::vector<llama_token> token_ids_full_vocab;
+
+        // backend nodes of each sequence's sampler at the last sched reserve (LLAMA_DSV41_GPU_SAMPLE)
+        std::map<llama_seq_id, uint32_t> reserved_nodes;
     };
 
     sampling_info sampling;

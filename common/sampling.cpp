@@ -153,6 +153,10 @@ struct common_sampler {
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
+        } else if (const llama_token id = llama_get_sampled_token_ith(ctx, idx); id != LLAMA_TOKEN_NULL) {
+            // the backend returned only the sampled token (Gumbel-max dist): it is the single candidate
+            cur.resize(1);
+            cur[0] = llama_token_data{id, 0.0f, 1.0f};
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
@@ -188,9 +192,80 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+// true when the chain of these parameters reduces to plain softmax sampling: every sampler other than the logit bias
+// and the final dist is a no-op (the early returns of their .apply()), and nothing needs the probabilities
+static bool common_sampler_gpu_dist_eligible(const common_params_sampling & params) {
+    if (params.mirostat != 0 || params.n_probs != 0) {
+        return false;
+    }
+
+    for (const auto & cnstr : params.samplers) {
+        bool noop = false;
+        switch (cnstr) {
+            case COMMON_SAMPLER_TYPE_DRY:
+                noop = params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0;
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                noop = params.top_k <= 0;
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_P:
+                noop = params.top_p >= 1.0f;
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                noop = params.top_n_sigma <= 0.0f;
+                break;
+            case COMMON_SAMPLER_TYPE_MIN_P:
+                noop = params.min_p <= 0.0f;
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                noop = params.xtc_probability <= 0.0f || params.xtc_threshold > 0.5f;
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                noop = params.typ_p >= 1.0f;
+                break;
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                noop = params.temp == 1.0f && params.dynatemp_range <= 0.0f;
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                noop = params.penalty_last_n == 0 ||
+                    (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+                break;
+            default: // infill, adaptive-p
+                noop = false;
+                break;
+        }
+        if (!noop) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static struct common_sampler * common_sampler_init_impl(
+        const struct llama_model * model,
+        struct common_params_sampling & params,
+        bool gpu_dist);
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params) {
+    return common_sampler_init_impl(model, params, false);
+}
+
+struct common_sampler * common_sampler_init_gpu_dist(
+        const struct llama_model * model,
+        struct common_params_sampling & params) {
+    if (!common_sampler_gpu_dist_eligible(params)) {
+        return nullptr;
+    }
+    return common_sampler_init_impl(model, params, true);
+}
+
+static struct common_sampler * common_sampler_init_impl(
+        const struct llama_model * model,
+        struct common_params_sampling & params,
+        bool gpu_dist) {
     if (!std::isfinite(params.penalty_repeat) ||
         params.penalty_repeat <= 0.0f ||
         !std::isfinite(1.0f/params.penalty_repeat)) {
@@ -341,7 +416,10 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    if (params.mirostat == 0) {
+    if (params.mirostat == 0 && gpu_dist) {
+        // the other samplers are no-ops (common_sampler_gpu_dist_eligible)
+        samplers.push_back(llama_sampler_init_dist_gumbel(params.seed));
+    } else if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
 
@@ -417,6 +495,14 @@ struct common_sampler * common_sampler_init(
 
     for (auto * smpl : samplers) {
         llama_sampler_chain_add(chain, smpl);
+    }
+
+    if (gpu_dist && (grmr || rbudget)) {
+        // the grammar and the reasoning budget run on the CPU candidates
+        llama_sampler_free(grmr);
+        llama_sampler_free(rbudget);
+        llama_sampler_free(chain);
+        return nullptr;
     }
 
     if (grmr && params.backend_sampling) {

@@ -1929,17 +1929,40 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            // GPU sampling (LLAMA_DSV41_GPU_SAMPLE=1): plain softmax sampling (e.g. temp 1, top_p 1, top_k 0, min_p 0)
+            // runs in the graph as Gumbel-max dist and only the token id is read back. Not with speculative decoding
+            // (the verification batch has several outputs and rejection sampling needs the target probabilities)
+            static const bool gpu_sample = [] {
+                const char * v = getenv("LLAMA_DSV41_GPU_SAMPLE");
+                return v && atoi(v) > 0;
+            }();
+
+            bool use_gpu_sample = false;
+
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                common_sampler * smpl = nullptr;
+                if (gpu_sample && !slot.can_speculate() && params_base.n_outputs_max_per_seq == 1 &&
+                        !task.params.sampling.backend_sampling) {
+                    smpl = common_sampler_init_gpu_dist(model_tgt, task.params.sampling);
+                    use_gpu_sample = smpl != nullptr;
+                }
+                if (!smpl) {
+                    smpl = common_sampler_init(model_tgt, task.params.sampling);
+                }
+                slot.smpl.reset(smpl);
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
 
+            if (gpu_sample) {
+                SLT_INF(slot, "gpu sample: %s\n", use_gpu_sample ? "on (gumbel-max dist)" : "off (cpu sampler chain)");
+            }
+
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
+            bool use_backend_sampling = task.params.sampling.backend_sampling || use_gpu_sample;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
