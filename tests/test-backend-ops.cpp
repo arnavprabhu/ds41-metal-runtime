@@ -11871,6 +11871,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
         }
     }
+    // (GGML_METAL_DSV4_SATTN=2 kernel: 64-key blocks) deep KV up to 128K rows, window-only lists (layers 0-1),
+    // list lengths that are not a multiple of the block
+    for (int64_t kv : { 33024, 131200 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 77, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+    }
+    for (int64_t nkv : { 128, 600, 97 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4224, 65, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, nkv));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 2048, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,  2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -12183,10 +12192,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         // dense Q8_0: attn_q_a, attn_kv
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  1280, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   512, n, 5120, {1, 1}, {1, 1}));
-        // routed experts, 6 of 64 (kernel is identical for 6 of 384)
+        // routed experts, 6 of 64 (kernel is identical for 6 of 384; DS41_NEXP=384 for the real rows per expert in prefill)
+        const int nexp = getenv("DS41_NEXP") ? atoi(getenv("DS41_NEXP")) : 64;
         for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 6, false, 2304, n, 5120));
-            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 6, false, 5120, n, 2304));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
+            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
         }
     }
     return test_cases;
@@ -12196,9 +12206,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // deepseek41 sparse prefill attention (GGML_METAL_DSV4_SATTN): 64 heads, 1 KV head, V view of K, window + top-k
-    for (int64_t nb : { 512, 2048 }) {
+    for (int64_t nb : { 512, 2048, 4096 }) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4224, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
     }
+    // window-only layers and 128K depth
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4224, 4096, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 128));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 131200, 1024, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
