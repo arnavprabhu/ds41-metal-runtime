@@ -1772,6 +1772,12 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    // LLAMA_DSV41_GPU_SAMPLE: the sampler nodes this reserve covers, see set_sampler()
+    sampling.reserved_nodes.clear();
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        sampling.reserved_nodes[seq_id] = llama_sampler_backend_n_nodes(sampler);
+    }
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -2468,6 +2474,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         sampler->iface->backend_apply &&
         llama_sampler_chain_n(sampler) > 0;
 
+    // LLAMA_DSV41_GPU_SAMPLE: the server sets a new sampler for each request and clears it on release; a full
+    // sched reserve each time is not needed when the last reserve already covered as many sampler nodes for this
+    // sequence (removing a sampler only shrinks the graph, the allocator grows the compute buffers if a graph needs it)
+    static const bool keep_reserve = [] {
+        const char * v = getenv("LLAMA_DSV41_GPU_SAMPLE");
+        return v && atoi(v) > 0;
+    }();
+
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
@@ -2475,7 +2489,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        const auto it = sampling.reserved_nodes.find(seq_id);
+        if (!keep_reserve || it == sampling.reserved_nodes.end() || it->second < llama_sampler_backend_n_nodes(sampler)) {
+            sched_need_reserve = true;
+        }
+
+        // never reuse a graph built for another sampler: graph reuse compares sampler pointers, and a new chain can
+        // be allocated at the address of the freed one whose input tensors the old graph holds
+        gf_res_prev_active = nullptr;
 
         return true;
     }
@@ -2494,7 +2515,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    if (!keep_reserve) {
+        sched_need_reserve = true;
+    }
+    gf_res_prev_active = nullptr;
 
     return true;
 }

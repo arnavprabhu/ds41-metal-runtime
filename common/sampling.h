@@ -41,6 +41,14 @@ struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params);
 
+// GPU sampling (LLAMA_DSV41_GPU_SAMPLE): when the parameters reduce to plain softmax sampling (temperature 1 or no
+// temperature sampler, no truncation, no penalties, no grammar / reasoning budget, n_probs == 0), returns a sampler
+// whose chain is [logit bias] + Gumbel-max dist, to be offloaded with llama_set_sampler so that only the token id is
+// read back; returns nullptr otherwise (use common_sampler_init)
+struct common_sampler * common_sampler_init_gpu_dist(
+        const struct llama_model * model,
+        struct common_params_sampling & params);
+
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
