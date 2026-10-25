@@ -463,6 +463,50 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    //
+    // Decode-step host overhead profile (LLAMA_DSV41_DECODE_PROF=1, diagnostics only)
+    //
+    // The application opens a step at every decode call (ggml_decode_prof_begin); steps of 1..16 tokens are profiled
+    // from one begin to the next. The scheduler, the backends and the application add to the counters of the open step
+    // (step id 0) or of an earlier step by id. A summary is printed to stderr at exit with the prefix "decode-prof:";
+    // LLAMA_DSV41_DECODE_PROF=2 also prints one line per step.
+
+    enum ggml_decode_prof_counter {
+        GGML_DECODE_PROF_DECODE_US,       // wall time inside the application's decode call
+        GGML_DECODE_PROF_SCHED_US,        // wall time of ggml_backend_sched compute_splits
+        GGML_DECODE_PROF_SPLITS,          // scheduler splits computed
+        GGML_DECODE_PROF_SPLITS_GPU,      // ... on a non-CPU backend
+        GGML_DECODE_PROF_GRAPHS,          // backend graph_compute calls
+        GGML_DECODE_PROF_CBS,             // command buffers committed (graph + copies/events)
+        GGML_DECODE_PROF_ENCODE_US,       // calling-thread time in the backend graph_compute (encode + commit)
+        GGML_DECODE_PROF_SYNC_CALLS,      // backend synchronize calls
+        GGML_DECODE_PROF_SYNCS,           // ... that had a command buffer to wait for
+        GGML_DECODE_PROF_SYNC_US,         // time in those
+        GGML_DECODE_PROF_SYNC_BLOCKED,    // ... of which the command buffer was still running at the call
+        GGML_DECODE_PROF_SYNC_SPIN_HITS,  // ... of which GGML_METAL_SPIN_US polling saw the completion
+        GGML_DECODE_PROF_WAKE_US,         // host return time - GPUEndTime of the waited command buffer (blocked syncs)
+        GGML_DECODE_PROF_WAKE_N,
+        GGML_DECODE_PROF_SUBMIT_US,       // GPUStartTime - commit time, first command buffer of a graph on an idle GPU
+        GGML_DECODE_PROF_SUBMIT_N,
+        GGML_DECODE_PROF_GPU_US,          // GPU busy time (union of the command buffers' GPUStartTime..GPUEndTime)
+        GGML_DECODE_PROF_GPU_IDLE_US,     // GPU idle between consecutive command buffers of the step
+        GGML_DECODE_PROF_GPU_LEAD_US,     // GPU idle before the step's first command buffer (since the previous one)
+        GGML_DECODE_PROF_COPY_CALLS,      // MoE cache copy callbacks (plan splits)
+        GGML_DECODE_PROF_COPY_SYNC_US,    // ... synchronize + read of the router ids (included in SYNC_US)
+        GGML_DECODE_PROF_COPY_PLAN_US,    // ... arena plan (overlap: without the upload start; otherwise incl. the fill)
+        GGML_DECODE_PROF_COPY_UPSTART_US, // ... start of the async upload (overlap mode)
+        GGML_DECODE_PROF_COPY_UPWAIT_US,  // ... wait for the upload in the second split (overlap mode)
+        GGML_DECODE_PROF_COUNT,
+    };
+
+    GGML_API bool     ggml_decode_prof_enabled(void);
+    // closes the open step and opens a new one if 1 <= n_tokens <= 16 (other decode calls only close it)
+    GGML_API void     ggml_decode_prof_begin(int n_tokens);
+    // id of the open step, 0 if none
+    GGML_API uint64_t ggml_decode_prof_step(void);
+    // add v to counter c of step `step` (0 = the open step); dropped if that step is not the open or the last closed one
+    GGML_API void     ggml_decode_prof_add(uint64_t step, enum ggml_decode_prof_counter c, double v);
+
 #ifdef  __cplusplus
 }
 #endif
