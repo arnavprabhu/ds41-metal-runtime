@@ -1076,8 +1076,9 @@ uint32_t llama_context::prompt_skip_head_rows(const llama_batch_ext & batch, boo
         }
     }
 
-    LLAMA_LOG_INFO("%s: prompt skip: seq %d, rows [%" PRId64 ", %" PRId64 ") of %" PRId64 " run as head (layers < %d only), keep %" PRId64 "\n",
-            __func__, seq, p0, p0 + rows, total, hp.dsv41_yoco, keep);
+    // stderr on purpose: the default log level hides INFO, and this is one line per prompt batch that is skipped
+    fprintf(stderr, "llama_context: prompt skip: seq %d, rows [%" PRId64 ", %" PRId64 ") of %" PRId64 " run as head (layers < %d only), keep %" PRId64 "\n",
+            seq, p0, p0 + rows, total, hp.dsv41_yoco, keep);
     return (uint32_t) rows;
 }
 
