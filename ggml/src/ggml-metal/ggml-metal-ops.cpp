@@ -44,6 +44,7 @@ struct ggml_metal_op {
         int  debug_graph) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
@@ -103,6 +104,7 @@ struct ggml_metal_op {
 
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -184,6 +186,29 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
     return ggml_mem_ranges_add(ctx->mem_ranges, node);
 }
 
+// GGML_OP_DSV41_EVENT (LLAMA_DSV41_MOE_GPURES): a GPU/host ordering point between two compute encoders, no kernel. The
+// node is a view of src[0]. The encoder boundary orders the work around it (ggml's buffers are hazard-tracked), so the
+// concurrency ranges start empty in the new encoder
+static int ggml_metal_op_dsv41_event(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * op = ctx->node(idx);
+
+    const int32_t  mode  = ggml_get_op_params_i32(op, 0);
+    const int32_t  id    = ggml_get_op_params_i32(op, 1);
+    const uint64_t value = ggml_metal_device_dsv41_get_base(ctx->dev) + (uint64_t) id + 1;
+
+    if (ctx->debug_graph > 0) {
+        GGML_LOG_DEBUG("%s: node[%5d] - %-12s %s value %llu\n", __func__, idx, ggml_op_name(op->op), mode == 0 ? "signal" : "wait", (unsigned long long) value);
+    }
+
+    ggml_metal_encoder_dsv41_event(ctx->enc, ctx->cmd_buf, ctx->dev, mode, value, ctx->use_concurrency);
+
+    if (ctx->mem_ranges) {
+        ggml_mem_ranges_reset(ctx->mem_ranges);
+    }
+
+    return 1;
+}
+
 static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     struct ggml_tensor * node = ctx->node(idx);
 
@@ -217,6 +242,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 
     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
         return 1;
+    }
+
+    if (node->op == GGML_OP_DSV41_EVENT) {
+        return ggml_metal_op_dsv41_event(ctx, idx);
     }
 
     int n_fuse = 1;
@@ -540,7 +569,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
-    if (ctx->use_capture) {
+    // the event node replaces the encoder, so it gets no debug group
+    const bool use_group = ctx->use_capture && ctx->node(idx)->op != GGML_OP_DSV41_EVENT;
+
+    if (use_group) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
@@ -550,7 +582,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
     }
 
-    if (ctx->use_capture) {
+    if (use_group) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
 

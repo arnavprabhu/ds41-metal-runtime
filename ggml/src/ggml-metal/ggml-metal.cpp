@@ -948,9 +948,43 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// DS41 GPU-resident MoE arena (LLAMA_DSV41_MOE_GPURES): host side of GGML_OP_DSV41_EVENT, see ggml-metal-device.h
+static ggml_metal_device_t ggml_backend_metal_dsv41_dev(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    return (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
+}
+
+static bool ggml_backend_metal_dsv41_init(ggml_backend_t backend) {
+    return backend != nullptr && ggml_backend_is_metal(backend) && ggml_metal_device_dsv41_init(ggml_backend_metal_dsv41_dev(backend));
+}
+
+static void ggml_backend_metal_dsv41_set_base(ggml_backend_t backend, uint64_t base) {
+    ggml_metal_device_dsv41_set_base(ggml_backend_metal_dsv41_dev(backend), base);
+}
+
+static uint64_t ggml_backend_metal_dsv41_gpu_value(ggml_backend_t backend) {
+    return ggml_metal_device_dsv41_gpu_value(ggml_backend_metal_dsv41_dev(backend));
+}
+
+static void ggml_backend_metal_dsv41_host_signal(ggml_backend_t backend, uint64_t value) {
+    ggml_metal_device_dsv41_host_signal(ggml_backend_metal_dsv41_dev(backend), value);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv41_init") == 0) {
+        return (void *)ggml_backend_metal_dsv41_init;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv41_set_base") == 0) {
+        return (void *)ggml_backend_metal_dsv41_set_base;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv41_gpu_value") == 0) {
+        return (void *)ggml_backend_metal_dsv41_gpu_value;
+    }
+    if (strcmp(name, "ggml_backend_metal_dsv41_host_signal") == 0) {
+        return (void *)ggml_backend_metal_dsv41_host_signal;
     }
     if (strcmp(name, "ggml_backend_buffer_is_metal_shared") == 0) {
         return (void *)ggml_backend_buffer_is_metal_shared;

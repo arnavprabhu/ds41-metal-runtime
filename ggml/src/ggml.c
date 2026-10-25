@@ -1142,9 +1142,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "DSV41_EVENT",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1257,9 +1259,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dsv41_event(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6684,6 +6688,33 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv41_event
+
+struct ggml_tensor * ggml_dsv41_event(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * d,
+        enum ggml_dsv41_event_mode mode,
+        int32_t               id) {
+    GGML_ASSERT(mode == GGML_DSV41_EVENT_SIGNAL || mode == GGML_DSV41_EVENT_WAIT);
+    GGML_ASSERT(id >= 0 && id < 255);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    const int32_t params[2] = { (int32_t) mode, id };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DSV41_EVENT;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+    result->src[3] = d;
 
     return result;
 }

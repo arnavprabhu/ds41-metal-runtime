@@ -612,6 +612,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_DSV41_EVENT,
+
         GGML_OP_COUNT,
     };
 
@@ -2750,6 +2752,25 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DeepSeek-V4.1 GPU-resident MoE arena (LLAMA_DSV41_MOE_GPURES): orders the GPU with a host thread in the middle of
+    // a graph. The result is a view of a; b, c, d are dependencies only (computed before, kept alive until this node).
+    //   GGML_DSV41_EVENT_SIGNAL: once every earlier node has completed, the device's GPU->host event gets base + id + 1
+    //   GGML_DSV41_EVENT_WAIT:   later nodes start once the device's host->GPU event reaches base + id + 1
+    // base is set by the host per graph (Metal: ggml_backend_metal_dsv41_set_base). Only the Metal backend runs it.
+    enum ggml_dsv41_event_mode {
+        GGML_DSV41_EVENT_SIGNAL = 0,
+        GGML_DSV41_EVENT_WAIT   = 1,
+    };
+
+    GGML_API struct ggml_tensor * ggml_dsv41_event(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * d,
+            enum ggml_dsv41_event_mode mode,
+            int32_t               id);
 
     // custom operators
 
