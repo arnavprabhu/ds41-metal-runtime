@@ -122,6 +122,10 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // long-prompt layer skip: the next init_batch splits so that its first n rows (a single sequence) form "head"
+    // ubatches, which the graph runs through the layers before the skip layer only. One-shot.
+    void set_prompt_head_rows(uint32_t n) { prompt_head_rows = n; }
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -166,6 +170,8 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+
+    uint32_t prompt_head_rows = 0;
 
     std::vector<uint32_t> rs_idx;
 
@@ -375,6 +381,10 @@ public:
     const llama_dsv4_comp_state       * get_hca_state() const;
     const llama_dsv4_comp_state       * get_lid_state() const;
 
+    // the current ubatch is a prompt head: layers >= the skip layer are not run, the skip layer only compresses
+    bool is_prompt_head() const { return i_next < head_flags.size() && head_flags[i_next]; }
+    void set_head_flags(std::vector<uint8_t> flags) { head_flags = std::move(flags); }
+
     const comp_plan & get_csa_plan() const;
     const comp_plan & get_hca_plan() const;
     const comp_plan & get_lid_plan() const;
@@ -387,6 +397,7 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+    std::vector<uint8_t>      head_flags;
 
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;

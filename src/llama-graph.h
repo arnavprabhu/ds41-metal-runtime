@@ -654,6 +654,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     llm_graph_input_dsv4_raw * get_raw() const { return inp_raw.get(); }
+    bool head = false; // built for a long-prompt skip head ubatch (a different topology)
     const comp_input & get_csa() const { return inp_csa; }
     const comp_input & get_hca() const { return inp_hca; }
     const comp_input & get_lid() const { return inp_lid; }

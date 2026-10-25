@@ -2176,6 +2176,9 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
 
     int n_processed = 0;
 
+    // DeepSeek-V4.1 long-prompt layer skip (LLAMA_DSV41_PROMPT_SKIP=1): the final length of this prompt, last-row logits only
+    llama_set_prompt_total(ctx, 0, (int32_t) (llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1 + n_prompt));
+
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
         tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;

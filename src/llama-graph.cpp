@@ -1157,7 +1157,7 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     this->mctx = mctx;
     inp_raw->mctx = mctx->get_raw();
 
-    bool res = true;
+    bool res = head == mctx->is_prompt_head();
 
     const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
     const auto & plan_hca = mctx->get_hca_plan(params.ubatch);

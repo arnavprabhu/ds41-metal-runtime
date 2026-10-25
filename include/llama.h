@@ -1099,6 +1099,18 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    // DeepSeek-V4.1 long-prompt layer skip (LLAMA_DSV41_PROMPT_SKIP=1, no effect otherwise): tell the context that
+    // sequence seq_id will have exactly n_total prompt tokens (positions 0..n_total-1) and that only the last row's
+    // logits are wanted. The rows of the prompt that precede the last ~2.7K are then run through the first half of the
+    // layers only. n_total <= 0 clears the hint. Pass it before the prompt's first batch; the caller must not take
+    // state checkpoints (llama_state_seq_get_data) at positions before n_total - 127 other than the final one.
+    LLAMA_API void llama_set_prompt_total(struct llama_context * ctx, llama_seq_id seq_id, int32_t n_total);
+
+    // With the skip active for a prompt of n_total tokens: the first position at which a state checkpoint is exact
+    // (the sliding-window rings of the skipped layers hold wrong rows before it). -1 = no restriction (skip off, or
+    // the prompt is too short to skip anything).
+    LLAMA_API int32_t llama_prompt_skip_ckpt_min_pos(const struct llama_context * ctx, int32_t n_total);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
