@@ -2506,6 +2506,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_hc_gate(ggm
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_moe_w(ggml_metal_library_t lib) {
+    const char * name = "kernel_ds41_moe_w_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_router(ggml_metal_library_t lib) {
     const char * name = "kernel_ds41_router_f32";
 

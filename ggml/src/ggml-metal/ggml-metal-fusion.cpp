@@ -768,6 +768,95 @@ static bool ggml_metal_fusion_check_ds41_hc_gate(
     return true;
 }
 
+// GET_ROWS + RESHAPE + SUM_ROWS + SCALE + DIV + RESHAPE + SCALE: the DeepSeek-V4 MoE weights (llm_graph build_moe_ffn
+// norm_w with the sum + 1e-20 scale_bias, then the weight scale). Unsafe: the raw node sequence (with the RESHAPEs) is
+// checked here. GGML_METAL_DS41_FUSE=1 enables it.
+static bool ggml_metal_fusion_check_ds41_moe_w(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(nodes);
+
+    static const bool enabled = getenv("GGML_METAL_DS41_FUSE") != nullptr && atoi(getenv("GGML_METAL_DS41_FUSE")) != 0;
+    if (!enabled) {
+        return false;
+    }
+
+    const std::vector<ggml_op> & ops_all = fusion->ops_all;
+    const int n_ops = (int) fusion->ops.size();
+
+    const int raw_start = node_idxs[idx];
+    const int raw_end   = node_idxs[idx + n_ops - 1];
+    const int raw_count = raw_end - raw_start + 1;
+    if (raw_count != (int) ops_all.size()) {
+        return false;
+    }
+
+    int raw_idxs[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw_idxs[i] = raw_start + i;
+        if (gf->nodes[raw_start + i]->op != ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * gr  = gf->nodes[raw_start + 0];
+    const ggml_tensor * wr  = gf->nodes[raw_start + 1];
+    const ggml_tensor * sum = gf->nodes[raw_start + 2];
+    const ggml_tensor * s1  = gf->nodes[raw_start + 3];
+    const ggml_tensor * div = gf->nodes[raw_start + 4];
+    const ggml_tensor * dr  = gf->nodes[raw_start + 5];
+    const ggml_tensor * out = gf->nodes[raw_start + 6];
+
+    const ggml_tensor * probs = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+
+    if (wr->src[0] != gr || sum->src[0] != wr || s1->src[0] != sum || div->src[0] != wr || div->src[1] != s1 ||
+        dr->src[0] != div || out->src[0] != dr) {
+        return false;
+    }
+
+    if (probs->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || gr->type != GGML_TYPE_F32 ||
+        sum->type != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 || div->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+
+    if (n_used < 1 || n_used > 32 || n_tokens > INT32_MAX || ids->ne[2] != 1 || ids->ne[3] != 1) {
+        return false;
+    }
+    if (probs->ne[0] != 1 || probs->ne[2] != n_tokens || probs->ne[3] != 1 || probs->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (gr->ne[0] != 1 || gr->ne[1] != n_used || gr->ne[2] != n_tokens || gr->ne[3] != 1) {
+        return false;
+    }
+    if (wr->ne[0] != n_used || wr->ne[1] != n_tokens || sum->ne[0] != 1 || sum->ne[1] != n_tokens) {
+        return false;
+    }
+    if (out->ne[0] != 1 || out->ne[1] != n_used || out->ne[2] != n_tokens || out->ne[3] != 1 || out->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    const int outputs[1] = { raw_end };
+    if (!ggml_can_fuse_subgraph_ext(gf, raw_idxs, raw_count, ops_all.data(), outputs, 1)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!probs->data || !ids->data || !out->data) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // UNARY(softplus) + SQRT + ADD(bias): the DeepSeek-V4 router scores (sqrt-softplus gating plus the selection bias).
 // The sqrt output (the routing probabilities) is a second output. GGML_METAL_DS41_FUSE=1 enables it.
 static bool ggml_metal_fusion_check_ds41_router(
@@ -875,6 +964,9 @@ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_A
 
 static const std::vector<ggml_op> ops_ds41_hc_gate = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_ds41_router  = { GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_ADD };
+static const std::vector<ggml_op> ops_ds41_moe_w   = {
+    GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
+};
 
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
@@ -906,6 +998,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
     { GGML_METAL_FUSION_DS41_HC_GATE,   ops_ds41_hc_gate,           {},     false, ggml_metal_fusion_check_ds41_hc_gate },
     { GGML_METAL_FUSION_DS41_ROUTER,    ops_ds41_router,            {1},    false, ggml_metal_fusion_check_ds41_router },
+    { GGML_METAL_FUSION_DS41_MOE_W,     ops_ds41_moe_w,             {},     true,  ggml_metal_fusion_check_ds41_moe_w },
 };
 
 // ---- alloc deps -----------------------------------------------------------

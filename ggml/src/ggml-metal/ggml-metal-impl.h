@@ -726,6 +726,21 @@ typedef struct {
 } ggml_metal_kargs_ds41_router;
 
 typedef struct {
+    int32_t  n_used;
+    int32_t  n_tokens;
+    uint64_t nb_p1;  // probs stride per expert
+    uint64_t nb_p2;  // probs stride per token
+    uint64_t nb_i0;  // ids stride per slot
+    uint64_t nb_i1;  // ids stride per token
+    uint64_t nb1;    // dst stride per slot
+    uint64_t nb2;    // dst stride per token
+    float    scale1; // SCALE after SUM_ROWS
+    float    bias1;
+    float    scale2; // final SCALE
+    float    bias2;
+} ggml_metal_kargs_ds41_moe_w;
+
+typedef struct {
     int32_t  IC;
     int32_t  IH;
     int32_t  IW;

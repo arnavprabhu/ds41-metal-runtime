@@ -1220,6 +1220,15 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_MOE_W) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_moe_w(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -5299,6 +5308,54 @@ int ggml_metal_op_ds41_router(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
 
     return 3;
+}
+
+// Dispatch the fused DeepSeek-V4 MoE weights from the matched get_rows -> sum_rows -> scale -> div -> scale chain.
+int ggml_metal_op_ds41_moe_w(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * gr  = ctx->node(idx + 0);
+    const ggml_tensor * s1  = ctx->node(idx + 2);
+    ggml_tensor *       out = ctx->node(idx + 4);
+
+    const ggml_tensor * probs = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+
+    for (int i = 1; i < 5; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_moe_w args = {
+        /*.n_used   =*/ (int32_t) ids->ne[0],
+        /*.n_tokens =*/ (int32_t) ids->ne[1],
+        /*.nb_p1    =*/ probs->nb[1],
+        /*.nb_p2    =*/ probs->nb[2],
+        /*.nb_i0    =*/ ids->nb[0],
+        /*.nb_i1    =*/ ids->nb[1],
+        /*.nb1      =*/ out->nb[1],
+        /*.nb2      =*/ out->nb[2],
+        /*.scale1   =*/ ggml_get_op_params_f32(s1, 0),
+        /*.bias1    =*/ ggml_get_op_params_f32(s1, 1),
+        /*.scale2   =*/ ggml_get_op_params_f32(out, 0),
+        /*.bias2    =*/ ggml_get_op_params_f32(out, 1),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_moe_w(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(probs), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),   3);
+
+    const int nsg = std::max(1, std::min(8, args.n_tokens));
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_tokens + nsg - 1)/nsg, 1, 1, 32, nsg, 1);
+
+    return 5;
 }
 
 int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {

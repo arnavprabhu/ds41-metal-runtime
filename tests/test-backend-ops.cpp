@@ -4405,6 +4405,53 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// DeepSeek-V4 MoE weights as built by build_moe_ffn (norm_w, sum + 1e-20, weight scale): get_rows of the probabilities
+// at the selected experts, sum_rows, scale_bias, div, scale (Metal fuses this chain with GGML_METAL_DS41_FUSE=1)
+struct test_ds41_moe_w_fuse : public test_case {
+    const int64_t n_exp;
+    const int64_t n_used;
+    const int64_t nt;
+    const float   w_scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_MOE_W";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_exp, n_used, nt, w_scale);
+    }
+
+    test_ds41_moe_w_fuse(int64_t n_exp = 384, int64_t n_used = 6, int64_t nt = 1, float w_scale = 1.5f)
+        : n_exp(n_exp), n_used(n_used), nt(nt), w_scale(w_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(probs, "probs");
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * ids = ggml_argsort_top_k(ctx, sel, n_used);
+        ggml_tensor * w = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_exp, nt), ids);
+        w = ggml_reshape_2d(ctx, w, n_used, nt);
+        ggml_tensor * sum = ggml_sum_rows(ctx, w);
+        sum = ggml_scale_bias(ctx, sum, 1.0f, 1e-20f);
+        w = ggml_div(ctx, w, sum);
+        w = ggml_reshape_3d(ctx, w, 1, n_used, nt);
+        w = ggml_scale(ctx, w, w_scale);
+        ggml_set_name(w, "out");
+        return w;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.01f, 4.0f);
+        }
+    }
+};
+
 // DeepSeek-V4 router scores: probs = sqrt(softplus(logits)), biased = probs + bias; both are consumed (argsort on
 // biased, get_rows on probs) (Metal fuses this chain with GGML_METAL_DS41_FUSE=1)
 struct test_ds41_router_fuse : public test_case {
@@ -9893,6 +9940,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nt : { 1, 2, 9 }) {
         test_cases.emplace_back(new test_ds41_router_fuse(384, nt, true));
         test_cases.emplace_back(new test_ds41_router_fuse(384, nt, false));
+    }
+    for (int64_t nt : { 1, 2, 9, 40 }) {
+        test_cases.emplace_back(new test_ds41_moe_w_fuse(384, 6, nt, 1.5f));
+        test_cases.emplace_back(new test_ds41_moe_w_fuse(64, 8, nt, 2.5f));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
