@@ -196,6 +196,8 @@ struct llama_moe_cache::impl {
     struct layer {
         int32_t ig = -1;                    // -1 if the layer is not cached
         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+        ggml_tensor * slot_map_h = nullptr; // overlap mode (LLAMA_DSV41_MOE_OVERLAP): hit map, slots of the experts resident before the fill, else -1
+        ggml_tensor * slot_map_m = nullptr; // overlap mode: level 1 the full map, level 2 the map of the experts the fill brings
         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
     };
 
@@ -215,6 +217,7 @@ struct llama_moe_cache::impl {
         size_t   fallback_calls = 0; // calls whose misses went through ggml_backend_tensor_set_async
         uint64_t sync_us = 0;  // waiting for the ids (the previous splits) before planning
         uint64_t fill_us = 0;  // plan + miss upload
+        uint64_t wait_us = 0;  // overlap mode: waiting for the asynchronous upload to land
     };
 
     // ubatches of at most max_batch tokens read their experts from the cache
@@ -242,6 +245,18 @@ struct llama_moe_cache::impl {
     std::vector<layer> layers;
     std::unordered_map<const ggml_tensor *, binding> bindings; // host experts -> cached experts
     std::unordered_map<const ggml_tensor *, int32_t> layer_of; // slot map -> layer
+    std::unordered_map<const ggml_tensor *, int32_t> layer_of_h; // overlap mode: hit maps -> layer
+    std::unordered_map<const ggml_tensor *, int32_t> layer_of_m; // overlap mode: fill maps -> layer
+
+    // overlap mode (LLAMA_DSV41_MOE_OVERLAP=1|2, decode of one token): the layer's lookup of the hit map starts a split whose
+    // callback plans the layer and starts the upload asynchronously, so the GPU computes the work that does not need the
+    // missing experts (level 1: the shared expert, level 2: also the experts already in the arena) while the upload runs;
+    // the lookup of the fill map starts the next split, whose callback waits for the upload
+    int  overlap_level = 0;
+    bool overlap_fill_pending = false;
+    int32_t overlap_il = -1;
+    size_t  overlap_pending_bytes = 0;
+    std::vector<int32_t> overlap_before; // slot map of the layer before the plan
 
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
@@ -492,6 +507,14 @@ struct llama_moe_cache::impl {
         }
 
         // within a device the budget is split by the size of the experts, so each group caches the same fraction of its experts
+        {
+            const char * v = getenv("LLAMA_DSV41_MOE_OVERLAP");
+            overlap_level = v ? atoi(v) : 0;
+            if (overlap_level != 0 && !llama_exps_prefetch::upload_enabled()) {
+                fprintf(stderr, "llama_moe_cache: LLAMA_DSV41_MOE_OVERLAP needs the pread uploader, disabled\n");
+                overlap_level = 0;
+            }
+        }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
         for (group & g : groups) {
@@ -510,7 +533,7 @@ struct llama_moe_cache::impl {
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
             g.filled.assign(g.n_slots, false);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
-            n_tensors_host  += g.layers.size();
+            n_tensors_host  += g.layers.size()*(overlap_level != 0 ? 3 : 1);
         }
         if (n_tensors_host == 0) {
             throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -566,6 +589,18 @@ struct llama_moe_cache::impl {
                 ggml_format_name(l.slot_map, "moe_cache.slot_map-%d", il);
                 layer_of[l.slot_map] = il;
                 buf_host_size += GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                if (overlap_level != 0) {
+                    l.slot_map_h = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.slot_map_h, "moe_cache.slot_map_h-%d", il);
+                    l.slot_map_m = ggml_new_tensor_2d(ctx_host.get(), GGML_TYPE_I32, 1, g.ref[0]->ne[2]);
+                    ggml_format_name(l.slot_map_m, "moe_cache.slot_map_m-%d", il);
+                    // the device copies keep a private region (ggml-backend): the fill map is written while the previous split still runs
+                    ggml_set_output(l.slot_map_h);
+                    ggml_set_output(l.slot_map_m);
+                    layer_of_h[l.slot_map_h] = il;
+                    layer_of_m[l.slot_map_m] = il;
+                    buf_host_size += 2*GGML_PAD(ggml_nbytes(l.slot_map), alignment_host);
+                }
             }
             devices[g.id].buf_size += alloc_size(g, g.n_slots);
         }
@@ -598,6 +633,10 @@ struct llama_moe_cache::impl {
                 // Shared Metal slots are written completely before their GPU map is published.
                 if (is_shared == nullptr || !is_shared(d.buf.get())) {
                     ggml_backend_buffer_clear(d.buf.get(), 0);
+                    if (overlap_level != 0) {
+                        fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
+                        overlap_level = 0;
+                    }
                 }
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
@@ -606,6 +645,9 @@ struct llama_moe_cache::impl {
                 throw std::runtime_error("failed to allocate the MoE cache buffers");
             }
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
+            if (overlap_level != 0) {
+                fprintf(stderr, "llama_moe_cache: overlap level %d (async arena fill)\n", overlap_level);
+            }
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
             for (group & g : groups) {
@@ -653,6 +695,14 @@ struct llama_moe_cache::impl {
                 g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
                 (double) g.n_slots/g.layers.size());
         }
+    }
+
+    static bool direct_enabled() {
+        static const bool on = [] {
+            const char * v = getenv("LLAMA_DSV41_MOE_DIRECT");
+            return v != nullptr && atoi(v) != 0;
+        }();
+        return on;
     }
 
     is_shared_fn get_is_shared(ggml_backend_t backend) {
@@ -709,6 +759,16 @@ struct llama_moe_cache::impl {
         return l.slot_map;
     }
 
+    // overlap mode: the hit and fill maps of layer il, false if the layer reads the plain slot map
+    bool get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** h, ggml_tensor ** m) const {
+        if (!overlap_usable(il, n_tokens) || get_slot_map(il, n_tokens, n_expert_used) == nullptr) {
+            return false;
+        }
+        *h = layers[il].slot_map_h;
+        *m = layers[il].slot_map_m;
+        return true;
+    }
+
     ggml_tensor * get_experts(const ggml_tensor * w) const {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
@@ -749,7 +809,179 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // overlap mode ------------------------------------------------------------------------------------------------------
+
+    bool overlap_usable(int32_t il, int64_t n_tokens) const {
+        return overlap_level != 0 && n_tokens == 1 && il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 && layers[il].slot_map_h != nullptr;
+    }
+
+    bool copy_nosync(const ggml_tensor * src) const {
+        return overlap_level != 0 && layer_of_m.find(src) != layer_of_m.end();
+    }
+
+    // the experts missing from the arena are read by the upload pool into the free slots: starts the reads and returns
+    void overlap_start_fill(ggml_backend_t backend, const layer & l, group & g, size_t & bytes) {
+        jobs.clear();
+        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+            const ggml_tensor * w    = l.experts[ip];
+            ggml_tensor       * bank = g.banks[ip];
+            const size_t expert_size = w->nb[2];
+            GGML_ASSERT(bank->nb[2] == expert_size);
+            int      fd       = -1;
+            uint64_t file_off = 0;
+            const bool direct = moe_fill_lookup(w->data, ggml_nbytes(w), &fd, &file_off);
+            for (size_t i = 0; i < fills.size();) {
+                size_t n = 1;
+                while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                    n++;
+                }
+                GGML_ASSERT(fills[i].slot + (int64_t) n <= bank->ne[2]);
+                const size_t src_off = (size_t) fills[i].expert*expert_size;
+                const size_t dst_off = (size_t) fills[i].slot*expert_size;
+                // without a file (fd -1) the pool copies from the mapping
+                llama_exps_prefetch::add_upload(jobs, direct ? fd : -1, direct ? file_off + src_off : 0, (char *) bank->data + dst_off, n*expert_size, (const char *) w->data + src_off);
+                bytes += n*expert_size;
+                i += n;
+            }
+        }
+        (void) backend;
+        if (!jobs.empty()) {
+            llama_exps_prefetch::upload_begin(jobs);
+        }
+    }
+
+    // split 1 of the layer: plan, start the upload, publish the hit map
+    bool copy_h(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        const int32_t il = layer_of_h.at(src);
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+        GGML_ASSERT(backend == devices[g.id].backend);
+        GGML_ASSERT(!overlap_fill_pending);
+
+        const int n_nodes = ggml_graph_n_nodes(graph);
+        const ggml_tensor * lookup = nullptr;
+        for (int i = 0; i < n_nodes && lookup == nullptr; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_GET_ROWS && node->src[0] == dst) {
+                lookup = node;
+            }
+        }
+        GGML_ASSERT(lookup != nullptr);
+        const ggml_tensor * sel = lookup->src[1];
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node == sel || node == sel->view_src) {
+                GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
+            }
+        }
+        GGML_ASSERT(ggml_is_contiguous(sel));
+
+        const is_shared_fn is_shared = get_is_shared(backend);
+        const ggml_tensor * sel_buf_t = sel->view_src ? sel->view_src : sel;
+        if (is_shared == nullptr || sel->data == nullptr || sel_buf_t->buffer == nullptr || !is_shared(sel_buf_t->buffer) ||
+                dst->data == nullptr || dst->buffer == nullptr || !is_shared(dst->buffer)) {
+            GGML_ABORT("LLAMA_DSV41_MOE_OVERLAP needs shared (unified memory) Metal buffers");
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        ids.resize(ggml_nelements(sel));
+        // no queued GPU work still reads a slot that is overwritten below; the ids are read directly
+        ggml_backend_synchronize(backend);
+        memcpy(ids.data(), sel->data, ggml_nbytes(sel));
+        const auto t1 = std::chrono::steady_clock::now();
+
+        // the background prefetch of this layer's predicted misses must land before the plan (they count as hits)
+        pred_resolve(il);
+
+        const int32_t n_expert = g.lru.n_expert;
+        overlap_before.assign(g.lru.slot_map[il], g.lru.slot_map[il] + n_expert);
+
+        size_t n_hit = 0;
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+            GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        size_t bytes = 0;
+        if (!fills.empty()) {
+            overlap_start_fill(backend, l, g, bytes);
+        }
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * w : l.experts) {
+            slot_bytes += w->nb[2];
+        }
+        for (const auto & fill : fills) {
+            GGML_ASSERT(fill.slot >= 0 && fill.slot < g.n_slots);
+            if (!g.filled[fill.slot]) {
+                g.filled[fill.slot] = true;
+                g.filled_bytes += slot_bytes;
+            }
+        }
+
+        // the hit map: the experts resident before this plan (the fills only write to slots that no selected expert uses)
+        GGML_ASSERT(dst->ne[0]*dst->ne[1] == n_expert);
+        memcpy(dst->data, overlap_before.data(), n_expert*sizeof(int32_t));
+
+        overlap_fill_pending = !fills.empty();
+        overlap_il = il;
+        overlap_pending_bytes = bytes;
+        const auto t2 = std::chrono::steady_clock::now();
+
+        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        st.hits   += n_hit;
+        st.misses += fills.size();
+        st.bytes  += bytes;
+        st.calls  += 1;
+        st.tokens += sel->ne[1];
+        st.pread_calls += !fills.empty();
+        st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        return true;
+    }
+
+    // split 2 of the layer: wait for the upload, publish the fill map
+    bool copy_m(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+        const int32_t il = layer_of_m.at(src);
+        GGML_ASSERT(overlap_il == il);
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+
+        const auto t0 = std::chrono::steady_clock::now();
+        if (overlap_fill_pending) {
+            llama_exps_prefetch::upload_end();
+            overlap_fill_pending = false;
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+
+        // LLAMA_DSV41_MOE_PREDICT=1: read the predicted misses of the next layer while the GPU computes this one
+        if (llama_moe_cache_predict_enabled()) {
+            pred_launch(backend, il);
+        }
+
+        const int32_t n_expert = g.lru.n_expert;
+        const int32_t * now = g.lru.slot_map[il];
+        int32_t * out = (int32_t *) dst->data;
+        GGML_ASSERT(dst->data != nullptr && dst->ne[0]*dst->ne[1] == n_expert);
+        if (overlap_level >= 2) {
+            // only the experts the fill brought
+            for (int32_t e = 0; e < n_expert; ++e) {
+                out[e] = (overlap_before[e] < 0 && now[e] >= 0) ? now[e] : -1;
+            }
+        } else {
+            memcpy(out, now, n_expert*sizeof(int32_t));
+        }
+        (stats_small).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        return true;
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (overlap_level != 0) {
+            if (layer_of_h.find(src) != layer_of_h.end()) {
+                return copy_h(backend, src, dst, graph);
+            }
+            if (layer_of_m.find(src) != layer_of_m.end()) {
+                return copy_m(backend, src, dst);
+            }
+        }
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -782,11 +1014,25 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        // LLAMA_DSV41_MOE_DIRECT=1: on a shared (unified memory) Metal buffer the ids are read by the CPU directly after
+        // the backend is idle, and the slot map is written directly while the GPU is idle: no blit command buffers
+        const is_shared_fn is_shared_d = direct_enabled() ? get_is_shared(backend) : nullptr;
+        const bool direct_ids = is_shared_d != nullptr && sel->data != nullptr &&
+            (sel->view_src ? sel->view_src->buffer : sel->buffer) != nullptr &&
+            is_shared_d(sel->view_src ? sel->view_src->buffer : sel->buffer);
+        const bool direct_map = is_shared_d != nullptr && dst->data != nullptr && dst->buffer != nullptr && is_shared_d(dst->buffer);
+
         const auto t0 = std::chrono::steady_clock::now();
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        // also guarantees that no queued GPU work still reads a slot that is overwritten below
-        ggml_backend_synchronize(backend);
+        if (direct_ids) {
+            // also guarantees that no queued GPU work still reads a slot that is overwritten below
+            ggml_backend_synchronize(backend);
+            memcpy(ids.data(), sel->data, ggml_nbytes(sel));
+        } else {
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+            // also guarantees that no queued GPU work still reads a slot that is overwritten below
+            ggml_backend_synchronize(backend);
+        }
         const auto t1 = std::chrono::steady_clock::now();
 
         // the background prefetch of this layer's predicted misses must land before the plan and the GPU read
@@ -865,7 +1111,12 @@ struct llama_moe_cache::impl {
         st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
         // the next copy synchronizes the backend before it changes the slot map again
-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        if (direct_map) {
+            // the GPU has been idle since the sync above (nothing was submitted by the plan or the fill)
+            memcpy(dst->data, src->data, ggml_nbytes(src));
+        } else {
+            ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        }
 
         if (llama_moe_cache_predict_enabled() && sel->ne[1] == 1) {
             pred_launch(backend, il);
@@ -884,10 +1135,10 @@ struct llama_moe_cache::impl {
             }
             const double tok = std::max(1.0, (double) st.tokens/n_layers); // tokens served through the cache
             fprintf(stderr, "llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB, "
-                "tokens = %.0f, misses/token = %.1f, MiB/token = %.2f, fill ms/token = %.2f, sync ms/token = %.2f, "
+                "tokens = %.0f, misses/token = %.1f, MiB/token = %.2f, fill ms/token = %.2f, sync ms/token = %.2f, join wait ms/token = %.2f, "
                 "calls = %zu (pread %zu, set_async fallback %zu)\n",
                 name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0,
-                tok, st.misses/tok, st.bytes/1024.0/1024.0/tok, st.fill_us/1000.0/tok, st.sync_us/1000.0/tok,
+                tok, st.misses/tok, st.bytes/1024.0/1024.0/tok, st.fill_us/1000.0/tok, st.sync_us/1000.0/tok, st.wait_us/1000.0/tok,
                 st.calls, st.pread_calls, st.fallback_calls);
         };
         log("ubatch <= 8", stats_small);
@@ -910,6 +1161,18 @@ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
     return pimpl->get_slot_map(il, n_tokens, n_expert_used);
+}
+
+bool llama_moe_cache::get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** h, ggml_tensor ** m) const {
+    return pimpl->get_slot_maps(il, n_tokens, n_expert_used, h, m);
+}
+
+int llama_moe_cache::overlap_level() const {
+    return pimpl->overlap_level;
+}
+
+bool llama_moe_cache::copy_nosync(const ggml_tensor * src) const {
+    return pimpl->copy_nosync(src);
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {

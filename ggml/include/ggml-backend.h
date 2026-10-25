@@ -375,6 +375,11 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // optional: for the host weights where this returns true, the copy callback is called before the split backend is
+    // synchronized (the callback must not touch memory that the running split can still use)
+    typedef bool (*ggml_backend_sched_copy_nosync_callback)(const struct ggml_tensor * src, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_copy_nosync_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_nosync_callback callback, void * user_data);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

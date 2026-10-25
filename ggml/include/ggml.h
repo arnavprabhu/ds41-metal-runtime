@@ -1519,6 +1519,14 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // like ggml_mul_mat_id, writes into the buffer of prev; rows whose expert id is negative are skipped (left unchanged)
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_acc(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

@@ -967,6 +967,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    ggml_backend_sched_set_copy_nosync_callback(sched.get(), sched_copy_nosync, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
@@ -1763,7 +1764,30 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_HOST_STATS=1: decode (single-token) host-time breakdown printed at exit (diagnostics only)
+struct llama_host_stats {
+    bool   on = false;
+    double t_pre = 0, t_build = 0, t_setin = 0, t_compute = 0;
+    long   n = 0, n_reuse = 0;
+    llama_host_stats() {
+        const char * v = getenv("LLAMA_HOST_STATS");
+        on = v && atoi(v) != 0;
+        if (on) { atexit([] { extern llama_host_stats g_host_stats; g_host_stats.print(); }); }
+    }
+    void print() const {
+        if (!n) return;
+        fprintf(stderr, "llama_host_stats: decode graphs = %ld (reused %ld), per token ms: pre %.3f, build+alloc %.3f, set_inputs %.3f, graph_compute (all splits) %.3f\n",
+            n, n_reuse, t_pre/n, t_build/n, t_setin/n, t_compute/n);
+    }
+};
+llama_host_stats g_host_stats;
+static inline double host_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool hs = g_host_stats.on && ubatch.n_tokens == 1;
+    double hs_t0 = hs ? host_now_ms() : 0, hs_t1 = 0, hs_t2 = 0, hs_t3 = 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1777,7 +1801,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (hs) { hs_t1 = host_now_ms(); }
+    const bool hs_reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    if (hs) { g_host_stats.n_reuse += hs_reuse; }
+    if (hs_reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1816,6 +1843,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    if (hs) { hs_t2 = host_now_ms(); }
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1826,7 +1854,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (hs) { hs_t3 = host_now_ms(); }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (hs) {
+        const double t4 = host_now_ms();
+        g_host_stats.n++;
+        g_host_stats.t_pre += hs_t1 - hs_t0; g_host_stats.t_build += hs_t2 - hs_t1;
+        g_host_stats.t_setin += hs_t3 - hs_t2; g_host_stats.t_compute += t4 - hs_t3;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3036,6 +3071,11 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+
+bool llama_context::sched_copy_nosync(const ggml_tensor * src, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    return lctx->moe_cache && lctx->moe_cache->copy_nosync(src);
+}
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);

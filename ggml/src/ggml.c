@@ -3471,6 +3471,29 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_id_acc: like ggml_mul_mat_id, but writes into the buffer of prev (the rows of the selected experts whose id is >= 0
+// are overwritten, rows with a negative id are left as they are; the Metal backend skips them)
+struct ggml_tensor * ggml_mul_mat_id_acc(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(prev->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(prev->ne[0] == as->ne[1] && prev->ne[1] == ids->ne[0] && prev->ne[2] == b->ne[2] && prev->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, prev);
+
+    result->op     = GGML_OP_MUL_MAT_ID;
+    result->src[0] = as;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = prev;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

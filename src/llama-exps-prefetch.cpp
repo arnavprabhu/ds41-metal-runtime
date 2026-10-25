@@ -337,6 +337,9 @@ struct upload_stats {
     std::atomic<uint64_t> fallbacks = 0;
     std::atomic<uint64_t> wall_us   = 0;
     std::atomic<uint64_t> sync_us   = 0;
+    std::atomic<uint64_t> job_us    = 0; // summed pread time
+    std::atomic<uint64_t> job_max_us = 0;
+    std::atomic<uint64_t> wake_us   = 0; // notify -> first job picked up by a worker thread other than the caller
 };
 
 struct upload_pool {
@@ -349,6 +352,13 @@ struct upload_pool {
     upload_stats            st;
 
     void run_job(const upload_job & j) {
+        const auto tj0 = std::chrono::steady_clock::now();
+        struct timer { upload_stats & st; std::chrono::steady_clock::time_point t0; ~timer() {
+            const uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            st.job_us += us;
+            uint64_t m = st.job_max_us.load();
+            while (us > m && !st.job_max_us.compare_exchange_weak(m, us)) {}
+        } } tm { st, tj0 };
         size_t got = 0;
         while (got < j.len) {
             const ssize_t r = pread(j.fd, (char *) j.dst + got, j.len - got, (off_t) (j.file_off + got));
@@ -407,6 +417,61 @@ struct upload_pool {
 
     const char * threads_env     = "LLAMA_DSV41_UPLOAD_THREADS";
     int          threads_default = 12;
+
+    // asynchronous batch: begin() wakes the workers and returns, end() helps and waits (one batch at a time)
+    upload_batch * async_b = nullptr;
+    std::chrono::steady_clock::time_point async_t0;
+
+    void start_workers_locked() {
+        if (workers.empty()) {
+            const int n = std::max(0, env_int(threads_env, threads_default) - 1); // the caller is one of them
+            for (int i = 0; i < n; ++i) {
+                workers.emplace_back([this] { worker(); });
+                workers.back().detach();
+            }
+        }
+    }
+
+    void begin(const std::vector<upload_job> & jobs) {
+        GGML_ASSERT(async_b == nullptr);
+        if (jobs.empty()) {
+            return;
+        }
+        async_t0 = std::chrono::steady_clock::now();
+        async_b = new upload_batch();
+        async_b->jobs = &jobs;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            start_workers_locked();
+            cur = async_b;
+            gen++;
+        }
+        cv.notify_all();
+    }
+
+    void end() {
+        if (async_b == nullptr) {
+            return;
+        }
+        upload_batch & b = *async_b;
+        drain(b);
+        size_t bytes = 0;
+        const size_t n = b.jobs->size();
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv_done.wait(lk, [&] { return b.done.load() == n && b.active.load() == 0; });
+            cur = nullptr;
+        }
+        for (const auto & j : *b.jobs) {
+            bytes += j.len;
+        }
+        st.calls++;
+        st.jobs  += n;
+        st.bytes += bytes;
+        st.wall_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - async_t0).count();
+        delete async_b;
+        async_b = nullptr;
+    }
 
     void run(const std::vector<upload_job> & jobs) {
         if (jobs.empty()) {
@@ -473,6 +538,14 @@ void upload_bg(const std::vector<upload_job> & jobs) {
     get_upload_bg().run(jobs);
 }
 
+void upload_begin(const std::vector<upload_job> & jobs) {
+    get_upload().begin(jobs);
+}
+
+void upload_end() {
+    get_upload().end();
+}
+
 void upload_add_sync_us(uint64_t us) {
     get_upload().st.sync_us += us;
 }
@@ -484,6 +557,8 @@ static void print_upload_stats() {
     }
     const double gib = st.bytes / 1073741824.0;
     const double s   = st.wall_us / 1e6;
+    fprintf(stderr, "print_upload_stats: per call: wall %.1f us, jobs %.1f, job avg %.1f us (max %llu us)\n", (double) st.wall_us/st.calls,
+        (double) st.jobs/st.calls, (double) st.job_us/std::max<uint64_t>(1, st.jobs), (unsigned long long) st.job_max_us.load());
     fprintf(stderr, "print_upload_stats: exps-prefetch upload calls=%llu jobs=%llu bytes=%.2f GiB time=%.1f ms (%.2f GB/s, %.1f MiB/call) sync=%.1f ms fallbacks=%llu\n",
         (unsigned long long) st.calls.load(), (unsigned long long) st.jobs.load(), gib, st.wall_us / 1000.0,
         s > 0 ? st.bytes / 1e9 / s : 0.0, st.bytes / 1048576.0 / st.calls, st.sync_us / 1000.0,
@@ -653,6 +728,8 @@ bool lookup_nocache(const void *, size_t, int *, uint64_t *) { return false; }
 void add_upload(std::vector<upload_job> &, int, uint64_t, void *, size_t, const void *) {}
 void upload(const std::vector<upload_job> &) {}
 void upload_bg(const std::vector<upload_job> &) {}
+void upload_begin(const std::vector<upload_job> &) {}
+void upload_end() {}
 void upload_add_sync_us(uint64_t) {}
 
 #endif

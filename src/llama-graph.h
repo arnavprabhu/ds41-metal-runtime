@@ -1067,6 +1067,10 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    // MoE cache overlap (LLAMA_DSV41_MOE_OVERLAP): called by build_moe_ffn between the two lookups of the layer; builds the
+    // layer work that does not need the routed experts (the shared expert) so that it runs while the experts are read
+    mutable std::function<void()> moe_overlap_hook;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
@@ -1121,7 +1125,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+              ggml_tensor * acc   = nullptr) const; // acc: write into the buffer of acc, skipping the rows with a negative slot
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1229,6 +1234,12 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+                     int   il) const;
+
+    // the lookup of the hit or fill map (MoE cache overlap mode) at the slots of the selected experts
+    ggml_tensor * build_moe_cache_lookup(
+             ggml_tensor * map,
+             ggml_tensor * selected_experts,
                      int   il) const;
 
     // DeepSeek-V4.1: async read of the selected host experts (LLAMA_DSV41_EXPS_PREFETCH=1)

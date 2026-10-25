@@ -1180,6 +1180,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             }
         }
 
+        // MoE cache overlap: the shared expert is built between the two lookups of the layer (it needs no routed expert), so
+        // that it runs while the missing experts are read
+        ggml_tensor * ffn_shexp = nullptr;
+        if (moe_cache != nullptr && moe_cache->overlap_level() != 0 && n_tokens == 1) {
+            moe_overlap_hook = [&]() {
+                ffn_shexp = build_ffn(cur,
+                        layer.ffn_up_shexp, nullptr, nullptr,
+                        layer.ffn_gate_shexp, nullptr, nullptr,
+                        layer.ffn_down_shexp, nullptr, nullptr,
+                        nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cb(ffn_shexp, "ffn_shexp", il);
+                ggml_build_forward_expand(gf, ffn_shexp);
+            };
+        }
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1194,12 +1209,15 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 il, logits);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        moe_overlap_hook = nullptr;
+        if (ffn_shexp == nullptr) {
+            ffn_shexp = build_ffn(cur,
+                    layer.ffn_up_shexp, nullptr, nullptr,
+                    layer.ffn_gate_shexp, nullptr, nullptr,
+                    layer.ffn_down_shexp, nullptr, nullptr,
+                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
