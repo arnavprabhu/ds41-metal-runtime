@@ -4052,12 +4052,20 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    static const int32_t ckpt_dense_step = [] { const char * e = getenv("LLAMA_SERVER_CKPT_STEP"); return e ? atoi(e) : 0; }();
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
+                        }
+
+                        // LLAMA_SERVER_CKPT_STEP=N: align prompt batches to multiples of N tokens so that a context checkpoint
+                        // exists every N tokens (a diverging prompt then only reprocesses from the nearest earlier boundary)
+                        if (ckpt_dense_step > 0 && do_checkpoint && batch.size() > 0 && slot.prompt.n_tokens() % ckpt_dense_step == 0) {
+                            break;
                         }
 
                         // stop at the end of the shared prefix, the children are started from this state
@@ -4149,7 +4157,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && ckpt_dense_step <= 0) {
                             do_checkpoint = false;
                         }
                     }
@@ -4170,7 +4178,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + (ckpt_dense_step > 0 ? ckpt_dense_step - 1 : params_base.checkpoint_min_step));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
