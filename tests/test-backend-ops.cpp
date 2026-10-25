@@ -12339,6 +12339,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  2304, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  5120, n, 2304, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 129280, n, 5120, {1, 1}, {1, 1}));
+        // router gate_inp (BF16, 384 x 5120) and hc_fn (F32, 24 x 20480)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  384, n,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   24, n, 20480, {1, 1}, {1, 1}));
         // dense Q8_0: attn_q_a, attn_kv
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  1280, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   512, n, 5120, {1, 1}, {1, 1}));
