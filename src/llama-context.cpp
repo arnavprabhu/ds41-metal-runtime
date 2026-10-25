@@ -2110,7 +2110,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (hs) { hs_t3 = host_now_ms(); }
-    ubatch_has_output = false;
+    // a prompt's last staged ubatch: it requests an output, or it is not full (the server holds back the last tokens of a
+    // prompt for a checkpoint, so the ubatch with the output is often a small one that is not staged)
+    ubatch_has_output = ubatch.n_tokens < cparams.n_ubatch;
     for (uint32_t i = 0; i < ubatch.n_tokens && ubatch.output && !ubatch_has_output; ++i) {
         ubatch_has_output = ubatch.output[i] != 0;
     }
