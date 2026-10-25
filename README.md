@@ -82,7 +82,7 @@ Set the environment flags from the table above; the current best set is listed i
 | pp4096 | ~262 tok/s A/B mean (278-283 tok/s on the warm first sample) |
 | tg128 | 16.12 tok/s (A/B mean, +2.7% over 15.69) |
 | copy/edit with n-gram speculation | 17.1-19.0 tok/s (was 9.9-11.6 without) |
-| 128K context | TTFT 10.5 min (188.6 tok/s, 119,144 tokens), needle retrieved, no swap, 26.1 GB peak RSS |
+| 128K context | TTFT 9.45 min (119,144 tokens), needle retrieved, no swap (measured before the v11 kernels) |
 
 Details and history: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 

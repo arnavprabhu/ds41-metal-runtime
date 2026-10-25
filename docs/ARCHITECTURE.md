@@ -6,10 +6,10 @@ How one token moves through the fork. All file references are relative to the re
 
 | Part | Size | Where | Read by |
 |---|---|---|---|
-| Dense weights (Q5_K, Q8_0) | ~10-15 GB | Metal buffers | Metal kernels |
+| Dense weights (Q5_K, Q8_0, BF16) | ~5.7 GB, all read every token | Metal buffers | Metal kernels |
 | Routed experts (IQ1_M / IQ2_XXS / IQ2_XS) | ~130 GB | GGUF file on SSD, CPU buffers | pread into the arena, or CPU |
 | KV cache / compressed KV | ~0.43 GB at 131K | Metal | sparse attention |
-| Engram table (layers 1, 14) | ~0.2 GB | host, gathered per token | host gather, then Metal |
+| Engram sidecar (layers 1, 14) | 110.6 GB table, a few rows read per token (its 0.2 GB projection weights are part of the dense set) | SSD, separate file | host gather, then Metal |
 
 Expert tensors never reach device memory by default: `src/llama-model-loader.cpp` refuses to place
 `ffn_{gate,up,down}_exps` on a non-host buffer unless `LLAMA_DSV41_EXPS_ON_DEVICE=1`. The model is loaded

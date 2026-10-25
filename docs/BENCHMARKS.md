@@ -41,7 +41,7 @@ instead of an 8/20 GiB LRU, plus the DS41 decode kernels.
 - Copy/edit prompts with n-gram-mod speculation: 9.88 -> 17.13 (copy0), 11.55 -> 18.88 (copy1),
   11.33 -> 18.12 (edit) tok/s; controller roughly equal to fixed m=8 on high-acceptance copy and better on
   mixed prompts.
-- 128K: TTFT 10.5 min (188.6 tok/s, 119,144 tokens), needle retrieved, no swap, 26.1 GB peak RSS.
+- 128K (arena auto-size build, before the v11 kernels): TTFT 9.45 min (210 tok/s, 119,144 tokens), needle retrieved, swap unchanged, 23.3 GB peak RSS. The v7 build took 10.5 min; a fixed 36 GiB arena swapped (24-32 min).
 
 | fast bench, same binary, interleaved | control | candidate |
 |---|---:|---:|
