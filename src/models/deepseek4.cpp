@@ -370,12 +370,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_mixes(
     GGML_ASSERT(hc == 4);
     GGML_ASSERT(hc_fn->ne[1] == hc_mix_dim);
 
+    // GGML_METAL_DS41_PFUSE_HC=1 (default off, numeric tier): prefill batches compute the mixes in one F32 pass over x
+    // (rms scale applied to the dot products) instead of RMS_NORM + MUL_MAT
+    static const bool pfuse_hc = [] {
+        const char * v = getenv("GGML_METAL_DS41_PFUSE_HC");
+        return v != nullptr && atoi(v) != 0;
+    }();
+
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
-    ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
-    ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
-    if (f32_src && !ggml_is_quantized(hc_fn->type)) {
-        // F32 weights (model.py hc_pre runs in fp32): request F32 inputs, the mixes are near-tie sensitive
-        ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+    ggml_tensor * mixes = nullptr;
+    if (pfuse_hc && nt >= 32 && hc_fn->type == GGML_TYPE_F32 && ggml_is_contiguous(hc_fn) &&
+            hc_dim % 64 == 0 && hc_mix_dim % 8 == 0 && hc_mix_dim <= 32) {
+        mixes = ggml_dsv4_hc_mix(ctx0, hc_fn, flat, norm_rms_eps);
+    } else {
+        ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
+        mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+        if (f32_src && !ggml_is_quantized(hc_fn->type)) {
+            // F32 weights (model.py hc_pre runs in fp32): request F32 inputs, the mixes are near-tie sensitive
+            ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+        }
     }
     cb(mixes, "hc_mixes", il);
 

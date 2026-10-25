@@ -31,6 +31,16 @@ static bool dsv41_env_on(const char * name) {
     return !v || atoi(v) != 0;
 }
 
+// GGML_METAL_DS41_PFUSE=1 (default off): prefill traffic fusions on multi-token batches (in-place RoPE of the rotated
+// slice, MoE reduce + shared expert + hc_post in one op); exact, the arithmetic of every element is unchanged
+static bool dsv41_pfuse() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_METAL_DS41_PFUSE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
     llama_model_deepseek4::load_arch_hparams(ml);
 
@@ -811,9 +821,13 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     const float   beta_slow_l   = comp_rope ? beta_slow : 0.0f;
     const int32_t n_ctx_orig_l  = comp_rope ? n_ctx_orig : 0;
 
-    const auto rope = [&](ggml_tensor * t, ggml_tensor * pos, int64_t n_nope) {
-        t = ggml_rope_ext(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    // in place (GGML_METAL_DS41_PFUSE, batches): only the rotated slice is read and written; t must have no other consumer
+    const bool rope_ip = dsv41_pfuse() && nt >= 32;
+    const auto rope = [&](ggml_tensor * t, ggml_tensor * pos, int64_t n_nope, bool inplace = false) {
+        t = inplace ? ggml_rope_ext_inplace(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                          freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l)
+                    : ggml_rope_ext(ctx0, t, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                          freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
         return ggml_rope_set_offset(t, n_nope);
     };
 
@@ -821,7 +835,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     cb(qr, "qr_norm", il);
 
     ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
-    q = rope(q, inp_pos, n_embd_head_nope);
+    q = rope(q, inp_pos, n_embd_head_nope, rope_ip);
     cb(q, "q", il);
 
     ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
@@ -923,7 +937,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             }
 
             ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
-            iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
+            iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope, rope_ip);
             iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nt/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nt/n_stream), 0);
 
             ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
@@ -1129,8 +1143,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     }
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
-    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
-            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    if (rope_ip) {
+        // in-place ggml_rope_ext_back: the attention output has no other consumer
+        out = ggml_rope_ext_inplace(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        out->op = GGML_OP_ROPE_BACK;
+    } else {
+        out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    }
     out = ggml_rope_set_offset(out, n_embd_head_nope);
     cb(out, "attn_derope", il);
 
@@ -1329,6 +1350,14 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             };
         }
 
+        // GGML_METAL_DS41_PFUSE (prefill): the router-weight MUL, the expert reduction, the shared-expert ADD and hc_post
+        // become one ggml_dsv4_hc_post_moe (same arithmetic per element); build_moe_ffn hands back the unweighted outputs
+        const bool pf_moe = dsv41_pfuse() && n_tokens >= 32 && cparams.fused_dsv4_hc_post && n_embd % 4 == 0 &&
+                hparams.n_expert_used() <= 12 && moe_overlap_hook == nullptr;
+        moe_defer_reduce  = pf_moe;
+        moe_defer_experts = nullptr;
+        moe_defer_weights = nullptr;
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1341,7 +1370,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il, logits);
-        cb(moe_out, "ffn_moe_out", il);
+        moe_defer_reduce = false;
+        GGML_ASSERT((moe_out == nullptr) == (moe_defer_experts != nullptr));
+        if (moe_out) {
+            cb(moe_out, "ffn_moe_out", il);
+        }
 
         moe_overlap_hook = nullptr;
         if (ffn_shexp == nullptr) {
@@ -1353,10 +1386,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             cb(ffn_shexp, "ffn_shexp", il);
         }
 
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
-        cb(cur, "ffn_out", il);
+        if (moe_out == nullptr) {
+            inpL = ggml_dsv4_hc_post_moe(ctx0, moe_defer_experts, moe_defer_weights, ffn_shexp, residual, post, comb);
+            cb(inpL, "ffn_moe_hc_post", il);
+            moe_defer_experts = nullptr;
+            moe_defer_weights = nullptr;
+        } else {
+            cur = ggml_add(ctx0, moe_out, ffn_shexp);
+            cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+            inpL = build_hc_post(cur, residual, post, comb, il);
+        }
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
     }

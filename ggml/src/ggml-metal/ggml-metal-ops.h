@@ -92,6 +92,7 @@ int ggml_metal_op_snake_fused       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ds41_hc_gate      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ds41_router       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ds41_moe_w        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_ds41_router_topk  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_upscale           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_pad_reflect_1d    (ggml_metal_op_t ctx, int idx);

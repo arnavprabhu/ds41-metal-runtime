@@ -11662,14 +11662,21 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
+    // ggml_dsv4_hc_post_moe: x = sum_e experts[:, e]*weights[e] + shexp (src[0] holds the experts)
+    const ggml_tensor * moe_w    = dst->src[4];
+    const ggml_tensor * moe_sh   = dst->src[5];
+
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    const int64_t n_embd   = x->ne[0];
-    const int64_t n_tokens = x->ne[1];
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[2];
     const int64_t hc       = residual->ne[1];
+    const int64_t n_used   = moe_w ? x->ne[1] : 0;
+
+    GGML_ASSERT(moe_w == nullptr || (moe_sh != nullptr && moe_w->ne[1] == n_used && x->ne[2] == n_tokens));
 
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == hc);
@@ -11711,7 +11718,18 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const int64_t idst   = (ir / n_embd) % hc;
         const int64_t it     = ir / (n_embd * hc);
 
-        const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
+        float xv;
+        if (moe_w) {
+            float acc = 0.0f;
+            for (int64_t e = 0; e < n_used; ++e) {
+                const float ev = *(const float *) ((const char *) x->data     + i0*nbx0 + e*nbx1 + it*nbx2);
+                const float wv = *(const float *) ((const char *) moe_w->data + e*moe_w->nb[1] + it*moe_w->nb[2]);
+                acc += ev*wv;
+            }
+            xv = acc + *(const float *) ((const char *) moe_sh->data + i0*moe_sh->nb[0] + it*moe_sh->nb[1]);
+        } else {
+            xv = *(const float *) ((const char *) x->data + i0*nbx0 + it*nbx1);
+        }
         const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
 
         float sum = xv * pv;
@@ -11743,6 +11761,53 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_dsv4_hc_mix
+
+void ggml_compute_forward_dsv4_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->nb[0] == sizeof(float) && x->nb[0] == sizeof(float));
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t K  = x->ne[0];
+    const int64_t M  = w->ne[1];
+    const int64_t nt = x->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // reference: rms_norm(x) rounded to float, then the dot product in double
+    std::vector<float> y(K);
+    for (int64_t it = ith; it < nt; it += nth) {
+        const float * xr = (const float *) ((const char *) x->data + it*x->nb[1]);
+
+        ggml_float sum = 0.0;
+        for (int64_t k = 0; k < K; ++k) {
+            sum += (ggml_float) (xr[k]*xr[k]);
+        }
+        const float scale = 1.0f/sqrtf((float) (sum/K) + eps);
+        for (int64_t k = 0; k < K; ++k) {
+            y[k] = xr[k]*scale;
+        }
+
+        for (int64_t m = 0; m < M; ++m) {
+            const float * wr = (const float *) ((const char *) w->data + m*w->nb[1]);
+            ggml_float acc = 0.0;
+            for (int64_t k = 0; k < K; ++k) {
+                acc += (ggml_float) wr[k]*(ggml_float) y[k];
+            }
+            *(float *) ((char *) dst->data + m*dst->nb[0] + it*dst->nb[1]) = (float) acc;
+        }
     }
 }
 

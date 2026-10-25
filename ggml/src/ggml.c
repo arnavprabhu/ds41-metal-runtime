@@ -1127,6 +1127,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_MIX",
 
     "UNARY",
 
@@ -1144,7 +1145,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1242,6 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_mix(w, x)",
 
     "unary(x)",
 
@@ -1259,7 +1261,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6684,6 +6686,64 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_hc_post_moe
+
+struct ggml_tensor * ggml_dsv4_hc_post_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * shexp,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(shexp->type   == GGML_TYPE_F32);
+    GGML_ASSERT(comb != NULL);
+
+    const int64_t n_embd   = experts->ne[0];
+    const int64_t n_used   = experts->ne[1];
+    const int64_t n_tokens = experts->ne[2];
+
+    GGML_ASSERT(n_used >= 1);
+    GGML_ASSERT(experts->ne[3] == 1);
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == n_used && weights->ne[2] == n_tokens && weights->ne[3] == 1);
+    GGML_ASSERT(shexp->ne[0] == n_embd && shexp->ne[1] == n_tokens && shexp->ne[2] == 1 && shexp->ne[3] == 1);
+
+    // shape checks of the hc part (x is [n_embd, n_tokens] like shexp)
+    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, shexp, residual, post, comb);
+
+    result->src[0] = experts;
+    result->src[4] = weights;
+    result->src[5] = shexp;
+
+    return result;
+}
+
+// ggml_dsv4_hc_mix
+
+struct ggml_tensor * ggml_dsv4_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * x,
+        float                 eps) {
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == x->ne[0]);
+    GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[1], x->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, eps);
+
+    result->op     = GGML_OP_DSV4_HC_MIX;
+    result->src[0] = w;
+    result->src[1] = x;
 
     return result;
 }

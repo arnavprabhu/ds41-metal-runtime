@@ -367,6 +367,7 @@ typedef struct {
     int32_t  sect_1;
     int32_t  sect_2;
     int32_t  sect_3;
+    int32_t  i0s;     // first channel visited (even): > 0 only in place, where the channels before it are skipped anyway
     bool     src2;
     bool     inplace;
 } ggml_metal_kargs_rope;
@@ -527,6 +528,8 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    uint64_t nbd1;  // dst stride of a src1 row (ne1 index), in floats: ne0 unless a permute + cont is fused
+    uint64_t nbd2;  // dst stride of a batch (ne2*ne3 index), in floats: ne0*ne1 unless fused
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
@@ -609,6 +612,21 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne02;
+    uint64_t nb01;  // gate and up have the same layout
+    uint64_t nb02;
+    int32_t  ne11;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne20;
+    int32_t  ne0;
+    int32_t  ne1;
+    float    limit; // swiglu_clamp
+} ggml_metal_kargs_mul_mm_id_glu;
+
+typedef struct {
     int32_t  nei0;
     int32_t  nei1;
     uint64_t nbi1;
@@ -630,6 +648,59 @@ typedef struct {
     uint64_t nb1;
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
+
+// DS41 decode MUL_MAT_ID (gate) + MUL_MAT_ID (up) + GLU (GGML_METAL_DS41_MVGLU)
+typedef struct {
+    int32_t  nei0;  // n_expert_used
+    int32_t  nei1;  // n_tokens
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;  // gate and up have the same layout
+    uint64_t nb02;
+    int32_t  ne11;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne0;
+    int32_t  ne1;
+    float    limit; // swiglu_clamp
+} ggml_metal_kargs_mul_mv_id_glu;
+
+// DS41 decode MUL_MAT_ID (down) + router-weight MUL + expert ADD chain (GGML_METAL_DS41_MVMOE)
+typedef struct {
+    int32_t  nei0;  // n_expert_used
+    int32_t  nei1;  // n_tokens
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    uint64_t nb02;
+    int32_t  ne11;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne0;
+    int32_t  tab;   // bytes of decode tables at the start of the threadgroup memory
+    uint64_t nbw1;  // router weights, stride per token
+    uint64_t nbp1;  // first-pass expert rows (acc), stride per used expert
+    uint64_t nbp2;  //                               stride per token
+    uint64_t nbd1;  // dst, stride per token
+} ggml_metal_kargs_mul_mv_id_moe;
+
+// DS41 router scores + top-k (bitonic argsort) + MoE weights (GGML_METAL_DS41_RTOPK)
+typedef struct {
+    int32_t  ne0;    // n_expert
+    int32_t  ne1;    // n_tokens
+    int32_t  n_used;
+    uint64_t nb01;   // logits row stride
+    uint64_t nb11;   // bias row stride (0 when broadcast)
+    uint64_t nbi1;   // argsort dst row stride
+    uint64_t nbw1;   // weights stride per slot
+    uint64_t nbw2;   // weights stride per token
+    float    scale1; // SCALE after SUM_ROWS
+    float    bias1;
+    float    scale2; // final SCALE
+    float    bias2;
+} ggml_metal_kargs_ds41_router_topk;
 
 // NORM
 // RMS_NORM
@@ -1388,6 +1459,37 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_used;
+    uint64_t nb_e1;   // experts [n_embd, n_used, n_tokens], contiguous rows
+    uint64_t nb_e2;
+    uint64_t nb_w1;   // weights [1, n_used, n_tokens]
+    uint64_t nb_w2;
+    uint64_t nb_s1;   // shexp [n_embd, n_tokens]
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+    uint64_t nb_c2;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_dsv4_hc_post_moe;
+
+typedef struct {
+    int32_t  K;        // row width (multiple of 64)
+    int32_t  M;        // output rows (multiple of 8, <= 32)
+    int32_t  n_tokens;
+    int32_t  t0;       // first token of the tail kernel
+    uint64_t nb_w1;
+    uint64_t nb_x1;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_mix;
 
 typedef struct {
     int32_t  ne00;

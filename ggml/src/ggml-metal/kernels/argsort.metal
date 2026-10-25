@@ -81,6 +81,81 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
 
+// DeepSeek-V4 router (iter 016k, GGML_METAL_DS41_RTOPK): sqrt-softplus scores + selection bias (kernel_ds41_router_f32),
+// the descending argsort of the selection scores (the bitonic network of kernel_argsort_f32_i32 with the same
+// threadgroup width, so ties resolve the same way) and the normalized weights of the top n_used (kernel_ds41_moe_w_f32)
+// in one dispatch, one threadgroup per token. The scores stay in threadgroup memory; the full argsort row is written.
+kernel void kernel_ds41_router_topk_f32(
+        constant ggml_metal_kargs_ds41_router_topk & args,
+        device const char * x,
+        device const char * b,
+        device       char * ids,
+        device       char * w,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort  tpitg[[thread_position_in_threadgroup]],
+        ushort    ntg[[threads_per_threadgroup]]) {
+    threadgroup int32_t * shmem_i32 = (threadgroup int32_t *) shmem;  // [ntg]
+    threadgroup float   * ssel      = (threadgroup float *) (shmem_i32 + ntg); // [ne0] selection scores
+    threadgroup float   * sprob     = ssel + args.ne0;                // [ne0] routing probabilities
+
+    const int col = tpitg;
+    const int i1  = tgpig;
+
+    for (int i0 = col; i0 < args.ne0; i0 += ntg) {
+        const float xv = *(device const float *) (x + i0*sizeof(float) + i1*args.nb01);
+        const float u  = exp(-fabs(xv));
+        const float pp = u*(1.0f - u*(0.5f - u*(1.0f/3.0f - u*(0.25f - u*(0.2f - u*(1.0f/6.0f))))));
+        const float sp = fmax(xv, 0.0f) + select(log(1.0f + u), pp, u < 0.0625f);
+        const float pr = sqrt(sp);
+        sprob[i0] = pr;
+        ssel [i0] = pr + *(device const float *) (b + i0*sizeof(float) + i1*args.nb11);
+    }
+
+    shmem_i32[col] = col;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= ntg; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = col ^ j;
+            if (ixj > col) {
+                if ((col & k) == 0) {
+                    if (shmem_i32[col] >= args.ne0 ||
+                       (shmem_i32[ixj] <  args.ne0 && ssel[shmem_i32[col]] < ssel[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                } else {
+                    if (shmem_i32[ixj] >= args.ne0 ||
+                       (shmem_i32[col] <  args.ne0 && ssel[shmem_i32[col]] > ssel[shmem_i32[ixj]])) {
+                        SWAP(shmem_i32[col], shmem_i32[ixj]);
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (col < args.ne0) {
+        ((device int32_t *) (ids + i1*args.nbi1))[col] = shmem_i32[col];
+    }
+
+    // weights: one simdgroup, lane = used slot
+    if (col < 32) {
+        float wv = 0.0f;
+        if (col < args.n_used) {
+            wv = sprob[shmem_i32[col]];
+        }
+        const float sum = simd_sum(wv);
+        const float s   = args.scale1*sum + args.bias1;
+        const float q   = wv / s;
+        if (col < args.n_used) {
+            *(device float *) (w + col*args.nbw1 + i1*args.nbw2) = args.scale2*q + args.bias2;
+        }
+    }
+}
+
 typedef void (argsort_merge_t)(
         constant   ggml_metal_kargs_argsort_merge & args,
         device const char    * src0,

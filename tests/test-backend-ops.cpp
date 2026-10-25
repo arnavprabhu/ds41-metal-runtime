@@ -1586,6 +1586,9 @@ struct test_case {
         ggml_context_ptr ctx_weights(use_weights ? ggml_init(params) : nullptr);
         GGML_ASSERT(!use_weights || ctx_weights);
 
+        // the graph exists before build_graph, so that a case can order nodes as the model does (DS41 fusion cases)
+        gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
         if (!matches_filter(out, op_names_filter)) {
@@ -1628,7 +1631,6 @@ struct test_case {
         }
 
         // build graph
-        ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
 
         // warmup run
@@ -4726,6 +4728,140 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// DS41 prefill (iter 013k): ggml_dsv4_hc_post_moe = MoE weighting + reduction + shared expert + hc_post in one op.
+// ref = true builds the unfused chain (MUL, expert views, ADD chain, ADD shexp, hc_post) for a perf baseline.
+struct test_ds41_hc_post_moe : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_used;
+    const int64_t n_tokens;
+    const bool    ref;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ref ? "DS41_MOE_POST_REF" : "DS41_HC_POST_MOE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_used, n_tokens, ref);
+    }
+
+    bool run_whole_graph() override { return ref; }
+
+    test_ds41_hc_post_moe(int64_t n_embd = 64, int64_t n_used = 6, int64_t n_tokens = 17, bool ref = false)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens), ref(ref) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_set_name(experts, "x");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(shexp, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+        ggml_set_name(comb, "comb");
+
+        if (ref) {
+            ggml_tensor * e = ggml_mul(ctx, experts, weights);
+            ggml_tensor * moe_out = nullptr;
+            for (int64_t i = 0; i < n_used; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx, e, n_embd, n_tokens, e->nb[2], i*e->nb[1]);
+                moe_out = moe_out ? ggml_add(ctx, moe_out, v) : v;
+            }
+            ggml_tensor * x = ggml_add(ctx, moe_out, shexp);
+            out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        } else {
+            out = ggml_dsv4_hc_post_moe(ctx, experts, weights, shexp, residual, post, comb);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// DS41 prefill (iter 013k): attention wo_a = grouped MUL_MAT over a permuted input, then PERMUTE + CONT to
+// [o_lora_rank*n_groups, tokens]. With GGML_METAL_DS41_PFUSE=1 the Metal mat-mat kernel stores straight into the
+// cont layout (MUL_MAT + PERMUTE + CONT fusion); the graph is the same either way.
+struct test_ds41_wo_a : public test_case {
+    const ggml_type type;
+    const int64_t   k;        // n_head/n_groups*n_embd_head
+    const int64_t   m;        // o_lora_rank
+    const int64_t   n_groups;
+    const int64_t   n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_WO_A";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, m, n_groups, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    test_ds41_wo_a(ggml_type type = GGML_TYPE_Q5_K, int64_t k = 256, int64_t m = 64, int64_t n_groups = 8, int64_t n_tokens = 33)
+        : type(type), k(k), m(m), n_groups(n_groups), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type, k, m, n_groups);
+        ggml_set_name(w, "wo_a");
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_groups, n_tokens);
+        ggml_set_name(x, "attn");
+
+        ggml_tensor * xp = ggml_permute(ctx, x, 0, 2, 1, 3);           // [k, tokens, groups]
+        ggml_tensor * oa = ggml_mul_mat(ctx, w, xp);                   // [m, tokens, groups]
+        ggml_tensor * out = ggml_cont_2d(ctx, ggml_permute(ctx, oa, 0, 2, 1, 3), m*n_groups, n_tokens);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// DS41 prefill (iter 013k): ggml_dsv4_hc_mix = mul_mat(w, rms_norm(x)) in one F32 pass (numeric tier: other order).
+// ref = true builds rms_norm + mul_mat (the current graph) for a perf baseline.
+struct test_ds41_hc_mix : public test_dsv4_hc {
+    const int64_t K;
+    const int64_t M;
+    const int64_t n_tokens;
+    const bool    ref;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ref ? "DS41_HC_MIX_REF" : "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(K, M, n_tokens, ref);
+    }
+
+    bool run_whole_graph() override { return ref; }
+
+    // fused: F32 accumulation in another order than the double CPU reference; ref: Metal mul_mm rounds w to F16
+    double max_nmse_err() override { return ref ? 5e-4 : 1e-6; }
+
+    test_ds41_hc_mix(int64_t K = 256, int64_t M = 24, int64_t n_tokens = 17, bool ref = false)
+        : K(K), M(M), n_tokens(n_tokens), ref(ref) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+        ggml_set_name(w, "hc_fn");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_set_name(x, "x");
+
+        if (ref) {
+            out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, 1e-6f));
+        } else {
+            out = ggml_dsv4_hc_mix(ctx, w, x, 1e-6f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -5735,6 +5871,339 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// DS41 routed experts (iter 014k): up = MUL_MAT_ID, gate = MUL_MAT_ID (same activations and ids), then swiglu /
+// swiglu_clamp. With GGML_METAL_DS41_MMID=1 Metal runs the three nodes as one kernel_mul_mm_id_glu dispatch.
+struct test_ds41_moe_glu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;   // n_ff_exp
+    const int64_t n;   // tokens
+    const int64_t k;   // n_embd
+    const bool clamp;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_MOE_GLU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, m, n, k, clamp);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * m * k * n * n_used;
+    }
+
+    test_ds41_moe_glu(ggml_type type_a = GGML_TYPE_Q4_0, int n_mats = 16, int n_used = 6,
+            int64_t m = 256, int64_t n = 64, int64_t k = 256, bool clamp = true)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), clamp(clamp) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up_w, "up_exps");
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate_w, "gate_exps");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, up_w,   b, ids);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, b, ids);
+
+        ggml_tensor * out = clamp ? ggml_swiglu_clamp(ctx, gate, up, 7.0f) : ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// fill the experts (ne[2] slices) of the weight tensors that no id selects with 0xFF bytes (NaN scales): a kernel that
+// reads an unselected expert (which prefill staging / the arena may leave unwritten) then fails the comparison
+static void ds41_poison_unused_experts(ggml_context * ctx, const std::vector<ggml_tensor *> & ids, int n_used) {
+    std::set<int32_t> used;
+    for (ggml_tensor * t : ids) {
+        std::vector<int32_t> data(ggml_nelements(t));
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+        for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+            for (int i = 0; i < n_used; ++i) {
+                used.insert(data[r*t->ne[0] + i]);
+            }
+        }
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_F32 || ggml_n_dims(t) != 3 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        std::vector<uint8_t> bad(t->nb[2], 0xFF);
+        for (int64_t e = 0; e < t->ne[2]; ++e) {
+            if (used.count((int32_t) e) == 0) {
+                ggml_backend_tensor_set(t, bad.data(), e*t->nb[2], t->nb[2]);
+            }
+        }
+    }
+}
+
+// DS41_MOE_GLU with the experts no token selects poisoned (the fused mat-mat kernel must read only selected slices)
+struct test_ds41_moe_glu_poison : public test_ds41_moe_glu {
+    using test_ds41_moe_glu::test_ds41_moe_glu;
+
+    std::string vars() override { return test_ds41_moe_glu::vars() + ",poison=1"; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_ds41_moe_glu::initialize_tensors(ctx);
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        ds41_poison_unused_experts(ctx, { ids }, n_used);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override { GGML_UNUSED(ctx); }
+};
+
+// DS41 decode routed-expert FFN as build_moe_ffn emits it on MoE cache slots, in graph order: gate / up MUL_MAT_ID +
+// GLU (swiglu_clamp or swiglu) + down MUL_MAT_ID + router-weight MUL + expert VIEWs + ADD chain. Metal fuses
+// MUL_MAT_ID x2 + GLU (GGML_METAL_DS41_MVGLU=1) and down + MUL + ADDs (GGML_METAL_DS41_MVMOE=1) for < 32 tokens.
+// overlap = 2: the MoE cache overlap passes, hit slots first (fill rows skipped with a negative slot), then the fill
+// slots accumulating into the first pass products (ggml_mul_mat_id_acc). poison: unselected slots are NaN.
+struct test_ds41_dec_moe : public test_case {
+    const ggml_type type_gu;
+    const ggml_type type_d;
+    const int     n_slots;
+    const int     n_used;
+    const int64_t n_ff;
+    const int64_t n_embd;
+    const int64_t nt;
+    const int     overlap;
+    const bool    clamp;
+    const bool    poison;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_DEC_MOE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_gu, type_d, n_slots, n_used, n_ff, n_embd, nt, overlap, clamp, poison);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 3 * n_ff * n_embd * nt * n_used;
+    }
+
+    test_ds41_dec_moe(ggml_type type_gu = GGML_TYPE_IQ2_XXS, ggml_type type_d = GGML_TYPE_IQ1_M, int n_slots = 64,
+            int n_used = 6, int64_t n_ff = 2304, int64_t n_embd = 5120, int64_t nt = 1, int overlap = 0,
+            bool clamp = true, bool poison = false)
+        : type_gu(type_gu), type_d(type_d), n_slots(n_slots), n_used(n_used), n_ff(n_ff), n_embd(n_embd), nt(nt),
+          overlap(overlap), clamp(clamp), poison(poison) {}
+
+    ggml_tensor * act(ggml_context * ctx, ggml_tensor * g, ggml_tensor * u) {
+        return clamp ? ggml_swiglu_clamp(ctx, g, u, 7.0f) : ggml_swiglu_split(ctx, g, u);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_slots);
+        ggml_set_name(gate_w, "gate_exps");
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, type_gu, n_embd, n_ff, n_slots);
+        ggml_set_name(up_w, "up_exps");
+        ggml_tensor * down_w = ggml_new_tensor_3d(ctx, type_d, n_ff, n_embd, n_slots);
+        ggml_set_name(down_w, "down_exps");
+
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, nt);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, nt);
+        ggml_set_name(w, "weights");
+
+        ggml_tensor * experts = nullptr;
+        if (overlap == 0) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+            ggml_set_name(ids, "slots");
+
+            ggml_tensor * up   = ggml_mul_mat_id(ctx, up_w,   x, ids);
+            ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+            ggml_tensor * a    = act(ctx, gate, up);
+            experts = ggml_mul_mat_id(ctx, down_w, a, ids);
+        } else {
+            ggml_tensor * ids_h = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+            ggml_set_name(ids_h, "slots_hit");
+            ggml_tensor * ids_m = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+            ggml_set_name(ids_m, "slots_fill");
+
+            ggml_tensor * g1 = ggml_mul_mat_id(ctx, gate_w, x, ids_h);
+            ggml_tensor * u1 = ggml_mul_mat_id(ctx, up_w,   x, ids_h);
+            ggml_tensor * a1 = act(ctx, g1, u1);
+            ggml_tensor * d1 = ggml_mul_mat_id(ctx, down_w, a1, ids_h);
+            if (gf) {
+                ggml_build_forward_expand(gf, d1);
+            }
+
+            ggml_tensor * g2 = ggml_mul_mat_id_acc(ctx, g1, gate_w, x, ids_m);
+            ggml_tensor * u2 = ggml_mul_mat_id_acc(ctx, u1, up_w,   x, ids_m);
+            ggml_tensor * a2 = act(ctx, g2, u2);
+            experts = ggml_mul_mat_id_acc(ctx, d1, down_w, a2, ids_m);
+        }
+
+        ggml_tensor * weighted = ggml_mul(ctx, experts, w);
+        if (gf) {
+            ggml_build_forward_expand(gf, weighted);
+        }
+
+        std::vector<ggml_tensor *> views(n_used);
+        for (int i = 0; i < n_used; ++i) {
+            views[i] = ggml_view_2d(ctx, weighted, n_embd, nt, weighted->nb[2], i*weighted->nb[1]);
+            if (gf) {
+                ggml_build_forward_expand(gf, views[i]);
+            }
+        }
+        ggml_tensor * out = views[0];
+        for (int i = 1; i < n_used; ++i) {
+            out = ggml_add(ctx, out, views[i]);
+            if (gf) {
+                ggml_build_forward_expand(gf, out);
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // distinct slots per token; overlap: about half of the rows hit (first pass), the others fill (second pass)
+        std::vector<ggml_tensor *> ids;
+        std::vector<int32_t> slots(n_slots);
+        std::vector<int32_t> hit(n_used*nt), fill(n_used*nt);
+        for (int64_t r = 0; r < nt; ++r) {
+            for (int i = 0; i < n_slots; ++i) {
+                slots[i] = i;
+            }
+            std::shuffle(slots.begin(), slots.end(), rng);
+            for (int i = 0; i < n_used; ++i) {
+                const bool h = overlap == 0 || (rng() % 2) == 0;
+                hit [r*n_used + i] = h ? slots[i] : -1;
+                fill[r*n_used + i] = h ? -1 : slots[i];
+            }
+        }
+        if (overlap == 0) {
+            ggml_tensor * t = ggml_get_tensor(ctx, "slots");
+            ggml_backend_tensor_set(t, hit.data(), 0, ggml_nbytes(t));
+            ids.push_back(t);
+        } else {
+            ggml_tensor * th = ggml_get_tensor(ctx, "slots_hit");
+            ggml_tensor * tm = ggml_get_tensor(ctx, "slots_fill");
+            ggml_backend_tensor_set(th, hit.data(),  0, ggml_nbytes(th));
+            ggml_backend_tensor_set(tm, fill.data(), 0, ggml_nbytes(tm));
+            // the poison pass reads the selected slots of both passes
+            std::vector<int32_t> both(n_used*nt);
+            for (size_t i = 0; i < both.size(); ++i) {
+                both[i] = hit[i] >= 0 ? hit[i] : fill[i];
+            }
+            ggml_backend_tensor_set(th, both.data(), 0, ggml_nbytes(th));
+            ids.push_back(th);
+            if (poison) {
+                ds41_poison_unused_experts(ctx, ids, n_used);
+            }
+            ggml_backend_tensor_set(th, hit.data(), 0, ggml_nbytes(th));
+            return;
+        }
+        if (poison) {
+            ds41_poison_unused_experts(ctx, ids, n_used);
+        }
+    }
+};
+
+// DS41 router as build_moe_ffn emits it: sqrt(softplus(logits)) + bias, argsort top-k, get_rows of the probabilities,
+// normalization (sum + 1e-20) and the weight scale. GGML_METAL_DS41_FUSE=1 fuses it as DS41_ROUTER + ARGSORT + DS41_MOE_W
+// (3 dispatches), GGML_METAL_DS41_FUSE=1 GGML_METAL_DS41_RTOPK=1 as one. The output (weights in slot order) depends
+// on the selected ids and their order.
+struct test_ds41_router_topk : public test_case {
+    const int64_t n_exp;
+    const int64_t n_used;
+    const int64_t nt;
+    const float   w_scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_ROUTER_TOPK";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_exp, n_used, nt, w_scale);
+    }
+
+    test_ds41_router_topk(int64_t n_exp = 384, int64_t n_used = 6, int64_t nt = 1, float w_scale = 1.5f)
+        : n_exp(n_exp), n_used(n_used), nt(nt), w_scale(w_scale) {}
+
+    ggml_tensor * ids = nullptr;
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { ids, out_w };
+    }
+
+    ggml_tensor * out_w = nullptr;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(logits, "logits");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_exp);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        ggml_tensor * sel   = ggml_add(ctx, probs, bias);
+
+        ids = ggml_argsort_top_k(ctx, sel, n_used);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * w = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_exp, nt), ids);
+        w = ggml_reshape_2d(ctx, w, n_used, nt);
+        ggml_tensor * sum = ggml_sum_rows(ctx, w);
+        sum = ggml_scale_bias(ctx, sum, 1.0f, 1e-20f);
+        w = ggml_div(ctx, w, sum);
+        w = ggml_reshape_3d(ctx, w, 1, n_used, nt);
+        w = ggml_scale(ctx, w, w_scale);
+        ggml_set_name(w, "out");
+        out_w = w;
+        return w;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -20.0f, 8.0f);
+        }
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -6561,6 +7030,10 @@ struct test_rope : public test_case {
                 } else {
                     out = ggml_rope_ext(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
                 }
+            } else if (inplace) {
+                // in-place ROPE_BACK as deepseek41 builds it (GGML_METAL_DS41_PFUSE): the in-place op with the back op
+                out = ggml_rope_ext_inplace(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
+                out->op = GGML_OP_ROPE_BACK;
             } else {
                 out = ggml_rope_ext_back(ctx, a, pos, freq, n_dims, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
             }
@@ -9956,6 +10429,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    // iter 013k: fused MoE reduce + hc_post, fused hc mixes (n_tokens around the 16-token groups and the tail kernel)
+    for (int64_t nt : { 1, 15, 16, 17, 33 }) {
+        test_cases.emplace_back(new test_ds41_hc_post_moe(64, 6, nt));
+        test_cases.emplace_back(new test_ds41_hc_mix(256, 24, nt));
+    }
+    test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, 7));
+    test_cases.emplace_back(new test_ds41_hc_post_moe(128, 1, 9));
+    test_cases.emplace_back(new test_ds41_hc_post_moe(128, 8, 9));
+    test_cases.emplace_back(new test_ds41_hc_mix(512, 8, 40));
+    // iter 014k: routed-expert gate + up + swiglu(_clamp) (GGML_METAL_DS41_MMID=1 fuses them on Metal)
+    for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M }) {
+        for (int64_t n : { 32, 33, 100 }) {
+            test_cases.emplace_back(new test_ds41_moe_glu(t, 16, 6, 256, n, 256, true));
+        }
+    }
+    test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_IQ2_XS, 8, 4, 192, 77, 512, false));
+    test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_F16,    32, 6, 128, 300, 256, true));
+    // iter 016k: the fused mat-mat kernel reads only the selected experts (unselected ones are NaN-poisoned)
+    test_cases.emplace_back(new test_ds41_moe_glu_poison(GGML_TYPE_IQ2_XXS, 128, 6, 256, 40, 256, true));
+    test_cases.emplace_back(new test_ds41_moe_glu_poison(GGML_TYPE_IQ1_M,   128, 6, 256, 33, 256, false));
+    // iter 016k: decode routed-expert FFN on cache slots (GGML_METAL_DS41_MVGLU / GGML_METAL_DS41_MVMOE fuse it with
+    // GGML_METAL_DS41_IQ=1 and/or GGML_METAL_DS41_IQ1M=1); gate/up k = 1024 (x1 / v2a kernels), down k = 768 (x2 / v2b)
+    for (auto tt : std::vector<std::pair<ggml_type, ggml_type>> {
+            { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M }, { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS },
+            { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS }, { GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M } }) {
+        for (int64_t nt : { 1, 3, 9 }) {
+            for (int overlap : { 0, 2 }) {
+                test_cases.emplace_back(new test_ds41_dec_moe(tt.first, tt.second, 64, 6, 768, 1024, nt, overlap, true, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_ds41_dec_moe(GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, 32, 4, 768, 1024, 2, 2, false, false));
+    test_cases.emplace_back(new test_ds41_dec_moe(GGML_TYPE_IQ1_M,   GGML_TYPE_IQ1_M,  32, 8, 768, 1024, 5, 0, false, true));
+    // iter 016k: router scores + argsort + weights (GGML_METAL_DS41_FUSE=1 GGML_METAL_DS41_RTOPK=1 fuse them)
+    for (int64_t nt : { 1, 2, 9, 40 }) {
+        test_cases.emplace_back(new test_ds41_router_topk(384, 6, nt, 1.5f));
+    }
+    test_cases.emplace_back(new test_ds41_router_topk(64, 8, 3, 2.5f));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q5_K, 256,  64, 8, 33));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_F16,  256,  64, 8, 200));
+    test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q8_0, 256, 128, 4, 129));
+    test_cases.emplace_back(new test_ds41_hc_mix(512, 32, 40));
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
@@ -12350,6 +12865,73 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
+        }
+        // routed experts gate + up + swiglu_clamp, real prefill shapes (DS41_MOE=1, iter 014k): 384 experts, 6 used,
+        // n_ff 2304, n_embd 5120; compare GGML_METAL_DS41_MMID=0 (two MUL_MAT_ID + GLU) vs =1 (one fused dispatch)
+        if (getenv("DS41_MOE")) {
+            for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
+                test_cases.emplace_back(new test_ds41_moe_glu(t, 384, 6, 2304, n, 5120, true));
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 384, 6, true, 2304, n, 5120));
+            }
+        }
+        // decode fusions (DS41_DEC=1, iter 016k): routed-expert FFN on cache slots with the real shapes and type pairs
+        // (gate/up IQ2_XXS / IQ1_M / IQ2_XS, down IQ1_M / IQ2_XXS / IQ2_XS), plain and the two overlap passes; router
+        // scores + top-k + weights. Compare GGML_METAL_DS41_MVGLU / MVMOE / RTOPK off vs on (perf: dispatches saved).
+        if (getenv("DS41_DEC")) {
+            for (auto tt : std::vector<std::pair<ggml_type, ggml_type>> {
+                    { GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M }, { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M },
+                    { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS }, { GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M } }) {
+                for (int overlap : { 0, 2 }) {
+                    test_cases.emplace_back(new test_ds41_dec_moe(tt.first, tt.second, nexp, 6, 2304, 5120, n, overlap, true, false));
+                }
+            }
+            test_cases.emplace_back(new test_ds41_router_topk(384, 6, n, 1.5f));
+        }
+        // expert GEMM ceiling (DS41_GEMM=1, perf, DS41_N=4096; iter 016k): the prefill MUL_MAT_ID products against a
+        // dense GEMM of the same FLOPs (k x m weights, 6n columns). F16 dense = tensor-op ceiling, quantized dense =
+        // + dequantization, F16 MUL_MAT_ID (48 experts, n/8 tokens: the same 64 rows per expert as 384 / n) = + routing
+        // and tiling, quantized MUL_MAT_ID 384 experts = today's kernel. us/run and TFLOPS are comparable within a shape.
+        if (getenv("DS41_GEMM")) {
+            const int64_t nn = n >= 64 ? n : 4096;
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>> { { 2304, 5120 }, { 5120, 2304 } }) {
+                const int64_t m = mk.first;
+                const int64_t k = mk.second;
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 6*nn, k, {1, 1}, {1, 1}));
+                for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 6*nn, k, {1, 1}, {1, 1}));
+                    test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 384, 6, false, m, nn, k));
+                }
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,     GGML_TYPE_F32, 48, 6, false, m, nn/8, k));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 48, 6, false, m, nn/8, k));
+            }
+            // fused gate + up + swiglu_clamp (GGML_METAL_DS41_MMID=1) at the real shape for the same comparison
+            test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_IQ2_XXS, 384, 6, 2304, nn, 5120, true));
+        }
+        // prefill traffic fusions (DS41_PF=1, iter 013k): set DS41_N=4096 (or 4096,4095,33) for ubatch shapes
+        if (getenv("DS41_PF")) {
+            // hc mixes: fused (numeric tier) vs RMS_NORM + MUL_MAT
+            test_cases.emplace_back(new test_ds41_hc_mix(20480, 24, n, false));
+            test_cases.emplace_back(new test_ds41_hc_mix(20480, 24, n, true));
+            // MoE reduce + shared expert + hc_post: fused vs MUL/VIEW/ADD chain + ADD + DSV4_HC_POST
+            test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, n, false));
+            test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, n, true));
+            // plain hc_post (attention site) for the mapping
+            test_cases.emplace_back(new test_dsv4_hc_post(5120, n));
+            // attention wo_a + permute + cont (fused store with GGML_METAL_DS41_PFUSE=1)
+            test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q5_K, 4096, 1024, 8, n));
+            // q / indexer-q / attention-output RoPE of the 64-channel slice, copy vs in place (the in-place slice
+            // dispatch needs GGML_METAL_DS41_PFUSE=1); forward = false is ROPE_BACK
+            for (bool fwd : { true, false }) {
+                for (bool ip : { false, true }) {
+                    test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, fwd, ip, 448));
+                }
+            }
+            for (bool ip : { false, true }) {
+                test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {128, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, true, ip, 64));
+            }
+            // YaRN parameters of the compressed-attention layers (ext_factor != 0)
+            test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 0.25f, 1.0f, 1.0f, false, 0, true, true, 448));
+            test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 0.25f, 1.0f, 1.0f, false, 0, false, true, 448));
         }
         // decode sparse attention (DS41_FA=1): 64 heads, 1 KV head, dk = dv = 512, V view of K, index lists of
         // n_kv_max entries (window only at short depth, window + top-k 512 at long depth)

@@ -521,6 +521,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             snprintf(name, 256, "%s_n_hc=%d", base, (int) op->src[0]->ne[1]);
             break;
         case GGML_OP_DSV4_HC_POST:
+            if (op->src[4]) {
+                base = "kernel_dsv4_hc_post_moe_f32";
+                snprintf(name, 256, "%s_nu=%d", base, (int) op->src[0]->ne[1]);
+                break;
+            }
             base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
             snprintf(name, 256, "%s", base);
             break;
@@ -536,12 +541,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
             cv = ggml_metal_cv_init();
             ggml_metal_cv_set_int32(cv, (int32_t) op->src[0]->ne[1], FC_DSV4_HC + 0);
         }
+        if (op->op == GGML_OP_DSV4_HC_POST && op->src[4]) {
+            cv = ggml_metal_cv_init();
+            ggml_metal_cv_set_int32(cv, (int32_t) op->src[0]->ne[1], FC_DSV4_HC + 1);
+        }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         if (cv) {
             ggml_metal_cv_free(cv);
         }
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc_mix(ggml_metal_library_t lib, const ggml_tensor * op, bool tail) {
+    char name[256];
+    const char * base = tail ? "kernel_dsv4_hc_mix_tail_f32" : "kernel_dsv4_hc_mix_f32";
+
+    const int16_t nm = (int16_t) (op->src[0]->ne[1]/8);
+
+    snprintf(name, 256, "%s_nm=%d", base, (int) nm);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nm, FC_DSV4_HC + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     return res;
@@ -1370,6 +1400,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_glu(ggml_metal_library_t lib, const ggml_tensor * op, bool clamp) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const ggml_type tsrc1 = op->src[1]->type;
+
+    const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_id_glu_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(name, 256, "%s_amax=%d_cl=%d", base, amax, clamp);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, amax,  FC_MUL_MM + 6);
+        ggml_metal_cv_set_bool(cv, clamp, FC_MUL_MM + 8);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    // loop: gate tile, up tile (64 x 32 half each), src1 tile (32 x 32 half); store: gate and up C tiles (64 x 32 f32 each)
+    res.smem = 16384;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1620,6 +1680,129 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
+
+    return res;
+}
+
+// DS41 decode expert fusions (GGML_METAL_DS41_MVGLU / GGML_METAL_DS41_MVMOE): the DS41 mul_mv_id variant that
+// ggml_metal_library_get_pipeline_mul_mv_id selects for op (same conditions), or false for the stock kernels, which
+// have no fused counterpart. nr0 = rows per simdgroup, tab = bytes of the decode tables in threadgroup memory.
+static bool ggml_metal_ds41_mv_variant(const ggml_tensor * op, const char ** suffix, int * nsg, int * nr0, size_t * tab) {
+    const ggml_type tsrc0 = op->src[0]->type;
+    const int32_t   ne00  = op->src[0]->ne[0];
+    const int32_t   ne01  = op->src[0]->ne[1];
+
+    if (op->src[1]->type != GGML_TYPE_F32 || ne00 % 256 != 0 || op->src[1]->nb[1] % 16 != 0) {
+        return false;
+    }
+    if (tsrc0 != GGML_TYPE_IQ1_M && tsrc0 != GGML_TYPE_IQ2_XXS && tsrc0 != GGML_TYPE_IQ2_XS) {
+        return false;
+    }
+
+    const int nb32 = ne00/32;
+    if (nb32 < 32 && (32 % nb32) == 0) {
+        return false; // split kernels
+    }
+
+    const bool x2 = (ne00/32) % 32 != 0;
+
+    bool ok = false;
+
+    if (ggml_metal_ds41_iq()) {
+        switch (tsrc0) {
+            case GGML_TYPE_IQ1_M:   *nsg = 4; *nr0 = x2 ? 16 : 8; *tab = 2048*4 + 82*8;  *suffix = x2 ? "_x2" : "_x1"; ok = true; break;
+            case GGML_TYPE_IQ2_XXS: *nsg = 4; *nr0 = x2 ?  8 : 4; *tab = (256 + 128)*16; *suffix = x2 ? "_x2" : "_x1"; ok = true; break;
+            case GGML_TYPE_IQ2_XS:  *nsg = 4; *nr0 = x2 ? 16 : 4; *tab = (512 + 128)*16; *suffix = x2 ? "_x2" : "_x1"; ok = true; break;
+            default: break;
+        }
+    }
+
+    if (ggml_metal_ds41_iq1m() && tsrc0 == GGML_TYPE_IQ1_M) {
+        if (!x2 && ne01 % 12 == 0) {
+            *nsg = 2; *nr0 =  6; *tab = 0;      *suffix = "_v2a"; ok = true;
+        } else if (x2 && (ne00/32) % 8 == 0 && ne01 % 64 == 0) {
+            *nsg = 4; *nr0 = 16; *tab = 2048*4; *suffix = "_v2b"; ok = true;
+        }
+    }
+
+    return ok;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_ds41(ggml_metal_library_t lib, const ggml_tensor * op, bool moe, bool clamp, int mode, int n_used) {
+    ggml_metal_pipeline_with_params res = {};
+
+    const char * suffix = "";
+    int    nsg = 0;
+    int    nr0 = 0;
+    size_t tab = 0;
+
+    if (!ggml_metal_ds41_mv_variant(op, &suffix, &nsg, &nr0, &tab)) {
+        return res;
+    }
+
+    if (moe) {
+        if (n_used < 1 || n_used > 8) {
+            return res;
+        }
+        // one simdgroup per used expert
+        nsg = n_used;
+    }
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_id_%s_%s_%s%s", moe ? "moe" : "glu", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
+    snprintf(name, 256, "%s_nsg=%d_cl=%d_mode=%d_nu=%d", base, nsg, clamp, mode, moe ? n_used : 0);
+
+    res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg,   FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 4);
+        ggml_metal_cv_set_bool (cv, false, FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, clamp, FC_MUL_MV + 6);
+        ggml_metal_cv_set_int16(cv, mode,  FC_MUL_MV + 7);
+        ggml_metal_cv_set_int32(cv, moe ? n_used : 1, FC_MUL_MV + 8);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg = nsg;
+    res.nr0 = nr0;
+    res.nr1 = 1;
+
+    if (moe) {
+        // tables, then the n_used x nr0 expert rows of the threadgroup
+        res.smem = GGML_PAD(tab + (size_t) n_used*nr0*sizeof(float), 16);
+    } else {
+        res.smem = tab;
+    }
+
+    return res;
+}
+
+// tab bytes of the DS41 decode tables of a variant (offset of the expert rows in the MVMOE threadgroup memory)
+size_t ggml_metal_library_ds41_mv_tab(const ggml_tensor * op) {
+    const char * suffix = "";
+    int    nsg = 0;
+    int    nr0 = 0;
+    size_t tab = 0;
+
+    return ggml_metal_ds41_mv_variant(op, &suffix, &nsg, &nr0, &tab) ? tab : 0;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_router_topk(ggml_metal_library_t lib) {
+    const char * name = "kernel_ds41_router_topk_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
 
     return res;
 }

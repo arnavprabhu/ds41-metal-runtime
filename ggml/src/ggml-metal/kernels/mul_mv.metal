@@ -3973,3 +3973,453 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+// DS41 decode expert fusions (iter 016k, GGML_METAL_DS41_MVGLU / GGML_METAL_DS41_MVMOE)
+//
+// The routed experts of a decode / verify ubatch (< 32 tokens) run mul_mv_id on arena slots. These kernels fuse
+//   MVGLU: MUL_MAT_ID (gate) + MUL_MAT_ID (up) + GLU (swiglu / swiglu_clamp) into one dispatch, and
+//   MVMOE: MUL_MAT_ID (down) + router-weight MUL + expert ADD chain (moe_reduce) into one dispatch.
+// Each output row is computed by the same lanes with the same loop as the DS41 x1 / x2 / v2 mul_mv_id kernel the
+// unfused graph would use (the ds41_core_* functions below are copies of those loops, same NR0 and LG), then the
+// GLU / weighted sum is applied with the expressions of kernel_swiglu(_clamp) / kernel_moe_reduce_f32, so the results
+// are the values the separate dispatches produce.
+//
+// Slots (ids) < 0 (MoE cache overlap, ggml_mul_mat_id_acc) skip the row like kernel_mul_mv_id. GLU mode 1 also stores
+// gate and up (the first overlap pass, whose gate / up the second pass accumulates into); mode 2 is the second pass:
+// the rows of skipped slots take the GLU of the stored gate / up (what the unfused GLU over the whole buffer gives).
+// MVMOE mode 2 (second pass of the down product) takes the rows of skipped slots from the first pass output.
+
+constant bool  FC_mul_mv_ds41_clamp [[function_constant(FC_MUL_MV + 6)]];
+constant short FC_mul_mv_ds41_mode  [[function_constant(FC_MUL_MV + 7)]];
+constant int   FC_mul_mv_ds41_nused [[function_constant(FC_MUL_MV + 8)]];
+
+typedef void (ds41_fill_t)(threadgroup char * tab, short tiitg, short nth);
+
+typedef void (ds41_core_t)(
+        device const char  * src0, // first row of the lane group
+        uint64_t             nb01,
+        device const float * y,
+        int                  nb32,
+        short                ix,
+        threadgroup const char * tab,
+        thread float       * sumf);
+
+inline void ds41_fill_none(threadgroup char * tab, short tiitg, short nth) {
+}
+
+inline void ds41_fill_iq2_xxs(threadgroup char * tab, short tiitg, short nth) {
+    threadgroup uint4 * sgrid = (threadgroup uint4 *) tab;
+    threadgroup uint4 * ssgn  = sgrid + 256;
+    for (short i = tiitg; i < 256; i += nth) sgrid[i] = ds41_grid_half(iq2xxs_grid[i]);
+    for (short i = tiitg; i < 128; i += nth) ssgn[i]  = ds41_sign_masks(ksigns_iq2xs[i]);
+}
+
+inline void ds41_fill_iq2_xs(threadgroup char * tab, short tiitg, short nth) {
+    threadgroup uint4 * sgrid = (threadgroup uint4 *) tab;
+    threadgroup uint4 * ssgn  = sgrid + 512;
+    for (short i = tiitg; i < 512; i += nth) sgrid[i] = ds41_grid_half(iq2xs_grid[i]);
+    for (short i = tiitg; i < 128; i += nth) ssgn[i]  = ds41_sign_masks(ksigns_iq2xs[i]);
+}
+
+inline void ds41_fill_iq1_m_x1(threadgroup char * tab, short tiitg, short nth) {
+    threadgroup uint  * spat = (threadgroup uint  *) tab;
+    threadgroup uint2 * sval = (threadgroup uint2 *) (spat + 2048);
+    for (short i = tiitg; i < 2048; i += nth) {
+        const uint w = iq1s_grid_gpu[i];
+        uint lo = 0, hi = 0;
+        for (short j = 3; j >= 0; --j) {
+            lo = lo*3 + ((w >> (8*j    )) & 0xf);
+            hi = hi*3 + ((w >> (8*j + 4)) & 0xf);
+        }
+        spat[i] = lo | (hi << 16);
+    }
+    for (short i = tiitg; i < 81; i += nth) {
+        sval[i] = as_type<uint2>(half4(i % 3, (i/3) % 3, (i/9) % 3, (i/27) % 3));
+    }
+}
+
+inline void ds41_fill_iq1_m_v2(threadgroup char * tab, short tiitg, short nth) {
+    threadgroup uint * sgrid = (threadgroup uint *) tab;
+    for (short i = tiitg; i < 2048; i += nth) sgrid[i] = iq1s_grid_gpu[i];
+}
+
+// loop of kernel_mul_mv_iq2_xxs_f32_x1_impl
+template<short NR0, short LG>
+void ds41_core_iq2_xxs(device const char * src0, uint64_t nb01, device const float * y, int nb32, short ix, threadgroup const char * tab, thread float * sumf) {
+    threadgroup const uint4 * sgrid = (threadgroup const uint4 *) tab;
+    threadgroup const uint4 * ssgn  = sgrid + 256;
+
+    device const block_iq2_xxs * x = (device const block_iq2_xxs *) src0;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += LG) {
+        float4 yl[8];
+        device const float4 * y4 = (device const float4 *) (y + 32*ib32);
+        for (short i = 0; i < 8; ++i) yl[i] = y4[i];
+
+        device const block_iq2_xxs * xr = x + ib32/8;
+        device const uint16_t * q2 = xr->qs + 4*(ib32%8);
+        device const half     * dh = &xr->d;
+
+        for (short row = 0; row < NR0; ++row) {
+            const uint a0 = q2[0] | (q2[1] << 16);
+            const uint a1 = q2[2] | (q2[3] << 16);
+            const float d = (float) dh[0] * (0.5f + (a1 >> 28));
+            float sum = 0.f;
+            for (short l = 0; l < 4; ++l) {
+                const uint4 g = sgrid[(a0 >> 8*l) & 255] ^ ssgn[(a1 >> 7*l) & 127];
+                sum += dot(yl[2*l+0], float4(as_type<half4>(g.xy)));
+                sum += dot(yl[2*l+1], float4(as_type<half4>(g.zw)));
+            }
+            sumf[row] += d*sum;
+            dh += nb01/2;
+            q2 += nb01/2;
+        }
+    }
+}
+
+// loop of kernel_mul_mv_iq2_xs_f32_x1_impl
+template<short NR0, short LG>
+void ds41_core_iq2_xs(device const char * src0, uint64_t nb01, device const float * y, int nb32, short ix, threadgroup const char * tab, thread float * sumf) {
+    threadgroup const uint4 * sgrid = (threadgroup const uint4 *) tab;
+    threadgroup const uint4 * ssgn  = sgrid + 512;
+
+    device const block_iq2_xs * x = (device const block_iq2_xs *) src0;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += LG) {
+        float4 yl[8];
+        device const float4 * y4 = (device const float4 *) (y + 32*ib32);
+        for (short i = 0; i < 8; ++i) yl[i] = y4[i];
+
+        device const block_iq2_xs * xr = x + ib32/8;
+        device const uint16_t * q2 = xr->qs + 4*(ib32%8);
+        device const uint8_t  * sc = xr->scales + (ib32%8);
+        device const half     * dh = &xr->d;
+
+        for (short row = 0; row < NR0; ++row) {
+            const float db = dh[0];
+            const float d1 = db * (0.5f + (sc[0] & 0xf));
+            const float d2 = db * (0.5f + (sc[0] >> 4));
+            float sum1 = 0.f, sum2 = 0.f;
+            for (short l = 0; l < 2; ++l) {
+                const uint q = q2[l];
+                const uint4 g = sgrid[q & 511] ^ ssgn[q >> 9];
+                sum1 += dot(yl[2*l+0], float4(as_type<half4>(g.xy)));
+                sum1 += dot(yl[2*l+1], float4(as_type<half4>(g.zw)));
+            }
+            for (short l = 2; l < 4; ++l) {
+                const uint q = q2[l];
+                const uint4 g = sgrid[q & 511] ^ ssgn[q >> 9];
+                sum2 += dot(yl[2*l+0], float4(as_type<half4>(g.xy)));
+                sum2 += dot(yl[2*l+1], float4(as_type<half4>(g.zw)));
+            }
+            sumf[row] += d1*sum1 + d2*sum2;
+            dh += nb01/2;
+            q2 += nb01/2;
+            sc += nb01;
+        }
+    }
+}
+
+// loop of kernel_mul_mv_iq1_m_f32_x1_impl
+template<short NR0, short LG>
+void ds41_core_iq1_m_x1(device const char * src0, uint64_t nb01, device const float * y, int nb32, short ix, threadgroup const char * tab, thread float * sumf) {
+    threadgroup const uint  * spat = (threadgroup const uint  *) tab;
+    threadgroup const uint2 * sval = (threadgroup const uint2 *) (spat + 2048);
+
+    device const block_iq1_m * x = (device const block_iq1_m *) src0;
+
+    iq1m_scale_t scale;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += LG) {
+        float4 yl[8];
+        device const float4 * y4 = (device const float4 *) (y + 32*ib32);
+        for (short i = 0; i < 8; ++i) yl[i] = y4[i];
+        const float4 sumy = float4(dot(yl[0] + yl[1], float4(1.f)), dot(yl[2] + yl[3], float4(1.f)),
+                                   dot(yl[4] + yl[5], float4(1.f)), dot(yl[6] + yl[7], float4(1.f)));
+
+        const int ib = ib32%8;
+        device const block_iq1_m * xr = x + ib32/8;
+        device const uint     * qs = (device const uint     *) (xr->qs + 4*ib);
+        device const uint16_t * qh = (device const uint16_t *) (xr->qh + 2*ib);
+        device const uint16_t * sc = (device const uint16_t *) xr->scales;
+
+        for (short row = 0; row < NR0; ++row) {
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const uint q4 = qs[0];
+            const uint hh = qh[0];
+
+            const uint p0 = spat[( q4        & 0xff) | ((hh << 8) & 0x700)];
+            const uint p1 = spat[((q4 >>  8) & 0xff) | ((hh << 4) & 0x700)];
+            const uint p2 = spat[((q4 >> 16) & 0xff) | ((hh     ) & 0x700)];
+            const uint p3 = spat[((q4 >> 24) & 0xff) | ((hh >> 4) & 0x700)];
+
+            const float sum0 = dot(yl[0], float4(as_type<half4>(sval[p0 & 0xffff]))) + dot(yl[1], float4(as_type<half4>(sval[p0 >> 16])))
+                             + dot(yl[2], float4(as_type<half4>(sval[p1 & 0xffff]))) + dot(yl[3], float4(as_type<half4>(sval[p1 >> 16])));
+            const float sum1 = dot(yl[4], float4(as_type<half4>(sval[p2 & 0xffff]))) + dot(yl[5], float4(as_type<half4>(sval[p2 >> 16])))
+                             + dot(yl[6], float4(as_type<half4>(sval[p3 & 0xffff]))) + dot(yl[7], float4(as_type<half4>(sval[p3 >> 16])));
+
+            const float delta1 = sumy[0] * (hh & 0x0008 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[1] * (hh & 0x0080 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+            const float delta2 = sumy[2] * (hh & 0x0800 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[3] * (hh & 0x8000 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+
+            sumf[row] += (float) scale.f16 * ((sum0 + delta1) * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 7) + 1) +
+                                              (sum1 + delta2) * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 7) + 1));
+            sc += nb01/2;
+            qs += nb01/4;
+            qh += nb01/2;
+        }
+    }
+}
+
+// loop of kernel_mul_mv_iq1_m_f32_v2_impl
+template<short NR0, short LG, short GSRC>
+void ds41_core_iq1_m_v2(device const char * src0, uint64_t nb01, device const float * y, int nb32, short ix, threadgroup const char * tab, thread float * sumf) {
+    threadgroup const uint * sgrid = (threadgroup const uint *) tab;
+
+    device const block_iq1_m * x = (device const block_iq1_m *) src0;
+
+    iq1m_scale_t scale;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += LG) {
+        float4 yl[8];
+        device const float4 * y4 = (device const float4 *) (y + 32*ib32);
+        for (short i = 0; i < 8; ++i) yl[i] = y4[i];
+        const float4 sumy = float4(dot(yl[0] + yl[1], float4(1.f)), dot(yl[2] + yl[3], float4(1.f)),
+                                   dot(yl[4] + yl[5], float4(1.f)), dot(yl[6] + yl[7], float4(1.f)));
+        float4 ys[8];
+        for (short i = 0; i < 8; ++i) ys[i] = yl[i].xzyw;
+
+        const int ib = ib32%8;
+        device const block_iq1_m * xr = x + ib32/8;
+        device const uint     * qs = (device const uint     *) (xr->qs + 4*ib);
+        device const uint16_t * qh = (device const uint16_t *) (xr->qh + 2*ib);
+        device const uint16_t * sc = (device const uint16_t *) xr->scales;
+
+        for (short row = 0; row < NR0; ++row) {
+            const ushort4 s4 = *((device const ushort4 *) sc);
+            scale.u16 = (s4[0] >> 12) | ((s4[1] >> 8) & 0x00f0) | ((s4[2] >> 4) & 0x0f00) | (s4[3] & 0xf000);
+            const uint sib = s4[ib/2] >> (6*(ib%2));
+            const uint q4 = qs[0];
+            const uint hh = qh[0];
+
+            const uint i0 = ( q4        & 0xff) | ((hh << 8) & 0x700);
+            const uint i1 = ((q4 >>  8) & 0xff) | ((hh << 4) & 0x700);
+            const uint i2 = ((q4 >> 16) & 0xff) | ((hh     ) & 0x700);
+            const uint i3 = ((q4 >> 24) & 0xff) | ((hh >> 4) & 0x700);
+            uint g0, g1, g2, g3;
+            if (GSRC == 0) { g0 = sgrid[i0];         g1 = sgrid[i1];         g2 = sgrid[i2];         g3 = sgrid[i3]; }
+            else           { g0 = iq1s_grid_gpu[i0]; g1 = iq1s_grid_gpu[i1]; g2 = iq1s_grid_gpu[i2]; g3 = iq1s_grid_gpu[i3]; }
+
+            const float sum0 = ds41_iq1m_dot8(g0, ys[0], ys[1]) + ds41_iq1m_dot8(g1, ys[2], ys[3]);
+            const float sum1 = ds41_iq1m_dot8(g2, ys[4], ys[5]) + ds41_iq1m_dot8(g3, ys[6], ys[7]);
+
+            const float delta1 = sumy[0] * (hh & 0x0008 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[1] * (hh & 0x0080 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+            const float delta2 = sumy[2] * (hh & 0x0800 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA) + sumy[3] * (hh & 0x8000 ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA);
+
+            sumf[row] += (float) scale.f16 * ((sum0 + delta1) * (2*((sib >> 0) & 7) + 1) +
+                                              (sum1 + delta2) * (2*((sib >> 3) & 7) + 1));
+            sc += nb01/2;
+            qs += nb01/4;
+            qh += nb01/2;
+        }
+    }
+}
+
+// the row reduction of the x1 / x2 / v2 kernels
+template<short LG>
+static inline float ds41_lane_sum(float s) {
+    if (LG == 32) {
+        s = simd_sum(s);
+    } else {
+        for (short o = LG/2; o > 0; o >>= 1) s += simd_shuffle_xor(s, o);
+    }
+    return s;
+}
+
+// kernel_swiglu / kernel_swiglu_clamp of one element
+static inline float ds41_glu(float g, float u, float limit) {
+    if (FC_mul_mv_ds41_clamp) {
+        const float gate = min(g, limit);
+        const float up   = clamp(u, -limit, limit);
+        return gate / (1.0f + exp(-gate)) * up;
+    }
+    const float silu = g / (1.0f + exp(-g));
+    return silu*u;
+}
+
+// grid: x = row blocks of NSG*NR0*(32/LG) rows, z = (token, used expert); NSG simdgroups as the unfused kernel
+// Q25: the kernel scales the row sum by 0.25 (IQ2_XXS / IQ2_XS)
+template<ds41_fill_t fill, ds41_core_t core, short NR0, short LG, short Q25>
+kernel void kernel_mul_mv_id_glu_ds41(
+        constant ggml_metal_kargs_mul_mv_id_glu & args,
+        device const char * src0g,
+        device const char * src0u,
+        device const char * src1,
+        device const char * ids,
+        device       char * dst,
+        device       char * pg,
+        device       char * pu,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int iid1 = tgpig.z/args.nei0;
+    const int idx  = tgpig.z%args.nei0;
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    // rows of this (token, used expert) pair: dst / gate / up are [ne0, nei0, nei1] contiguous
+    const uint64_t doff = (uint64_t) idx*args.ne0 + (uint64_t) iid1*args.ne1*args.ne0;
+
+    device float * D = (device float *) dst + doff;
+
+    const int nrt = NSG*NR0*(32/LG);
+    const int r0  = tgpig.x*nrt;
+
+    if (i02 < 0) {
+        if (FC_mul_mv_ds41_mode == 2) {
+            device const float * G = (device const float *) pg + doff;
+            device const float * U = (device const float *) pu + doff;
+            for (int i = tiitg; i < nrt && r0 + i < args.ne0; i += 32*NSG) {
+                D[r0 + i] = ds41_glu(G[r0 + i], U[r0 + i], args.limit);
+            }
+        }
+        return;
+    }
+
+    fill(shmem, tiitg, 32*NSG);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short ix  = tiisg % LG;
+    const short grp = tiisg / LG;
+
+    const int first_row = r0 + sgitg*NR0*(32/LG) + grp*NR0;
+
+    const uint64_t offset0 = (uint64_t) i02*args.nb02 + (uint64_t) first_row*args.nb01;
+
+    device const float * y = (device const float *) (src1 + (idx % args.ne11)*args.nb11 + iid1*args.nb12);
+
+    float sg[NR0] = {0.f};
+    float su[NR0] = {0.f};
+
+    core(src0g + offset0, args.nb01, y, args.ne00/32, ix, shmem, sg);
+    core(src0u + offset0, args.nb01, y, args.ne00/32, ix, shmem, su);
+
+    for (short row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        const float g = ds41_lane_sum<LG>(sg[row]);
+        const float u = ds41_lane_sum<LG>(su[row]);
+        if (ix == 0) {
+            const float gv = Q25 ? g*0.25f : g;
+            const float uv = Q25 ? u*0.25f : u;
+            if (FC_mul_mv_ds41_mode == 1) {
+                ((device float *) pg + doff)[first_row + row] = gv;
+                ((device float *) pu + doff)[first_row + row] = uv;
+            }
+            D[first_row + row] = ds41_glu(gv, uv, args.limit);
+        }
+    }
+}
+
+// grid: x = row blocks of NR0*(32/LG) rows, z = token; FC_mul_mv_nsg simdgroups take the used experts in turn, the
+// expert rows meet in threadgroup memory and are summed as kernel_moe_reduce_f32 does
+template<ds41_fill_t fill, ds41_core_t core, short NR0, short LG, short Q25>
+kernel void kernel_mul_mv_id_moe_ds41(
+        constant ggml_metal_kargs_mul_mv_id_moe & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * ids,
+        device const char * weights,
+        device const char * prev,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const int   n_expert_used = FC_mul_mv_ds41_nused;
+
+    constexpr int RS = NR0*(32/LG);
+
+    const int r0 = tgpig.x*RS;
+    const int it = tgpig.z;
+
+    threadgroup float * sd = (threadgroup float *) (shmem + args.tab); // [n_expert_used][RS]
+
+    fill(shmem, tiitg, 32*NSG);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short ix  = tiisg % LG;
+    const short grp = tiisg / LG;
+
+    const int first_row = r0 + grp*NR0;
+
+    device const int32_t * ids_t = (device const int32_t *) (ids + it*args.nbi1);
+
+    for (int e = sgitg; e < n_expert_used; e += NSG) {
+        const int32_t i02 = ids_t[e];
+
+        if (i02 < 0) {
+            // second overlap pass: the first pass wrote this expert's rows
+            device const float * P = (device const float *) (prev + e*args.nbp1 + it*args.nbp2);
+            for (int i = tiisg; i < RS; i += 32) {
+                sd[e*RS + i] = (FC_mul_mv_ds41_mode == 2 && r0 + i < args.ne0) ? P[r0 + i] : 0.0f;
+            }
+            continue;
+        }
+
+        const uint64_t offset0 = (uint64_t) i02*args.nb02 + (uint64_t) first_row*args.nb01;
+
+        device const float * y = (device const float *) (src1 + (e % args.ne11)*args.nb11 + it*args.nb12);
+
+        float s[NR0] = {0.f};
+
+        core(src0 + offset0, args.nb01, y, args.ne00/32, ix, shmem, s);
+
+        for (short row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+            const float v = ds41_lane_sum<LG>(s[row]);
+            if (ix == 0) {
+                sd[e*RS + grp*NR0 + row] = Q25 ? v*0.25f : v;
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const float * w = (device const float *) (weights + it*args.nbw1);
+    device       float * d = (device       float *) (dst     + it*args.nbd1);
+
+    for (int i = tiitg; i < RS; i += 32*NSG) {
+        if (r0 + i >= args.ne0) {
+            break;
+        }
+        float sum = 0.0f;
+        FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
+            sum += sd[e*RS + i] * w[e];
+        }
+        d[r0 + i] = sum;
+    }
+}
+
+typedef decltype(kernel_mul_mv_id_glu_ds41<ds41_fill_iq2_xxs, ds41_core_iq2_xxs<4, 32>, 4, 32, 1>) kernel_mul_mv_id_glu_ds41_t;
+typedef decltype(kernel_mul_mv_id_moe_ds41<ds41_fill_iq2_xxs, ds41_core_iq2_xxs<4, 32>, 4, 32, 1>) kernel_mul_mv_id_moe_ds41_t;
+
+template [[host_name("kernel_mul_mv_id_glu_iq2_xxs_f32_x1")]] kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq2_xxs,  ds41_core_iq2_xxs<4, 32>,     4, 32, 1>;
+template [[host_name("kernel_mul_mv_id_glu_iq2_xxs_f32_x2")]] kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq2_xxs,  ds41_core_iq2_xxs<2, 8>,      2, 8,  1>;
+template [[host_name("kernel_mul_mv_id_glu_iq2_xs_f32_x1")]]  kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq2_xs,   ds41_core_iq2_xs<4, 32>,      4, 32, 1>;
+template [[host_name("kernel_mul_mv_id_glu_iq2_xs_f32_x2")]]  kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq2_xs,   ds41_core_iq2_xs<4, 8>,       4, 8,  1>;
+template [[host_name("kernel_mul_mv_id_glu_iq1_m_f32_x1")]]   kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq1_m_x1, ds41_core_iq1_m_x1<8, 32>,    8, 32, 0>;
+template [[host_name("kernel_mul_mv_id_glu_iq1_m_f32_x2")]]   kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq1_m_x1, ds41_core_iq1_m_x1<4, 8>,     4, 8,  0>;
+template [[host_name("kernel_mul_mv_id_glu_iq1_m_f32_v2a")]]  kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_none,     ds41_core_iq1_m_v2<6, 32, 1>, 6, 32, 0>;
+template [[host_name("kernel_mul_mv_id_glu_iq1_m_f32_v2b")]]  kernel kernel_mul_mv_id_glu_ds41_t kernel_mul_mv_id_glu_ds41<ds41_fill_iq1_m_v2, ds41_core_iq1_m_v2<4, 8, 0>,  4, 8,  0>;
+
+template [[host_name("kernel_mul_mv_id_moe_iq2_xxs_f32_x1")]] kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq2_xxs,  ds41_core_iq2_xxs<4, 32>,     4, 32, 1>;
+template [[host_name("kernel_mul_mv_id_moe_iq2_xxs_f32_x2")]] kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq2_xxs,  ds41_core_iq2_xxs<2, 8>,      2, 8,  1>;
+template [[host_name("kernel_mul_mv_id_moe_iq2_xs_f32_x1")]]  kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq2_xs,   ds41_core_iq2_xs<4, 32>,      4, 32, 1>;
+template [[host_name("kernel_mul_mv_id_moe_iq2_xs_f32_x2")]]  kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq2_xs,   ds41_core_iq2_xs<4, 8>,       4, 8,  1>;
+template [[host_name("kernel_mul_mv_id_moe_iq1_m_f32_x1")]]   kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq1_m_x1, ds41_core_iq1_m_x1<8, 32>,    8, 32, 0>;
+template [[host_name("kernel_mul_mv_id_moe_iq1_m_f32_x2")]]   kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq1_m_x1, ds41_core_iq1_m_x1<4, 8>,     4, 8,  0>;
+template [[host_name("kernel_mul_mv_id_moe_iq1_m_f32_v2a")]]  kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_none,     ds41_core_iq1_m_v2<6, 32, 1>, 6, 32, 0>;
+template [[host_name("kernel_mul_mv_id_moe_iq1_m_f32_v2b")]]  kernel kernel_mul_mv_id_moe_ds41_t kernel_mul_mv_id_moe_ds41<ds41_fill_iq1_m_v2, ds41_core_iq1_m_v2<4, 8, 0>,  4, 8,  0>;

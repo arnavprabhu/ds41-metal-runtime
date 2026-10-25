@@ -69,7 +69,7 @@ kernel void kernel_rope_norm(
     float cos_theta;
     float sin_theta;
 
-    for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
+    for (int i0 = args.i0s + 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
         if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
             const int iw = i0 - args.n_offs; // relative idx
             const int ic = iw/2;
@@ -127,7 +127,7 @@ kernel void kernel_rope_neox(
     float cos_theta;
     float sin_theta;
 
-    for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
+    for (int i0 = args.i0s + 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
         if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
             const int iw = i0 - args.n_offs; // relative idx
             const int ic = iw/2;
