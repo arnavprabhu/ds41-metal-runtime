@@ -566,8 +566,12 @@ inline uint64_t eg_now() {
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {
+        // LLAMA_DSV41_ENGRAM_STATS: single-token calls are averaged at exit; multi-token ubatches (prefill) log one line each
         const bool eg_t = g_eg.on && ubatch->n_tokens == 1;
-        uint64_t eg0 = eg_t ? eg_now() : 0;
+        const bool eg_m = g_eg.on && ubatch->n_tokens > 1;
+        uint64_t eg0 = (eg_t || eg_m) ? eg_now() : 0;
+        uint64_t eg_gather = 0, eg_set = 0;
+        size_t eg_rows = 0;
         // a token shared by several sequences has the same history in each, so its first sequence resolves it
         std::vector<llama_token> prev;
         mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
@@ -588,7 +592,7 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         llama_dsv41_dump_engram(model, *ubatch, ids);
-        uint64_t eg1 = eg_t ? eg_now() : 0;
+        uint64_t eg1 = (eg_t || eg_m) ? eg_now() : 0;
         if (eg_t) { g_eg.pref_us += eg1 - eg0; g_eg.tok1_calls++; }
         std::vector<float> rows;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
@@ -596,15 +600,20 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
                 if (engram_tab[e]) {
                     // host gather: same rows and conversion as the CPU GET_ROWS
                     rows.resize(ids[e].size()*engram_tab[e]->ne[0]);
-                    const uint64_t g0 = eg_t ? eg_now() : 0;
+                    const uint64_t g0 = (eg_t || eg_m) ? eg_now() : 0;
                     llm_graph_host_get_rows(engram_tab[e], ids[e].data(), (int64_t) ids[e].size(), rows.data());
-                    const uint64_t g1 = eg_t ? eg_now() : 0;
+                    const uint64_t g1 = (eg_t || eg_m) ? eg_now() : 0;
                     ggml_backend_tensor_set(engram_ids[e], rows.data(), 0, rows.size()*sizeof(float));
                     if (eg_t) { g_eg.gather_us += g1 - g0; g_eg.set_us += eg_now() - g1; }
+                    if (eg_m) { eg_gather += g1 - g0; eg_set += eg_now() - g1; eg_rows += ids[e].size(); }
                 } else {
                     ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
                 }
             }
+        }
+        if (eg_m) {
+            fprintf(stderr, "engram stats: ubatch %u tokens: rows = %zu, hash+readahead %.2f ms, gather %.2f ms, upload %.2f ms, total %.2f ms\n",
+                ubatch->n_tokens, eg_rows, (eg1 - eg0)/1000.0, eg_gather/1000.0, eg_set/1000.0, (eg_now() - eg0)/1000.0);
         }
     }
 

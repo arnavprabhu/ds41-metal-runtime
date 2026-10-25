@@ -140,6 +140,63 @@ struct llama_moe_cache::impl {
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
 
+    // LLAMA_DSV41_MOE_TOKSTATS=1: one stderr line per decode step (small ubatch through all cached layers): hits, misses,
+    // uploaded MiB, fill/sync/join ms. A step that starts > 2 s after the previous activity starts a new sequence (a prompt
+    // was processed in between), so "seq S step K" is the K-th decode step after a prompt. Instrumentation only.
+    struct tok_stat {
+        int32_t  n_tok = 0;
+        size_t   hits = 0, misses = 0, bytes = 0;
+        uint64_t fill_us = 0, sync_us = 0, wait_us = 0;
+    };
+    const bool tok_on = [] { const char * v = getenv("LLAMA_DSV41_MOE_TOKSTATS"); return v != nullptr && atoi(v) != 0; }();
+    int32_t  tok_first_il = -1;
+    tok_stat tok_cur;
+    int32_t  tok_seq = 0;
+    int32_t  tok_idx = 0;
+    std::chrono::steady_clock::time_point tok_last;
+
+    void tok_flush() {
+        if (tok_cur.n_tok == 0) {
+            return;
+        }
+        const size_t n = tok_cur.hits + tok_cur.misses;
+        fprintf(stderr, "llama_moe_cache: tokstat seq %d step %d: n_tok = %d, hits = %zu, misses = %zu, hit rate = %.2f%%, "
+            "MiB = %.2f, fill ms = %.2f, sync ms = %.2f, join wait ms = %.2f\n",
+            tok_seq, tok_idx, tok_cur.n_tok, tok_cur.hits, tok_cur.misses, n ? 100.0*tok_cur.hits/n : 0.0,
+            tok_cur.bytes/1024.0/1024.0, tok_cur.fill_us/1000.0, tok_cur.sync_us/1000.0, tok_cur.wait_us/1000.0);
+        tok_idx++;
+        tok_cur = tok_stat();
+    }
+
+    void tok_add(int32_t il, int32_t n_tok, size_t hits, size_t misses, size_t bytes, uint64_t fill_us, uint64_t sync_us) {
+        if (!tok_on) {
+            return;
+        }
+        if (tok_first_il < 0) {
+            for (int32_t i = 0; i < (int32_t) layers.size(); ++i) {
+                if (layers[i].ig >= 0) {
+                    tok_first_il = i;
+                    break;
+                }
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (il == tok_first_il) {
+            tok_flush();
+            if (tok_idx > 0 && now - tok_last > std::chrono::seconds(2)) {
+                tok_seq++;
+                tok_idx = 0;
+            }
+            tok_cur.n_tok = n_tok;
+        }
+        tok_cur.hits    += hits;
+        tok_cur.misses  += misses;
+        tok_cur.bytes   += bytes;
+        tok_cur.fill_us += fill_us;
+        tok_cur.sync_us += sync_us;
+        tok_last = now;
+    }
+
     std::vector<device> devices;
     std::vector<group> groups;
     std::vector<layer> layers;
@@ -1047,6 +1104,7 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        tok_flush();
         overlap_drain();
         pf_flush();
         warm_finish();
@@ -1295,6 +1353,11 @@ struct llama_moe_cache::impl {
         st.pread_calls += !fills.empty();
         st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        if (&st == &stats_small) {
+            tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
+                std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
         return true;
     }
 
@@ -1344,6 +1407,7 @@ struct llama_moe_cache::impl {
             memcpy(out, now, n_expert*sizeof(int32_t));
         }
         (stats_small).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        tok_cur.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         return true;
     }
 
@@ -1502,6 +1566,11 @@ struct llama_moe_cache::impl {
         st.fallback_calls += fallback_used;
         st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        if (&st == &stats_small) {
+            tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
+                std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
 
         // the next copy synchronizes the backend before it changes the slot map again
         if (direct_map) {
