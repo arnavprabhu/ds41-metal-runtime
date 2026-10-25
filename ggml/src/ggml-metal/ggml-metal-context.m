@@ -534,11 +534,30 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// GGML_METAL_SPIN_US=N: poll the status of the command buffer for up to N us before blocking in waitUntilCompleted
+// returns true if the command buffer finished (completed or failed) while polling
+static bool ggml_metal_cmd_buf_wait(id<MTLCommandBuffer> cmd_buf) {
+    const int spin_us = ggml_metal_spin_us();
+    if (spin_us > 0) {
+        const int64_t t0 = ggml_time_us();
+        do {
+            const MTLCommandBufferStatus status = [cmd_buf status];
+            if (status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError) {
+                return true;
+            }
+        } while (ggml_time_us() - t0 < spin_us);
+    }
+
+    [cmd_buf waitUntilCompleted];
+
+    return false;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         const int64_t t_w = ctx->prof ? ggml_time_us() : 0;
-        [ctx->cmd_buf_last waitUntilCompleted];
+        ggml_metal_cmd_buf_wait(ctx->cmd_buf_last);
         ctx->cmd_buf_last = nil;
         if (ctx->prof) {
             ctx->prof->sync_wait_s += (ggml_time_us() - t_w) * 1e-6;
