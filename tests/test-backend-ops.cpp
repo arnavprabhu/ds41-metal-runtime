@@ -12883,6 +12883,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
             }
             test_cases.emplace_back(new test_ds41_router_topk(384, 6, n, 1.5f));
         }
+        // expert GEMM ceiling (DS41_GEMM=1, perf, DS41_N=4096; iter 016k): the prefill MUL_MAT_ID products against a
+        // dense GEMM of the same FLOPs (k x m weights, 6n columns). F16 dense = tensor-op ceiling, quantized dense =
+        // + dequantization, F16 MUL_MAT_ID (48 experts, n/8 tokens: the same 64 rows per expert as 384 / n) = + routing
+        // and tiling, quantized MUL_MAT_ID 384 experts = today's kernel. us/run and TFLOPS are comparable within a shape.
+        if (getenv("DS41_GEMM")) {
+            const int64_t nn = n >= 64 ? n : 4096;
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>> { { 2304, 5120 }, { 5120, 2304 } }) {
+                const int64_t m = mk.first;
+                const int64_t k = mk.second;
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 6*nn, k, {1, 1}, {1, 1}));
+                for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
+                    test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, 6*nn, k, {1, 1}, {1, 1}));
+                    test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 384, 6, false, m, nn, k));
+                }
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,     GGML_TYPE_F32, 48, 6, false, m, nn/8, k));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 48, 6, false, m, nn/8, k));
+            }
+            // fused gate + up + swiglu_clamp (GGML_METAL_DS41_MMID=1) at the real shape for the same comparison
+            test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_IQ2_XXS, 384, 6, 2304, nn, 5120, true));
+        }
         // prefill traffic fusions (DS41_PF=1, iter 013k): set DS41_N=4096 (or 4096,4095,33) for ubatch shapes
         if (getenv("DS41_PF")) {
             // hc mixes: fused (numeric tier) vs RMS_NORM + MUL_MAT
