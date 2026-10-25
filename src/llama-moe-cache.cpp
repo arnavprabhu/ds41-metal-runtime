@@ -77,6 +77,7 @@ struct llama_moe_cache::impl {
         // banks and their views
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
+        std::vector<ggml_backend_buffer_t> sub_bufs; // the buffers holding the banks (several if buf is a multi-buffer)
         size_t buf_size = 0;
     };
 
@@ -934,14 +935,35 @@ struct llama_moe_cache::impl {
                 if (!d.buf) {
                     throw std::runtime_error("failed to allocate the MoE cache buffers");
                 }
+                // an arena larger than the device's maximum buffer size (Metal maxBufferLength, 38.9 GiB on M5 Pro) is
+                // split over several buffers behind a multi-buffer wrapper: the banks live in the sub-buffers, so those
+                // are tested (the wrapper itself is never a shared Metal buffer)
                 const is_shared_fn is_shared = get_is_shared(d.backend);
-                // Shared Metal slots are written completely before their GPU map is published.
-                if (is_shared == nullptr || !is_shared(d.buf.get())) {
-                    ggml_backend_buffer_clear(d.buf.get(), 0);
-                    if (overlap_level != 0) {
-                        fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
-                        overlap_level = 0;
+                d.sub_bufs.clear();
+                // LLAMA_DSV41_MOE_SUBBUF_CHECK=0: old check of the wrapper only (a multi-buffer arena is cleared and runs without overlap)
+                static const bool subbuf_check = [] { const char * v = getenv("LLAMA_DSV41_MOE_SUBBUF_CHECK"); return v == nullptr || atoi(v) != 0; }();
+                for (ggml_tensor * t = subbuf_check ? ggml_get_first_tensor(d.ctx.get()) : nullptr; t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                    if (t->view_src == nullptr && t->buffer != nullptr &&
+                            std::find(d.sub_bufs.begin(), d.sub_bufs.end(), t->buffer) == d.sub_bufs.end()) {
+                        d.sub_bufs.push_back(t->buffer);
                     }
+                }
+                if (d.sub_bufs.empty()) {
+                    d.sub_bufs.push_back(d.buf.get());
+                }
+                bool all_shared = true;
+                for (ggml_backend_buffer_t b : d.sub_bufs) {
+                    // Shared Metal slots are written completely before their GPU map is published.
+                    if (is_shared == nullptr || !is_shared(b)) {
+                        ggml_backend_buffer_clear(b, 0);
+                        all_shared = false;
+                    }
+                }
+                fprintf(stderr, "llama_moe_cache: arena of %s in %zu buffer(s), %s\n", ggml_backend_name(d.backend), d.sub_bufs.size(),
+                    all_shared ? "all shared" : "not all shared");
+                if (!all_shared && overlap_level != 0) {
+                    fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
+                    overlap_level = 0;
                 }
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
@@ -997,10 +1019,11 @@ struct llama_moe_cache::impl {
         if (const char * ml = getenv("LLAMA_DSV41_MOE_MLOCK"); ml && atoi(ml) != 0) {
             // keep the arena resident (pageable otherwise between command buffers; Strata MAC.md). Pages are wired as they are touched.
             for (const device & d : devices) {
-                if (d.buf) {
-                    void * base = ggml_backend_buffer_get_base(d.buf.get());
-                    const int rc = mlock(base, d.buf_size);
-                    fprintf(stderr, "llama_moe_cache: mlock arena %.0f MiB: %s\n", d.buf_size/1024.0/1024.0, rc == 0 ? "ok" : strerror(errno));
+                for (ggml_backend_buffer_t b : d.sub_bufs) {
+                    void * base = ggml_backend_buffer_get_base(b);
+                    const size_t sz = ggml_backend_buffer_get_size(b);
+                    const int rc = mlock(base, sz);
+                    fprintf(stderr, "llama_moe_cache: mlock arena %.0f MiB: %s\n", sz/1024.0/1024.0, rc == 0 ? "ok" : strerror(errno));
                 }
             }
         }
