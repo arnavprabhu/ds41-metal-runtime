@@ -203,11 +203,89 @@ struct llama_prefill_stage {
         return n <= union_max_frac()*n_expert;
     }
 
+    // LLAMA_DSV41_STAGE_BLIT=1 (with PREFILL_ARENA): the arena-resident experts of the reader's layer are copied into its
+    // staging set by one GPU blit queued at the layer's start_bg (first split of the previous layer, after the
+    // synchronize: the parity is free, and the copy is ordered before every split encoded later; the next layer's first
+    // split synchronizes before it is used), instead of memcpy jobs on the reader's upload threads. Not for a start_bg
+    // that also seeds the arena (the seeding evicts slots on the reader thread while the blit may still read them).
+    // =2: the blit runs on a second Metal queue, concurrent with layer li's compute (=1 queues it in order, before it)
+    static int blit_mode() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_STAGE_BLIT"); return v ? std::max(0, atoi(v)) : 0; }();
+        return n;
+    }
+    struct blit_run {
+        char *                dst;
+        ggml_backend_buffer_t dst_buf;
+        const void *          src;
+        ggml_backend_buffer_t src_buf;
+        size_t                len;
+    };
+    bool           blit_pending = false; // blits queued since the last synchronize of blit_backend
+    ggml_backend_t blit_backend = nullptr;
+    uint64_t       blit_calls = 0, blit_runs_n = 0, blit_bytes = 0, blit_fallback = 0;
+
+    // queue runs as one blit on backend; if that is not possible they become memcpy jobs of the reader
+    void issue_blits(ggml_backend_t backend, std::vector<blit_run> & runs, std::vector<llama_exps_prefetch::upload_job> & jobs) {
+        if (runs.empty()) {
+            return;
+        }
+        using cpy_fn = bool (*)(ggml_backend_t, int, const ggml_tensor * const *, ggml_tensor * const *, bool);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto fn = reg ? (cpy_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_cpy_tensors_async") : nullptr;
+        bool ok = false;
+        if (fn != nullptr) {
+            ggml_init_params ip = { 2*runs.size()*ggml_tensor_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            if (ctx != nullptr) {
+                std::vector<const ggml_tensor *> srcs(runs.size());
+                std::vector<ggml_tensor *>       dsts(runs.size());
+                for (size_t i = 0; i < runs.size(); ++i) {
+                    // byte tensors placed on the bank / staging buffer (no allocation: buffer + data only)
+                    ggml_tensor * s = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) runs[i].len);
+                    ggml_tensor * d = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, (int64_t) runs[i].len);
+                    s->buffer = runs[i].src_buf;
+                    s->data   = const_cast<void *>(runs[i].src);
+                    d->buffer = runs[i].dst_buf;
+                    d->data   = runs[i].dst;
+                    srcs[i] = s;
+                    dsts[i] = d;
+                }
+                ok = fn(backend, (int) runs.size(), srcs.data(), dsts.data(), blit_mode() == 2);
+                ggml_free(ctx);
+            }
+        }
+        if (ok) {
+            blit_pending = true;
+            blit_backend = backend;
+            blit_calls++;
+            blit_runs_n += runs.size();
+            for (const auto & r : runs) {
+                blit_bytes += r.len;
+            }
+        } else {
+            blit_fallback++;
+            for (const auto & r : runs) {
+                llama_exps_prefetch::add_upload(jobs, -1, 0, r.dst, r.len, r.src);
+            }
+        }
+        runs.clear();
+    }
+
+    // wait for the queued blits (before the staging sets are freed or the arena may be written)
+    void blit_sync() {
+        if (blit_pending && blit_backend != nullptr) {
+            ggml_backend_synchronize(blit_backend);
+        }
+        blit_pending = false;
+    }
+
     // jobs for the experts sel[] of host tensor t into dst (its staging data), as runs of consecutive experts; with mc
-    // (PREFILL_ARENA) the resident ones are copied from the arena. File runs carry the per-expert path's padding (up to
-    // 512 bytes of the next expert; Metal's MUL_MAT_ID never reads it). Returns the number of experts.
+    // (PREFILL_ARENA) the resident ones are copied from the arena (as blit runs of staging buffer dst_buf with blits).
+    // File runs carry the per-expert path's padding (up to 512 bytes of the next expert; Metal's MUL_MAT_ID never reads
+    // it). Returns the number of experts.
     int64_t add_expert_runs(std::vector<llama_exps_prefetch::upload_job> & jobs, const ggml_tensor * t, int fd, uint64_t off, char * dst,
-            const std::vector<bool> & sel, llama_moe_cache * mc) {
+            const std::vector<bool> & sel, llama_moe_cache * mc, std::vector<blit_run> * blits = nullptr, ggml_backend_buffer_t dst_buf = nullptr) {
         const int64_t n_expert = t->ne[2];
         const size_t  es       = t->nb[2];
         int64_t n_sel = 0;
@@ -221,13 +299,18 @@ struct llama_prefill_stage {
                 last++;
             }
             for (int64_t e = first; e <= last; ) {
-                const void * a = mc ? mc->resident_expert(t, e) : nullptr;
+                ggml_backend_buffer_t abuf = nullptr;
+                const void * a = mc ? mc->resident_expert(t, e, &abuf) : nullptr;
                 int64_t n = 1;
                 if (a) {
                     while (e + n <= last && mc->resident_expert(t, e + n) == (const char *) a + n*es) {
                         n++;
                     }
-                    llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                    if (blits && abuf) {
+                        blits->push_back({ dst + e*es, dst_buf, a, abuf, (size_t) (n*es) });
+                    } else {
+                        llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                    }
                     arena_experts += n;
                 } else {
                     while (e + n <= last && (mc == nullptr || mc->resident_expert(t, e + n) == nullptr)) {
@@ -559,12 +642,15 @@ struct llama_prefill_stage {
     void start_bg(int li, llama_moe_cache * mc) {
         start_bg(li, mc, seed_req());
     }
-    void start_bg(int li, llama_moe_cache * mc, seed_req sr, const std::vector<bool> * cur_used = nullptr) {
+    void start_bg(int li, llama_moe_cache * mc, seed_req sr, const std::vector<bool> * cur_used = nullptr, ggml_backend_t backend = nullptr) {
         GGML_ASSERT(!busy);
         const int p = li & 1;
         std::vector<llama_exps_prefetch::upload_job> jobs;
         size_t bytes = 0;
         static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
+        // LLAMA_DSV41_STAGE_BLIT: arena copies as one GPU blit (not while this reader also seeds the arena)
+        std::vector<blit_run> blits;
+        std::vector<blit_run> * bl = backend != nullptr && blit_mode() != 0 && arena_env && mc != nullptr && sr.li < 0 ? &blits : nullptr;
         // LLAMA_DSV41_STAGE_UNION: only the predicted experts have[p] (empty = the full tensors)
         const bool un = cur_used != nullptr && union_mode() != 0 && union_predict(li, *cur_used, have[p]);
         if (!un) {
@@ -585,7 +671,7 @@ struct llama_prefill_stage {
             head[p][k] = widen ? (size_t) (off % WPAGE) : 0;
             char * dst = base + head[p][k];
             if (un) {
-                bytes += (size_t) add_expert_runs(jobs, t, fd, off, dst, have[p], arena_env ? mc : nullptr)*t->nb[2];
+                bytes += (size_t) add_expert_runs(jobs, t, fd, off, dst, have[p], arena_env ? mc : nullptr, bl, buf[p][k])*t->nb[2];
                 un_full_bytes += ggml_nbytes(t);
                 continue;
             }
@@ -595,13 +681,18 @@ struct llama_prefill_stage {
                 const int64_t n_expert = t->ne[2];
                 const size_t  es       = t->nb[2];
                 for (int64_t e = 0; e < n_expert; ) {
-                    const void * a = mc->resident_expert(t, e);
+                    ggml_backend_buffer_t abuf = nullptr;
+                    const void * a = mc->resident_expert(t, e, &abuf);
                     int64_t n = 1;
                     if (a) {
                         while (e + n < n_expert && mc->resident_expert(t, e + n) == (const char *) a + n*es) {
                             n++;
                         }
-                        llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                        if (bl && abuf) {
+                            bl->push_back({ dst + e*es, buf[p][k], a, abuf, (size_t) (n*es) });
+                        } else {
+                            llama_exps_prefetch::add_upload(jobs, -1, 0, dst + e*es, n*es, a);
+                        }
                         arena_experts += n;
                     } else {
                         while (e + n < n_expert && mc->resident_expert(t, e + n) == nullptr) {
@@ -616,6 +707,10 @@ struct llama_prefill_stage {
                 }
             }
             bytes += ggml_nbytes(t);
+        }
+        if (bl) {
+            // queued now: after layer li-1 (synchronized by the caller), before any split of layer li is encoded
+            issue_blits(backend, blits, jobs);
         }
         staged[p] = li;
         busy = true;
@@ -640,6 +735,7 @@ struct llama_prefill_stage {
     void release() {
         restore();
         wait_bg();
+        blit_sync();
         bool any = false;
         for (auto & pb : buf) {
             for (auto & b : pb) {
@@ -669,6 +765,7 @@ struct llama_prefill_stage {
     void destroy() {
         restore();
         wait_bg();
+        blit_sync();
         if (stats_on()) {
             stats_print();
         }
@@ -680,6 +777,11 @@ struct llama_prefill_stage {
             }
             if (arena_experts + file_experts > 0) {
                 fprintf(stderr, "exps-prefetch stage: arena copies = %llu experts, file reads = %llu experts\n", (unsigned long long) arena_experts, (unsigned long long) file_experts);
+            }
+            if (blit_calls + blit_fallback > 0) {
+                fprintf(stderr, "exps-prefetch stage: arena blits = %llu layers (%llu runs, %.2f GiB, %s queue), not blitted = %llu layers\n",
+                        (unsigned long long) blit_calls, (unsigned long long) blit_runs_n, blit_bytes / (1024.0*1024.0*1024.0),
+                        blit_mode() == 2 ? "side" : "main", (unsigned long long) blit_fallback);
             }
             fprintf(stderr, "exps-prefetch stage: staged splits = %llu, fallback layers = %llu, reads = %llu (%.1f GiB, %.1f s on the reader, %.3f s exposed wait)\n",
                     (unsigned long long) n_staged_splits, (unsigned long long) n_fallback_layers, (unsigned long long) n_reads,
@@ -3758,6 +3860,11 @@ ggml_status llama_context::graph_compute(
     if (moe_cache) {
         moe_cache->set_graph(gf);
     }
+    if (auto * stg = llama_prefill_stage_get(this, false); stg && stg->blit_pending) {
+        // LLAMA_DSV41_STAGE_BLIT: a graph that ended before the layer of its last staging blit (prompt-skip head) left
+        // it queued; it reads arena slots that this graph may refill
+        stg->blit_sync();
+    }
     if (moe_cache && llama_prefill_stage::seed_n() > 0) {
         // arena seeding may still run on the staging thread after the last prefill graph: it must finish before a graph
         // that reads (or fills) the arena; staged graphs join it at their first layer anyway
@@ -3869,6 +3976,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         // first split of a new layer: everything queued before it (incl. layer li-1) must be done
                         // before the reader may overwrite the parity of li-1 with li+1
                         ggml_backend_synchronize(backend);
+                        if (stg->blit_backend == backend) {
+                            stg->blit_pending = false; // the synchronize also waited for the staging blits (both queues)
+                        }
+                        stg->blit_sync(); // blits queued on another backend (never expected)
                         stg->wait_bg();
                         static const bool arena_env = [] { const char * v = getenv("LLAMA_DSV41_PREFILL_ARENA"); return v && atoi(v) != 0; }();
                         if (llama_prefill_stage::union_mode() != 0) {
@@ -3901,7 +4012,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                             sr.n_rows = (int32_t) (ids->ne[1] - r0);
                         }
                         if (li + 1 < (int) stg->layers.size()) {
-                            stg->start_bg(li + 1, lctx->moe_cache.get(), std::move(sr), llama_prefill_stage::union_mode() != 0 ? &st.used : nullptr);
+                            stg->start_bg(li + 1, lctx->moe_cache.get(), std::move(sr), llama_prefill_stage::union_mode() != 0 ? &st.used : nullptr,
+                                    llama_prefill_stage::blit_mode() != 0 ? backend : nullptr);
                         } else if (sr.li >= 0) {
                             stg->start_seed_bg(lctx->moe_cache.get(), std::move(sr));
                         }

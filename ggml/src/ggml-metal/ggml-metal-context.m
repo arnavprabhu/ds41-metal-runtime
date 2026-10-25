@@ -68,6 +68,11 @@ struct ggml_metal {
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
 
+    // ggml_metal_cpy_tensors_async(side = true): blits on a second queue, concurrent with the main queue; waited for
+    // at the start of ggml_metal_synchronize
+    id<MTLCommandQueue> queue_side;
+    NSMutableArray * cmd_bufs_side;
+
     // buffers to release after async Metal operations complete
     // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
     NSMutableArray * buf_refs;
@@ -456,6 +461,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->cmd_bufs_ext = [[NSMutableArray alloc] init];
         res->buf_refs     = [[NSMutableArray alloc] init];
 
+        res->queue_side    = nil;
+        res->cmd_bufs_side = [[NSMutableArray alloc] init];
+
         res->cmd_buf_last = nil;
 
         res->pipelines_ext = ggml_metal_pipelines_init();
@@ -492,6 +500,17 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
+
+    for (int i = 0; i < (int) ctx->cmd_bufs_side.count; ++i) {
+        [ctx->cmd_bufs_side[i] waitUntilCompleted];
+        [ctx->cmd_bufs_side[i] release];
+    }
+    [ctx->cmd_bufs_side removeAllObjects];
+    [ctx->cmd_bufs_side release];
+    if (ctx->queue_side) {
+        [ctx->queue_side release];
+        ctx->queue_side = nil;
+    }
 
     @autoreleasepool {
         [ctx->buf_refs removeAllObjects];
@@ -535,6 +554,20 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    // side-queue blits (ggml_metal_cpy_tensors_async)
+    if (ctx->cmd_bufs_side.count > 0) {
+        for (size_t i = 0; i < ctx->cmd_bufs_side.count; ++i) {
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_side[i];
+            [cmd_buf waitUntilCompleted];
+            if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: side-queue command buffer %d failed with status %d\n", __func__, (int) i, (int) [cmd_buf status]);
+                ctx->has_error = true;
+            }
+            [cmd_buf release];
+        }
+        [ctx->cmd_bufs_side removeAllObjects];
+    }
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         const int64_t t_w = ctx->prof ? ggml_time_us() : 0;
@@ -755,6 +788,84 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         [cmd_buf retain];
 
         ggml_metal_event_wait(ctx_dst, ev_cpy);
+
+        return true;
+    }
+}
+
+bool ggml_metal_cpy_tensors_async(ggml_metal_t ctx, int n, const struct ggml_tensor * const * src, struct ggml_tensor * const * dst, bool side) {
+    if (n <= 0) {
+        return true;
+    }
+    @autoreleasepool {
+        // all or nothing: check every pair before queuing anything
+        for (int i = 0; i < n; ++i) {
+            const struct ggml_metal_buffer_id bs = ggml_metal_get_buffer_id(src[i]);
+            const struct ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(dst[i]);
+            if (bs.metal == nil || bd.metal == nil || ggml_nbytes(src[i]) != ggml_nbytes(dst[i])) {
+                return false;
+            }
+        }
+
+        if (side) {
+            // no ordering against the main queue: the caller synchronized before and synchronizes before any reader
+            if (ctx->queue_side == nil) {
+                id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
+                ctx->queue_side = [device newCommandQueue];
+                if (ctx->queue_side == nil) {
+                    return false;
+                }
+            }
+            id<MTLCommandBuffer> cmd_buf = [ctx->queue_side commandBuffer];
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+            for (int i = 0; i < n; ++i) {
+                const struct ggml_metal_buffer_id bs = ggml_metal_get_buffer_id(src[i]);
+                const struct ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(dst[i]);
+                [encoder copyFromBuffer:bs.metal
+                           sourceOffset:bs.offs
+                               toBuffer:bd.metal
+                      destinationOffset:bd.offs
+                                   size:ggml_nbytes(src[i])];
+            }
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [ctx->cmd_bufs_side addObject:cmd_buf];
+            [cmd_buf retain];
+            return true;
+        }
+
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+        // same ordering as ggml_metal_cpy_tensor_async: after all queued work, and later work waits for the copies
+        id<MTLCommandBuffer> sync_cmd_buf = [queue commandBuffer];
+        ggml_metal_event_encode_signal(ctx->ev_sync, sync_cmd_buf);
+        [sync_cmd_buf commit];
+        [ctx->cmd_bufs_ext addObject:sync_cmd_buf];
+        ctx->cmd_buf_last = sync_cmd_buf;
+        [sync_cmd_buf retain];
+
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        ggml_metal_event_encode_wait(ctx->ev_sync, cmd_buf);
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        for (int i = 0; i < n; ++i) {
+            const struct ggml_metal_buffer_id bs = ggml_metal_get_buffer_id(src[i]);
+            const struct ggml_metal_buffer_id bd = ggml_metal_get_buffer_id(dst[i]);
+            [encoder copyFromBuffer:bs.metal
+                       sourceOffset:bs.offs
+                           toBuffer:bd.metal
+                  destinationOffset:bd.offs
+                               size:ggml_nbytes(src[i])];
+        }
+        [encoder endEncoding];
+
+        ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx);
+        ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
+        [cmd_buf commit];
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+        [cmd_buf retain];
+
+        ggml_metal_event_wait(ctx, ev_cpy);
 
         return true;
     }
