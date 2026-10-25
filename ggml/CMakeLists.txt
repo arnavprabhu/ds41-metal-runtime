@@ -329,19 +329,9 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
-    include/ggml-blas.h
-    include/ggml-cann.h
     include/ggml-cpp.h
-    include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-metal.h
-    include/ggml-rpc.h
-    include/ggml-virtgpu.h
-    include/ggml-sycl.h
-    include/ggml-vulkan.h
-    include/ggml-webgpu.h
-    include/ggml-zendnn.h
-    include/ggml-openvino.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
