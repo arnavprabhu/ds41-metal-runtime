@@ -255,6 +255,46 @@ struct moe_cache_lru {
         key_of[slot] = -1;
     }
 
+    // prefill arena seeding (LLAMA_DSV41_MOE_SEED_STAGE): counts [n_expert] are the selections of layer il over the last
+    // n_rows prompt rows. lfu-decay: they are added to the heat as if those rows had been decoded. Then up to max_n of the
+    // most selected experts that are not resident get a slot (prefetch_take: an empty slot, or a victim colder than the
+    // expert; the resident experts of the list are protected and touched). Returns the (expert, slot) pairs to fill.
+    void seed_take(int32_t il, const float * counts, int32_t n_rows, int32_t max_n, std::vector<fill> & fills) {
+        fills.clear();
+        std::vector<int32_t> order;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            if (counts[e] > 0.0f) {
+                order.push_back(e);
+            }
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return counts[a] > counts[b]; });
+        if ((int32_t) order.size() > max_n) {
+            order.resize(max_n);
+        }
+        if (evict == evict_kind::lfu_decay) {
+            note_tokens(n_rows);
+            float * row = heat.data() + (size_t) il * (size_t) n_expert;
+            for (int32_t e = 0; e < n_expert; ++e) {
+                row[e] += counts[e];
+            }
+        }
+        int32_t * slots = slot_map[il];
+        for (int32_t e : order) {
+            if (slots[e] >= 0) {
+                touch(slots[e]);
+            }
+        }
+        prefetch_begin(il, order.data(), order.size());
+        for (int32_t e : order) {
+            fill f;
+            if (slots[e] < 0 && prefetch_take(il, e, 0.0f, f)) {
+                touch(f.slot);
+                fills.push_back(f);
+            }
+        }
+        prefetch_end();
+    }
+
 private:
     void read_env() {
         decay = k_decay_default;

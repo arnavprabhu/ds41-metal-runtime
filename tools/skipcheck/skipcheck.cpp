@@ -91,7 +91,33 @@ int main(int argc, char ** argv) {
     }
     const int n_gen = getenv("SKIPCHK_GEN") ? atoi(getenv("SKIPCHK_GEN")) : (int) forced.size();
     std::vector<llama_token> gen;
-    for (int k = 0; k < n_gen; ++k) {
+    // SKIPCHK_BATCH=N (with SKIPCHK_FORCE): feed the forced tokens N at a time with logits on every row (batched path
+    // instead of single-token decode; same rows and semantics), to locate decode-only numeric differences
+    const int n_chunk = getenv("SKIPCHK_BATCH") ? atoi(getenv("SKIPCHK_BATCH")) : 0;
+    if (n_chunk > 0 && !forced.empty()) {
+        std::vector<llama_token> all(n_prompt, 0);
+        all.insert(all.end(), forced.begin(), forced.end());
+        for (int k0 = 0; k0 < n_gen; k0 += n_chunk) {
+            const int k1 = std::min(n_gen, k0 + n_chunk);
+            llama_batch_ext_clear(batch);
+            for (int k = k0; k < k1; ++k) {
+                const int32_t idx = llama_batch_ext_add_token(batch, 0, all[n_prompt + k]);
+                const llama_pos pos = n_prompt + k;
+                llama_batch_ext_set_pos(batch, idx, &pos);
+                llama_batch_ext_set_output_logits(batch, k - k0, true);
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+                fprintf(stderr, "batched gen decode failed\n");
+                return 1;
+            }
+            for (int k = k0; k < k1; ++k) {
+                const float * l = llama_get_logits_ith(ctx, k - k0);
+                rows.insert(rows.end(), l, l + n_vocab);
+                gen.push_back(all[n_prompt + k]);
+            }
+        }
+    }
+    for (int k = (n_chunk > 0 && !forced.empty()) ? n_gen : 0; k < n_gen; ++k) {
         const llama_token feed = k < (int) forced.size() ? forced[k] : next;
         gen.push_back(feed);
         std::vector<llama_token> one(n_prompt + k + 1, 0);

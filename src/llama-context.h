@@ -235,6 +235,7 @@ private:
     uint32_t prompt_skip_head_rows(const llama_batch_ext & batch, bool output_all);
 
     std::array<int32_t, LLAMA_MAX_SEQ> prompt_total = {}; // per sequence, 0 = no hint
+    bool ubatch_has_output = true; // the ubatch being computed requests an output (prefill arena seeding: LLAMA_DSV41_MOE_SEED_LAST)
 
     //
     // output

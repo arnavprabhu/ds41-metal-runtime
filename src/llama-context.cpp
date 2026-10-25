@@ -43,6 +43,11 @@
 //   LLAMA_DSV41_PREFILL_STAGE=1             enable
 //   LLAMA_DSV41_STAGE_MIN_TOKENS=N          only for ubatches with at least N tokens (default 1024)
 //   LLAMA_DSV41_STAGE_THREADS=N             reader threads (default 8)
+//   LLAMA_DSV41_MOE_SEED_STAGE=N            arena seeding: after the reader of layer i+1, the staging thread gives MoE arena
+//                                           slots to up to N experts of layer i most selected by the ubatch's last
+//                                           LLAMA_DSV41_MOE_SEED_ROWS (256) rows and memcpys them from layer i's staging
+//                                           set (no SSD read), so the first decode tokens after a prompt hit the arena.
+//                                           0 = off (default). Lossless (residency only).
 namespace {
 
 struct llama_prefill_stage {
@@ -70,6 +75,41 @@ struct llama_prefill_stage {
     ggml_backend_buffer_t rp_buf   = nullptr;
     void *                rp_data  = nullptr;
     const ggml_cgraph *   rp_graph = nullptr;
+
+    // arena seeding (LLAMA_DSV41_MOE_SEED_STAGE)
+    struct seed_req {
+        int li = -1;               // layer order index whose staging set is copied from
+        int32_t n_rows = 0;
+        std::vector<float> counts; // [n_expert] selections of the last n_rows rows
+    };
+    static int seed_n() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_MOE_SEED_STAGE"); return v ? std::max(0, atoi(v)) : 0; }();
+        return n;
+    }
+    static int seed_rows() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_MOE_SEED_ROWS"); return v ? std::max(1, atoi(v)) : 256; }();
+        return n;
+    }
+    // runs on the staging thread: layer sr.li must be held by its parity and stay there until the thread is joined
+    void seed_run(llama_moe_cache * mc, const seed_req & sr) {
+        if (mc == nullptr || sr.li < 0 || staged[sr.li & 1] != sr.li) {
+            return;
+        }
+        const int p = sr.li & 1;
+        mc->seed_layer(layers[sr.li][0], sr.counts.data(), sr.n_rows, seed_n(), [&](const ggml_tensor * t, int64_t e) -> const void * {
+            const auto it = where.find(t->data);
+            if (it == where.end() || it->second.first != sr.li) {
+                return nullptr;
+            }
+            return (const char *) ggml_backend_buffer_get_base(buf[p][it->second.second]) + (size_t) e*t->nb[2];
+        });
+    }
+    // seeding of the last layer, which has no next reader to follow
+    void start_seed_bg(llama_moe_cache * mc, seed_req sr) {
+        GGML_ASSERT(!busy);
+        busy = true;
+        th = std::thread([this, mc, sr = std::move(sr)]() { seed_run(mc, sr); });
+    }
 
     // stats
     uint64_t n_staged_splits = 0, n_fallback_layers = 0, n_reads = 0, read_bytes = 0, wait_us = 0, read_us = 0;
@@ -133,6 +173,9 @@ struct llama_prefill_stage {
     // LLAMA_DSV41_PREFILL_ARENA=1: experts resident in the MoE arena are copied from it instead of read from the file
     uint64_t arena_experts = 0, file_experts = 0;
     void start_bg(int li, llama_moe_cache * mc) {
+        start_bg(li, mc, seed_req());
+    }
+    void start_bg(int li, llama_moe_cache * mc, seed_req sr) {
         GGML_ASSERT(!busy);
         const int p = li & 1;
         std::vector<llama_exps_prefetch::upload_job> jobs;
@@ -177,10 +220,12 @@ struct llama_prefill_stage {
         busy = true;
         n_reads++;
         read_bytes += bytes;
-        th = std::thread([this, jobs = std::move(jobs)]() {
+        th = std::thread([this, mc, jobs = std::move(jobs), sr = std::move(sr)]() {
             const auto t0 = std::chrono::steady_clock::now();
             llama_exps_prefetch::upload_bg(jobs);
             read_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+            // after the reader: no in-flight read of layer li+1 can be hit by a seeding eviction
+            seed_run(mc, sr);
         });
     }
 
@@ -2065,6 +2110,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (hs) { hs_t3 = host_now_ms(); }
+    // a prompt's last staged ubatch: it requests an output, or it is not full (the server holds back the last tokens of a
+    // prompt for a checkpoint, so the ubatch with the output is often a small one that is not staged)
+    ubatch_has_output = ubatch.n_tokens < cparams.n_ubatch;
+    for (uint32_t i = 0; i < ubatch.n_tokens && ubatch.output && !ubatch_has_output; ++i) {
+        ubatch_has_output = ubatch.output[i] != 0;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (hs) {
         const double t4 = host_now_ms();
@@ -3264,6 +3315,13 @@ ggml_status llama_context::graph_compute(
     if (moe_cache) {
         moe_cache->set_graph(gf);
     }
+    if (moe_cache && llama_prefill_stage::seed_n() > 0) {
+        // arena seeding may still run on the staging thread after the last prefill graph: it must finish before a graph
+        // that reads (or fills) the arena; staged graphs join it at their first layer anyway
+        if (auto * stg = llama_prefill_stage_get(this, false); stg && stg->busy) {
+            stg->wait_bg();
+        }
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (auto * stg = llama_prefill_stage_get(this, false)) {
@@ -3374,8 +3432,26 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         if (!stg->cur_have) {
                             stg->n_fallback_layers++;
                         }
+                        llama_prefill_stage::seed_req sr;
+                        // LLAMA_DSV41_MOE_SEED_LAST=1 (default): only the ubatch that requests an output (a prompt's last
+                        // ubatch; mid-prompt ubatches would churn the arena with experts the next ubatch evicts again)
+                        static const bool seed_last = [] { const char * v = getenv("LLAMA_DSV41_MOE_SEED_LAST"); return v == nullptr || atoi(v) != 0; }();
+                        if (stg->cur_have && lctx->moe_cache && llama_prefill_stage::seed_n() > 0 && (!seed_last || lctx->ubatch_has_output)) {
+                            // the selections of the ubatch's last rows (ids [n_expert_used, n_tokens], read above)
+                            sr.li = li;
+                            sr.counts.assign(n_expert, 0.0f);
+                            const int64_t r0 = std::max<int64_t>(0, ids->ne[1] - llama_prefill_stage::seed_rows());
+                            for (int64_t i1 = r0; i1 < ids->ne[1]; i1++) {
+                                for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                                    sr.counts[st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)]] += 1.0f;
+                                }
+                            }
+                            sr.n_rows = (int32_t) (ids->ne[1] - r0);
+                        }
                         if (li + 1 < (int) stg->layers.size()) {
-                            stg->start_bg(li + 1, lctx->moe_cache.get());
+                            stg->start_bg(li + 1, lctx->moe_cache.get(), std::move(sr));
+                        } else if (sr.li >= 0) {
+                            stg->start_seed_bg(lctx->moe_cache.get(), std::move(sr));
                         }
                     }
                     if (stg->cur_have) {

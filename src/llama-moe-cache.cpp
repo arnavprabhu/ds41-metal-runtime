@@ -1144,6 +1144,10 @@ struct llama_moe_cache::impl {
                 pfs.cancelled, pfs.wasted_started, pfs.inflight_masked, pfs.resolve_wait_us/1000.0, pfs.join_wait_us/1000.0, pfs.launch_us/1000.0);
         }
         pred_wait();
+        if (seed_st.layers > 0) {
+            fprintf(stderr, "llama_moe_cache: prefill seeding: layers = %zu, experts = %zu (%.2f MiB), %.1f ms on the staging thread\n",
+                seed_st.layers, seed_st.experts, seed_st.bytes/1024.0/1024.0, seed_st.us/1000.0);
+        }
         log_arena("teardown");
         log_stats();
         if (pst.launched > 0) {
@@ -1182,6 +1186,63 @@ struct llama_moe_cache::impl {
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
     }
+
+    // LLAMA_DSV41_MOE_SEED_STAGE (prefill arena seeding): w is a host expert tensor of a cached layer, counts [n_expert] the
+    // selections of that layer over the last n_rows prompt rows. Gives slots to up to max_n of the most selected experts
+    // (moe_cache_lru::seed_take) and copies their bytes from src(host tensor, e), a CPU address holding expert e (the prefill
+    // staging set, same bytes as the file). Runs on the staging thread while the GPU computes the prefill: no decode graph
+    // and no arena read by the GPU may run concurrently (large ubatches do not read the arena; the caller joins before a
+    // small ubatch). Lossless: the arena only holds file bytes, outputs do not depend on residency. Returns bytes copied.
+    size_t seed_layer(const ggml_tensor * w, const float * counts, int32_t n_rows, int32_t max_n,
+            const std::function<const void *(const ggml_tensor *, int64_t)> & src) {
+        const auto it = bindings.find(w);
+        if (it == bindings.end()) {
+            return 0;
+        }
+        const int32_t il = it->second.il;
+        const layer & l = layers[il];
+        group & g = groups[l.ig];
+        if (g.lru.slot_map[il] == nullptr) {
+            return 0;
+        }
+        const is_shared_fn is_shared = get_is_shared(devices[g.id].backend);
+        for (const ggml_tensor * bank : g.banks) {
+            if (is_shared == nullptr || bank->data == nullptr || bank->buffer == nullptr || !is_shared(bank->buffer)) {
+                return 0;
+            }
+        }
+        // nothing else may write a slot that the plan below hands out
+        overlap_drain();
+        pf_flush();
+        pred_wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        g.lru.seed_take(il, counts, n_rows, max_n, fills);
+        size_t bytes = 0;
+        size_t slot_bytes = 0;
+        for (const ggml_tensor * t : l.experts) {
+            slot_bytes += t->nb[2];
+        }
+        for (const auto & f : fills) {
+            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                const ggml_tensor * t = l.experts[ip];
+                const size_t es = t->nb[2];
+                const void * s = src(t, f.expert);
+                GGML_ASSERT(s != nullptr);
+                memcpy((char *) g.banks[ip]->data + (size_t) f.slot*es, s, es);
+                bytes += es;
+            }
+            if (!g.filled[f.slot]) {
+                g.filled[f.slot] = true;
+                g.filled_bytes += slot_bytes;
+            }
+        }
+        seed_st.layers++;
+        seed_st.experts += fills.size();
+        seed_st.bytes   += bytes;
+        seed_st.us      += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        return bytes;
+    }
+    struct { size_t layers = 0, experts = 0, bytes = 0; uint64_t us = 0; } seed_st;
 
     // LLAMA_DSV41_PREFILL_ARENA=1: address of expert e of the host tensor w inside the arena (shared memory), nullptr if it is
     // not resident or the arena is not CPU-addressable. Read-only: no heat, no recency change, bytes identical to the file.
@@ -1702,6 +1763,11 @@ int llama_moe_cache_predict_k() {
 
 const void * llama_moe_cache::resident_expert(const ggml_tensor * w, int64_t e) {
     return pimpl->resident_expert(w, e);
+}
+
+size_t llama_moe_cache::seed_layer(const ggml_tensor * w, const float * counts, int32_t n_rows, int32_t max_n,
+        const std::function<const void *(const ggml_tensor *, int64_t)> & src) {
+    return pimpl->seed_layer(w, counts, n_rows, max_n, src);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

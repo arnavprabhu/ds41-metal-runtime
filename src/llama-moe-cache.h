@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -47,6 +48,12 @@ public:
 
     // pointer to expert e of the host tensor w inside the arena if it is resident (CPU-addressable shared memory), else nullptr
     const void * resident_expert(const ggml_tensor * w, int64_t e);
+
+    // prefill arena seeding (LLAMA_DSV41_MOE_SEED_STAGE): give slots to up to max_n of the experts most selected by the
+    // last n_rows prompt rows (counts [n_expert]) of the layer of host expert tensor w, copying their bytes from src(t, e).
+    // Must not run concurrently with a graph that reads the arena. Returns the bytes copied.
+    size_t seed_layer(const ggml_tensor * w, const float * counts, int32_t n_rows, int32_t max_n,
+            const std::function<const void *(const ggml_tensor *, int64_t)> & src);
 
     // the graph about to be computed: picks up the next-layer prediction tensors (LLAMA_DSV41_MOE_PREDICT=1)
     void set_graph(ggml_cgraph * gf);
