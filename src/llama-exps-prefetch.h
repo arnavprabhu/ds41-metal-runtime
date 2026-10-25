@@ -68,6 +68,11 @@ void add_upload(std::vector<upload_job> & jobs, int fd, uint64_t file_off, void 
 // runs the jobs on the upload pool (the caller helps) and returns when all bytes are in place
 void upload(const std::vector<upload_job> & jobs);
 
+// asynchronous upload on the same pool as upload(): upload_begin() starts the workers and returns, upload_end() helps
+// and returns when all bytes are in place. The jobs vector must stay alive and unchanged until upload_end().
+void upload_begin(const std::vector<upload_job> & jobs);
+void upload_end();
+
 // same as upload() on a separate pool (LLAMA_DSV41_STAGE_THREADS, default 8), callable from one background thread
 // concurrently with upload() on the scheduler thread
 void upload_bg(const std::vector<upload_job> & jobs);

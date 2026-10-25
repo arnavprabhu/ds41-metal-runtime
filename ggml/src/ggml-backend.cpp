@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -968,6 +969,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    ggml_backend_sched_copy_nosync_callback callback_copy_nosync;
+    void * callback_copy_nosync_user_data;
 
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
@@ -1527,7 +1530,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
+                            if (sched->n_copies > 1 || (src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                                // (a host weight flagged as output) keep a private region: its copy can be written while earlier splits still run
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
@@ -1837,6 +1841,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // host weights whose copy callback does not need the split backend to be idle (their copy tensor has a private region)
+    if (sched->callback_copy != NULL && sched->callback_copy_nosync != NULL && ggml_backend_sched_is_host_weight(input) &&
+        sched->callback_copy_nosync(input, sched->callback_copy_nosync_user_data) &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1862,9 +1873,34 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// GGML_SCHED_HOST_STATS=1: time spent per phase of ggml_backend_sched_compute_splits, graphs of one input token (diagnostics only)
+struct ggml_sched_host_stats {
+    bool on = false;
+    double t_presync = 0, t_copy = 0, t_copy_w = 0, t_compute_gpu = 0, t_compute_cpu = 0, t_total = 0;
+    long   n_graphs = 0, n_splits = 0, n_split_gpu = 0, n_split_cpu = 0;
+    ggml_sched_host_stats() {
+        const char * v = getenv("GGML_SCHED_HOST_STATS");
+        on = v && atoi(v) != 0;
+        if (on) { atexit([] { extern ggml_sched_host_stats g_sched_host_stats; g_sched_host_stats.print(); }); }
+    }
+    void print() const {
+        if (!n_graphs) return;
+        fprintf(stderr, "ggml_sched_host_stats: graphs = %ld, per graph: splits %.1f (gpu %.1f, cpu %.1f), ms: presync %.3f, copy_input(non-weight) %.3f, copy_input(host weights/fill) %.3f, "
+            "graph_compute_async gpu %.3f cpu %.3f, total %.3f\n", n_graphs, (double) n_splits/n_graphs, (double) n_split_gpu/n_graphs, (double) n_split_cpu/n_graphs,
+            t_presync/n_graphs, t_copy/n_graphs, t_copy_w/n_graphs, t_compute_gpu/n_graphs, t_compute_cpu/n_graphs, t_total/n_graphs);
+    }
+};
+ggml_sched_host_stats g_sched_host_stats;
+static inline double sched_now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    ggml_sched_host_stats & hs = g_sched_host_stats;
+    const bool hon = hs.on;
+    double h_tot0 = hon ? sched_now_ms() : 0;
 
     int prev_backend_id = -1;
 
@@ -1873,6 +1909,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        double h0 = hon ? sched_now_ms() : 0;
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1883,6 +1920,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        double h1 = hon ? sched_now_ms() : 0;
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1890,16 +1928,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        double h2 = hon ? sched_now_ms() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id]);
             }
         }
+        double h3 = hon ? sched_now_ms() : 0;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (hon) {
+                const double h4 = sched_now_ms();
+                const bool is_cpu = split_backend_id == sched->n_backends - 1;
+                hs.t_presync += h1 - h0; hs.t_copy += h2 - h1; hs.t_copy_w += h3 - h2;
+                (is_cpu ? hs.t_compute_cpu : hs.t_compute_gpu) += h4 - h3;
+                hs.n_splits++; (is_cpu ? hs.n_split_cpu : hs.n_split_gpu)++;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1943,6 +1990,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (hon) { hs.n_graphs++; hs.t_total += sched_now_ms() - h_tot0; }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2153,6 +2201,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_nosync_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_nosync_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_nosync = callback;
+    sched->callback_copy_nosync_user_data = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

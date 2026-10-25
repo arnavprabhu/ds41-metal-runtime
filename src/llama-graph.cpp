@@ -1728,11 +1728,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * slots) const {
+          ggml_tensor * slots,
+          ggml_tensor * acc) const {
     cur = build_hadamard_input(w, cur);
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
+        acc != nullptr ?
+        ggml_mul_mat_id_acc(ctx0, acc, moe_cache->get_experts(w), cur, slots) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
 
     if (prec_policy) {
@@ -2378,8 +2381,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    // MoE cache overlap mode (decode of one token): the layer is split in two, the first split (hit map) plans the layer and starts
+    // reading the missing experts, and computes the shared expert (level 1) and the experts already in the arena (level 2) while
+    // the experts are read; the second split (fill map) waits for the read and computes the rest
+    ggml_tensor * slots   = nullptr;
+    ggml_tensor * slots_h = nullptr;
+    ggml_tensor * slots_m = nullptr;
+    ggml_tensor * overlap_map_m = nullptr;
+    int overlap = 0;
+    if (moe_overlap_hook && moe_cache != nullptr && arch == LLM_ARCH_DEEPSEEK41 && n_tokens == 1 && moe_cache->overlap_level() != 0 &&
+            gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr &&
+            up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
+            up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
+            !weight_before_ffn && type_op == LLM_FFN_SILU && post_exp_norm == nullptr) {
+        ggml_tensor * map_h = nullptr;
+        ggml_tensor * map_m = nullptr;
+        bool ok = moe_cache->get_slot_maps(il, n_tokens, n_expert_used, &map_h, &map_m);
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps }) {
+            ok = ok && moe_cache->get_experts(w) != nullptr;
+        }
+        if (ok) {
+            overlap = moe_cache->overlap_level();
+            slots_h = build_moe_cache_lookup(map_h, selected_experts, il);
+            moe_overlap_hook();
+            moe_overlap_hook = nullptr;
+            // the lookup of the fill map starts the second split: level 1 builds it now, level 2 after its first pass
+            if (overlap < 2) {
+                slots_m = build_moe_cache_lookup(map_m, selected_experts, il);
+                slots   = slots_m;
+            }
+            overlap_map_m = map_m;
+        }
+    } else {
+        // the experts of host-resident layers may be read from the MoE cache
+        slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    }
 
     // LLAMA_DSV41_PREFETCH_OFFLOADED=0: with op offload the ubatches >= the offload min batch run MUL_MAT_ID on Metal
     // and the pread uploader is the only reader of the experts, so the F_RDADVISE prefetch would only read twice
@@ -2393,7 +2429,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return (int64_t) (v ? atoi(v) : 32);
     }();
     const bool skip_prefetch = !prefetch_offloaded && n_tokens >= offload_min_batch;
-    if (slots == nullptr && arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled() && !skip_prefetch) {
+    if (slots == nullptr && overlap == 0 && arch == LLM_ARCH_DEEPSEEK41 && llama_exps_prefetch::enabled() && !skip_prefetch) {
         build_moe_exps_prefetch(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
     }
 
@@ -2409,6 +2445,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    if (overlap >= 2) {
+        // pass 1 (first split): the experts already in the arena, the rows of the others are skipped (negative slot)
+        // pass 2 (second split): the experts the fill brought, written into the same buffers
+        const float limit = hparams.swiglu_clamp_exp[il];
+        constexpr float eps = 1e-6f;
+        auto act = [&](ggml_tensor * g, ggml_tensor * u) {
+            return limit > eps ? ggml_swiglu_clamp(ctx0, g, u, limit) : ggml_swiglu_split(ctx0, g, u);
+        };
+        ggml_tensor * g1 = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr, slots_h);
+        cb(g1, "ffn_moe_gate_hit", il);
+        ggml_tensor * u1 = build_lora_mm_id(up_exps, cur, selected_experts, nullptr, slots_h);
+        cb(u1, "ffn_moe_up_hit", il);
+        ggml_tensor * a1 = act(g1, u1);
+        cb(a1, "ffn_moe_act_hit", il);
+        ggml_tensor * d1 = build_lora_mm_id(down_exps, a1, selected_experts, nullptr, slots_h);
+        cb(d1, "ffn_moe_down_hit", il);
+        ggml_build_forward_expand(gf, d1);
+
+        slots_m = build_moe_cache_lookup(overlap_map_m, selected_experts, il);
+        slots   = slots_m;
+
+        ggml_tensor * g2 = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr, slots_m, g1);
+        cb(g2, "ffn_moe_gate_fill", il);
+        ggml_tensor * u2 = build_lora_mm_id(up_exps, cur, selected_experts, nullptr, slots_m, u1);
+        cb(u2, "ffn_moe_up_fill", il);
+        ggml_tensor * a2 = act(g2, u2);
+        cb(a2, "ffn_moe_act_fill", il);
+        experts = build_lora_mm_id(down_exps, a2, selected_experts, nullptr, slots_m, d1);
+        cb(experts, "ffn_moe_down", il);
+    } else {
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
@@ -2550,6 +2616,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);
@@ -2677,6 +2744,25 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     cb(slots, "ffn_moe_slots", il);
 
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
+    ggml_build_forward_expand(gf, slots);
+
+    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+}
+
+// the lookup of a hit or fill map of the MoE cache overlap mode: a host weight, so the scheduler starts a new split here
+ggml_tensor * llm_graph_context::build_moe_cache_lookup(
+         ggml_tensor * map,
+         ggml_tensor * selected_experts,
+                 int   il) const {
+    ggml_tensor * ids = selected_experts;
+    if (!ggml_is_contiguous(ids)) {
+        ids = ggml_cont(ctx0, ids);
+    }
+    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+
+    ggml_tensor * slots = ggml_get_rows(ctx0, map, ids); // [1, n_expert_used*n_tokens]
+    ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
+    cb(slots, "ffn_moe_slots", il);
     ggml_build_forward_expand(gf, slots);
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
