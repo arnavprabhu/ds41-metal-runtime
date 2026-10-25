@@ -619,7 +619,7 @@ llama_context::llama_context(
         if (v && strcmp(v, "auto") == 0) {
             // allocated at the maximum, limited after the compute buffers are reserved (see below)
             const char * mx = getenv("LLAMA_DSV41_MOE_CACHE_MAX_MIB");
-            mib = mx ? atoll(mx) : 45056;
+            mib = mx ? atoll(mx) : 40960;
             moe_cache_auto = true;
         }
         if (mib > 0) {
@@ -1018,7 +1018,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 }
 
 // LLAMA_DSV41_MOE_CACHE_MIB=auto: arena = RAM*frac - (dense weights + KV + compute buffers + prefill staging + margin), in
-// [LLAMA_DSV41_MOE_CACHE_MIN_MIB (4096), LLAMA_DSV41_MOE_CACHE_MAX_MIB (45056)]. frac = LLAMA_DSV41_MOE_RAM_FRAC (0.90),
+// [LLAMA_DSV41_MOE_CACHE_MIN_MIB (4096), LLAMA_DSV41_MOE_CACHE_MAX_MIB (40960)]. frac = LLAMA_DSV41_MOE_RAM_FRAC (0.90),
 // margin = LLAMA_DSV41_MOE_MARGIN_MIB (3072).
 void llama_context::moe_cache_auto_size() {
     uint64_t phys = 0;
@@ -1032,7 +1032,7 @@ void llama_context::moe_cache_auto_size() {
     const double frac = envd("LLAMA_DSV41_MOE_RAM_FRAC", 0.90);
     const double margin = envd("LLAMA_DSV41_MOE_MARGIN_MIB", 3072.0)*mib;
     const double lo = envd("LLAMA_DSV41_MOE_CACHE_MIN_MIB", 4096.0)*mib;
-    const double hi = envd("LLAMA_DSV41_MOE_CACHE_MAX_MIB", 45056.0)*mib;
+    const double hi = envd("LLAMA_DSV41_MOE_CACHE_MAX_MIB", 40960.0)*mib;
     double dense = 0, kv = 0, compute = 0;
     for (const auto & [buft, size] : model.memory_breakdown()) {
         if (!ggml_backend_buft_is_host(buft)) {
