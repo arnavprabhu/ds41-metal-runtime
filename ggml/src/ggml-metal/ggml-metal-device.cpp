@@ -1551,10 +1551,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     };
 
     if (ggml_metal_ds41_iq() && !split && tsrc1 == GGML_TYPE_F32 && ne00 % 256 == 0 && op->src[1]->nb[1] % 16 == 0) {
+        const bool x2 = (ne00/32) % 32 != 0;
         switch (tsrc0) {
-            case GGML_TYPE_IQ1_M:   nsg = 4; nr0 = 8; smem = 2048*4 + 82*8;   suffix = "_x1"; break;
-            case GGML_TYPE_IQ2_XXS: nsg = 4; nr0 = 4; smem = (256 + 128)*16;  suffix = "_x1"; break;
-            case GGML_TYPE_IQ2_XS:  nsg = 4; nr0 = 4; smem = (512 + 128)*16;  suffix = "_x1"; break;
+            // x2: 4 row groups of 8 lanes per simdgroup when a row's 32-weight chunks do not split evenly over 32 lanes
+            // (DS41 ffn_down: k = 2304 -> 72 chunks); nr0 = rows per simdgroup (dispatch)
+            case GGML_TYPE_IQ1_M:   nsg = 4; nr0 = x2 ? 16 : 8; smem = 2048*4 + 82*8;   suffix = x2 ? "_x2" : "_x1"; break;
+            case GGML_TYPE_IQ2_XXS: nsg = 4; nr0 = x2 ?  8 : 4; smem = (256 + 128)*16;  suffix = x2 ? "_x2" : "_x1"; break;
+            case GGML_TYPE_IQ2_XS:  nsg = 4; nr0 = x2 ? 16 : 4; smem = (512 + 128)*16;  suffix = x2 ? "_x2" : "_x1"; break;
             default: break;
         }
     }
