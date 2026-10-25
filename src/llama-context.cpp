@@ -48,6 +48,18 @@
 //                                           LLAMA_DSV41_MOE_SEED_ROWS (256) rows and memcpys them from layer i's staging
 //                                           set (no SSD read), so the first decode tokens after a prompt hit the arena.
 //                                           0 = off (default). Lossless (residency only).
+//   LLAMA_DSV41_STAGE_STATS=1               stats only (printed when the context is freed): per staged-size ubatch layer, the
+//                                           union of the experts selected by the ubatch vs the full tensors the stage reads,
+//                                           a histogram of the union fraction, per-ubatch lines and the recall / precision of
+//                                           two read-ahead predictors (previous layer's selection, previous ubatch's selection
+//                                           of the same layer). Lossless (no behaviour change).
+//   LLAMA_DSV41_STAGE_WIDEN=1               page-widened F_NOCACHE staging reads: the GGUF expert tensors start at file
+//                                           offsets that are not 16 KiB aligned (32-byte GGUF alignment), so the reads are
+//                                           misaligned and go through the cached fd. With WIDEN the staging buffers get
+//                                           2 pages of slack, the reader preads [align_down(off), align_up(off + len)) on the
+//                                           F_NOCACHE fd into the page-aligned buffer base and the tensor data is pointed at
+//                                           base + off % 16 KiB (same bytes). =2: same widening on the cached fd.
+//                                           0 = off (default). Lossless (identical bytes).
 namespace {
 
 struct llama_prefill_stage {
@@ -101,7 +113,7 @@ struct llama_prefill_stage {
             if (it == where.end() || it->second.first != sr.li) {
                 return nullptr;
             }
-            return (const char *) ggml_backend_buffer_get_base(buf[p][it->second.second]) + (size_t) e*t->nb[2];
+            return (const char *) stage_data(p, it->second.second) + (size_t) e*t->nb[2];
         });
     }
     // seeding of the last layer, which has no next reader to follow
@@ -113,6 +125,185 @@ struct llama_prefill_stage {
 
     // stats
     uint64_t n_staged_splits = 0, n_fallback_layers = 0, n_reads = 0, read_bytes = 0, wait_us = 0, read_us = 0;
+
+    // page-widened staging reads (LLAMA_DSV41_STAGE_WIDEN)
+    static constexpr size_t WPAGE = 16384;
+    static int widen_mode() {
+        static const int n = [] { const char * v = getenv("LLAMA_DSV41_STAGE_WIDEN"); return v ? std::max(0, atoi(v)) : 0; }();
+        return n;
+    }
+    bool     widen = false;
+    size_t   head[2][N_KIND] = {}; // offset of the tensor data inside the staging buffer, per parity / kind
+    uint64_t widen_jobs = 0, widen_extra_bytes = 0, widen_tail_clamped = 0, widen_fallback = 0;
+    char * stage_data(int p, int k) const {
+        return (char *) ggml_backend_buffer_get_base(buf[p][k]) + head[p][k];
+    }
+
+    // selected-expert union stats (LLAMA_DSV41_STAGE_STATS)
+    static bool stats_on() {
+        static const bool on = [] { const char * v = getenv("LLAMA_DSV41_STAGE_STATS"); return v && atoi(v) != 0; }();
+        return on;
+    }
+    struct ss_ubatch {
+        int64_t  n_tokens = 0;
+        int      n_layers = 0, n_staged = 0;
+        double   fsum = 0.0, fmin = 1.0, fmax = 0.0;
+        uint64_t union_b = 0, full_b = 0;
+    };
+    struct ss_pred {
+        uint64_t n = 0, tp = 0, pred = 0, act = 0; // layers with the predictor available; expert counts
+        uint64_t pred_b = 0, miss_b = 0, extra_b = 0;
+    };
+    static constexpr int SS_BINS = 20;
+    std::vector<ss_ubatch>         ss_ubs;
+    ss_ubatch                      ss_cur;
+    bool                           ss_open = false;
+    std::vector<std::vector<bool>> ss_prev_ub;   // [layer order index] selection of the previous ubatch
+    std::vector<bool>              ss_prev_layer; // selection of layer ss_prev_li of the current ubatch
+    int                            ss_prev_li = -1;
+    uint64_t ss_layers = 0, ss_staged_layers = 0, ss_sel = 0, ss_n_expert = 0, ss_runs = 0, ss_all = 0;
+    uint64_t ss_union_b = 0, ss_full_b = 0, ss_union_b_staged = 0, ss_full_b_staged = 0;
+    uint64_t ss_hist[SS_BINS] = {};
+    ss_pred  ss_p[3]; // previous layer (same ubatch), previous ubatch (same layer), union of both
+
+    void ss_flush() {
+        if (ss_open && ss_cur.n_layers > 0) {
+            ss_ubs.push_back(ss_cur);
+        }
+        ss_cur  = ss_ubatch();
+        ss_open = false;
+    }
+
+    // first split of layer li of a staged-size ubatch; used = the experts selected by the ubatch at li (st.used)
+    void stats_layer(int li, const std::vector<bool> & used, int64_t n_tokens, bool staged) {
+        if (li < 0 || li >= (int) layers.size()) {
+            return;
+        }
+        if (cur == -1 || li <= ss_prev_li) {
+            // new graph: a new ubatch
+            ss_flush();
+            ss_open          = true;
+            ss_cur.n_tokens  = n_tokens;
+            ss_prev_li       = -1;
+        }
+        const int64_t n_expert = (int64_t) used.size();
+        size_t eb = 0, full = 0;
+        for (int k = 0; k < N_KIND; ++k) {
+            eb   += layers[li][k]->nb[2];
+            full += ggml_nbytes(layers[li][k]);
+        }
+        int64_t n_sel = 0, n_runs = 0;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (used[e]) {
+                n_sel++;
+                if (e == 0 || !used[e - 1]) {
+                    n_runs++;
+                }
+            }
+        }
+        const double   frac    = n_expert > 0 ? (double) n_sel / n_expert : 0.0;
+        const uint64_t union_b = (uint64_t) n_sel * eb;
+        ss_layers++;
+        ss_sel      += n_sel;
+        ss_n_expert += n_expert;
+        ss_runs     += n_runs;
+        ss_union_b  += union_b;
+        ss_full_b   += full;
+        if (staged) {
+            ss_staged_layers++;
+            ss_union_b_staged += union_b;
+            ss_full_b_staged  += full;
+        }
+        ss_hist[std::min(SS_BINS - 1, (int) (frac*SS_BINS))]++;
+        if (n_sel == n_expert) {
+            ss_all++;
+        }
+        ss_cur.n_layers++;
+        ss_cur.n_staged += staged ? 1 : 0;
+        ss_cur.fsum     += frac;
+        ss_cur.fmin      = std::min(ss_cur.fmin, frac);
+        ss_cur.fmax      = std::max(ss_cur.fmax, frac);
+        ss_cur.union_b  += union_b;
+        ss_cur.full_b   += full;
+
+        // read-ahead predictors, known when layer li-1's ids are read (before the reader of li would start)
+        if (ss_prev_ub.size() < layers.size()) {
+            ss_prev_ub.resize(layers.size());
+        }
+        const std::vector<bool> * p_layer = ss_prev_li == li - 1 && (int64_t) ss_prev_layer.size() == n_expert ? &ss_prev_layer : nullptr;
+        const std::vector<bool> * p_ub    = (int64_t) ss_prev_ub[li].size() == n_expert ? &ss_prev_ub[li] : nullptr;
+        auto acc = [&](ss_pred & s, auto pred_at) {
+            int64_t tp = 0, np = 0;
+            for (int64_t e = 0; e < n_expert; ++e) {
+                const bool p = pred_at(e);
+                np += p;
+                tp += p && used[e];
+            }
+            s.n++;
+            s.tp      += tp;
+            s.pred    += np;
+            s.act     += n_sel;
+            s.pred_b  += (uint64_t) np*eb;
+            s.miss_b  += (uint64_t) (n_sel - tp)*eb;
+            s.extra_b += (uint64_t) (np - tp)*eb;
+        };
+        if (p_layer) {
+            acc(ss_p[0], [&](int64_t e) { return (bool) (*p_layer)[e]; });
+        }
+        if (p_ub) {
+            acc(ss_p[1], [&](int64_t e) { return (bool) (*p_ub)[e]; });
+        }
+        if (p_layer && p_ub) {
+            acc(ss_p[2], [&](int64_t e) { return (*p_layer)[e] || (*p_ub)[e]; });
+        }
+        ss_prev_ub[li] = used;
+        ss_prev_layer  = used;
+        ss_prev_li     = li;
+    }
+
+    void stats_print() {
+        ss_flush();
+        if (ss_layers == 0) {
+            return;
+        }
+        const double GiB = 1024.0*1024.0*1024.0;
+        fprintf(stderr, "exps-prefetch stage-stats: ubatches=%zu layers=%llu (staged %llu, all-selected %llu) experts/layer=%.1f/%.0f runs/layer=%.1f\n",
+                ss_ubs.size(), (unsigned long long) ss_layers, (unsigned long long) ss_staged_layers, (unsigned long long) ss_all,
+                (double) ss_sel / ss_layers, (double) ss_n_expert / ss_layers, (double) ss_runs / ss_layers);
+        fprintf(stderr, "exps-prefetch stage-stats: union=%.2f GiB of full=%.2f GiB (%.2f%%); staged layers: union=%.2f GiB of staged=%.2f GiB (%.2f%%)\n",
+                ss_union_b / GiB, ss_full_b / GiB, ss_full_b ? 100.0*ss_union_b/ss_full_b : 0.0,
+                ss_union_b_staged / GiB, ss_full_b_staged / GiB, ss_full_b_staged ? 100.0*ss_union_b_staged/ss_full_b_staged : 0.0);
+        std::string h;
+        for (int b = 0; b < SS_BINS; ++b) {
+            if (ss_hist[b]) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), " [%.2f,%.2f%s:%llu", (double) b/SS_BINS, (double) (b + 1)/SS_BINS, b == SS_BINS - 1 ? "]" : ")",
+                         (unsigned long long) ss_hist[b]);
+                h += tmp;
+            }
+        }
+        fprintf(stderr, "exps-prefetch stage-stats: hist union fraction per layer:%s\n", h.c_str());
+        static const char * pn[3] = { "prev-layer", "prev-ubatch", "either" };
+        for (int i = 0; i < 3; ++i) {
+            const ss_pred & s = ss_p[i];
+            if (s.n == 0) {
+                fprintf(stderr, "exps-prefetch stage-stats: pred %-11s layers=0\n", pn[i]);
+                continue;
+            }
+            fprintf(stderr, "exps-prefetch stage-stats: pred %-11s layers=%llu recall=%.2f%% precision=%.2f%% pred_read=%.2f GiB miss=%.2f GiB extra=%.2f GiB\n",
+                    pn[i], (unsigned long long) s.n, s.act ? 100.0*s.tp/s.act : 0.0, s.pred ? 100.0*s.tp/s.pred : 0.0,
+                    s.pred_b / GiB, s.miss_b / GiB, s.extra_b / GiB);
+        }
+        const size_t max_lines = 512;
+        for (size_t i = 0; i < ss_ubs.size() && i < max_lines; ++i) {
+            const ss_ubatch & u = ss_ubs[i];
+            fprintf(stderr, "exps-prefetch stage-stats: ub %zu n_tokens=%lld layers=%d staged=%d frac mean=%.4f min=%.4f max=%.4f union=%.2f GiB full=%.2f GiB\n",
+                    i, (long long) u.n_tokens, u.n_layers, u.n_staged, u.fsum / u.n_layers, u.fmin, u.fmax, u.union_b / GiB, u.full_b / GiB);
+        }
+        if (ss_ubs.size() > max_lines) {
+            fprintf(stderr, "exps-prefetch stage-stats: ... %zu more ubatches\n", ss_ubs.size() - max_lines);
+        }
+    }
 
     void restore() {
         if (rp_t) {
@@ -152,20 +343,28 @@ struct llama_prefill_stage {
             disabled = true;
             return false;
         }
+        // WIDEN: up to one page before the tensor (off % 16 KiB) and the rounding of the end to the next page
+        widen = widen_mode() != 0;
         size_t total = 0;
         for (int p = 0; p < 2; ++p) {
             for (int k = 0; k < N_KIND; ++k) {
-                buf[p][k] = ggml_backend_buft_alloc_buffer(buft, cap[k]);
+                head[p][k] = 0;
+                buf[p][k] = ggml_backend_buft_alloc_buffer(buft, widen ? cap[k] + 2*WPAGE : cap[k]);
                 if (!buf[p][k] || !is_shared(buf[p][k]) || !ggml_backend_buffer_get_base(buf[p][k])) {
                     fprintf(stderr, "exps-prefetch stage: staging buffer allocation failed, staging disabled\n");
                     disabled = true;
                     return false;
                 }
+                if (widen && ((uintptr_t) ggml_backend_buffer_get_base(buf[p][k]) % WPAGE) != 0) {
+                    fprintf(stderr, "exps-prefetch stage: staging buffer not 16 KiB aligned, widened reads off\n");
+                    widen = false;
+                }
                 total += cap[k];
             }
         }
-        fprintf(stderr, "exps-prefetch stage: on, %zu layers, 2 x %.2f GiB staging, min %d tokens\n",
-                layers.size(), total / 2.0 / (1024.0*1024.0*1024.0), min_tokens);
+        fprintf(stderr, "exps-prefetch stage: on, %zu layers, 2 x %.2f GiB staging, min %d tokens%s\n",
+                layers.size(), total / 2.0 / (1024.0*1024.0*1024.0), min_tokens,
+                widen ? (widen_mode() == 2 ? ", widened reads (cached fd)" : ", widened F_NOCACHE reads") : "");
         return true;
     }
 
@@ -189,9 +388,44 @@ struct llama_prefill_stage {
                 staged[p] = -1;
                 return;
             }
-            char * dst = (char *) ggml_backend_buffer_get_base(buf[p][k]);
+            char * base = (char *) ggml_backend_buffer_get_base(buf[p][k]);
+            head[p][k] = 0;
+            char * dst = base;
             if (!(arena_env && mc != nullptr)) {
-                llama_exps_prefetch::add_upload(jobs, fd, off, dst, ggml_nbytes(t), t->data);
+                bool done = false;
+                if (widen) {
+                    // page-widened read: [off - h, align_up(off + n)) into base, the tensor at base + h; the file
+                    // offset, the length and the destination are 16 KiB multiples, so F_NOCACHE reads stay direct
+                    const size_t   n    = ggml_nbytes(t);
+                    const size_t   h    = (size_t) (off % WPAGE);
+                    const char *   wsrc = (const char *) t->data - h; // the mapping starts at file offset 0
+                    size_t         wlen = GGML_PAD(h + n, WPAGE);
+                    int            wfd  = -1;
+                    uint64_t       woff = 0;
+                    auto lk = [&](size_t len) {
+                        return widen_mode() == 2 ? llama_exps_prefetch::lookup(wsrc, len, &wfd, &woff)
+                                                 : llama_exps_prefetch::lookup_nocache(wsrc, len, &wfd, &woff);
+                    };
+                    bool ok = lk(wlen);
+                    if (!ok) {
+                        // the rounded end is past the end of the file (last tensor): keep the exact end
+                        wlen = h + n;
+                        ok   = lk(wlen);
+                        widen_tail_clamped += ok;
+                    }
+                    if (ok && woff == off - h) {
+                        llama_exps_prefetch::add_upload(jobs, wfd, woff, base, wlen, wsrc);
+                        head[p][k] = h;
+                        widen_jobs++;
+                        widen_extra_bytes += wlen - n;
+                        done = true;
+                    } else {
+                        widen_fallback++;
+                    }
+                }
+                if (!done) {
+                    llama_exps_prefetch::add_upload(jobs, fd, off, dst, ggml_nbytes(t), t->data);
+                }
             } else {
                 const int64_t n_expert = t->ne[2];
                 const size_t  es       = t->nb[2];
@@ -261,7 +495,15 @@ struct llama_prefill_stage {
     void destroy() {
         restore();
         wait_bg();
+        if (stats_on()) {
+            stats_print();
+        }
         if (n_reads || n_staged_splits) {
+            if (widen_jobs + widen_fallback > 0) {
+                fprintf(stderr, "exps-prefetch stage: widened reads = %llu tensors (%.1f MiB extra, %llu tail-clamped), not widened = %llu\n",
+                        (unsigned long long) widen_jobs, widen_extra_bytes / (1024.0*1024.0), (unsigned long long) widen_tail_clamped,
+                        (unsigned long long) widen_fallback);
+            }
             if (arena_experts + file_experts > 0) {
                 fprintf(stderr, "exps-prefetch stage: arena copies = %llu experts, file reads = %llu experts\n", (unsigned long long) arena_experts, (unsigned long long) file_experts);
             }
@@ -3421,6 +3663,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         // before the reader may overwrite the parity of li-1 with li+1
                         ggml_backend_synchronize(backend);
                         stg->wait_bg();
+                        if (llama_prefill_stage::stats_on()) {
+                            // before cur is updated: cur == -1 marks the first layer of a graph (ubatch)
+                            stg->stats_layer(li, st.used, ids->ne[1], stg->staged[li & 1] == li);
+                        }
                         stg->cur      = li;
                         stg->cur_have = stg->staged[li & 1] == li;
                         if (!stg->cur_have) {
@@ -3452,7 +3698,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                         stg->rp_data  = dst->data;
                         stg->rp_graph = graph;
                         dst->buffer   = sb;
-                        dst->data     = ggml_backend_buffer_get_base(sb);
+                        dst->data     = stg->stage_data(li & 1, kind);
                         stg->n_staged_splits++;
                         return true;
                     }
