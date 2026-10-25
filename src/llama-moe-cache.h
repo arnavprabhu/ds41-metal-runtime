@@ -23,11 +23,14 @@ public:
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
-    // LLAMA_DSV41_MOE_OVERLAP=1|2 (decode of one token): the hit map (first split of the layer) and the fill map (second
+    // LLAMA_DSV41_MOE_OVERLAP=1|2 (decode of one token; with LLAMA_DSV41_MOE_OVERLAP_NT=1 ubatches of up to
+    // overlap_max_tokens() tokens): the hit map (first split of the layer) and the fill map (second
     // split) of layer il in place of the slot map, false if the layer uses the slot map. Level 1: the fill map is the full
     // slot map; level 2: it only holds the experts the fill brings, the hit map the experts already in the arena
     bool get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expert_used, ggml_tensor ** h, ggml_tensor ** m) const;
     int  overlap_level() const;
+    // the largest ubatch the overlap mode splits: 0 if it is off, 1 by default, 16 with LLAMA_DSV41_MOE_OVERLAP_NT=1
+    int64_t overlap_max_tokens() const;
 
     // true for the host weights whose copy must not wait for the running split (the fill maps)
     bool copy_nosync(const ggml_tensor * src) const;

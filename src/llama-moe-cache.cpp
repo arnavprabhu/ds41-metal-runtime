@@ -211,6 +211,14 @@ struct llama_moe_cache::impl {
     // missing experts (level 1: the shared expert, level 2: also the experts already in the arena) while the upload runs;
     // the lookup of the fill map starts the next split, whose callback waits for the upload
     int  overlap_level = 0;
+    // LLAMA_DSV41_MOE_OVERLAP_NT=1: also overlap ubatches of 2..max_batch tokens (speculative-decoding verify batches), else
+    // only single-token decode. Lossless like the single-token mode: every (token, expert) row of the routed experts is still
+    // computed exactly once, by the same mul_mv_id kernel (ne21 = n_tokens <= 16 < 32, see max_batch) on the same arena
+    // bytes, in pass 1 if its slot is in the hit map, else in pass 2 (ggml_mul_mat_id_acc writes the remaining rows into the
+    // buffer of pass 1); the plan keeps every expert selected by any token of the ubatch out of the victims, so no hit slot
+    // is written while pass 1 runs. Default off: n_tokens == 1 only, as before.
+    int64_t overlap_max_tokens = 1;
+    bool overlap_small = true; // the ubatch being overlapped counts in stats_small (and the tokstat line)
     bool overlap_fill_pending = false;
     int32_t overlap_il = -1;
     size_t  overlap_pending_bytes = 0;
@@ -820,6 +828,8 @@ struct llama_moe_cache::impl {
                 fprintf(stderr, "llama_moe_cache: LLAMA_DSV41_MOE_OVERLAP needs the pread uploader, disabled\n");
                 overlap_level = 0;
             }
+            const char * nt = getenv("LLAMA_DSV41_MOE_OVERLAP_NT");
+            overlap_max_tokens = nt != nullptr && atoi(nt) != 0 ? max_batch : 1;
         }
         std::vector<size_t> n_tensors(devices.size(), 0);
         size_t n_tensors_host = 0;
@@ -973,7 +983,7 @@ struct llama_moe_cache::impl {
             }
             ggml_backend_buffer_clear(buf_host.get(), 0xff); // all slots are -1
             if (overlap_level != 0) {
-                fprintf(stderr, "llama_moe_cache: overlap level %d (async arena fill)\n", overlap_level);
+                fprintf(stderr, "llama_moe_cache: overlap level %d (async arena fill), ubatches of up to %lld tokens\n", overlap_level, (long long) overlap_max_tokens);
             }
             buf_host_size = ggml_backend_buffer_get_size(buf_host.get());
 
@@ -1306,7 +1316,7 @@ struct llama_moe_cache::impl {
     // overlap mode ------------------------------------------------------------------------------------------------------
 
     bool overlap_usable(int32_t il, int64_t n_tokens) const {
-        return overlap_level != 0 && n_tokens == 1 && il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 && layers[il].slot_map_h != nullptr;
+        return overlap_level != 0 && n_tokens >= 1 && n_tokens <= overlap_max_tokens && il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0 && layers[il].slot_map_h != nullptr;
     }
 
     bool copy_nosync(const ggml_tensor * src) const {
@@ -1398,8 +1408,13 @@ struct llama_moe_cache::impl {
             pf_mask(overlap_before);
         }
 
+        // the ubatch length drives the heat decay of the LFU policy, as in copy() (1 for single-token decode, the old call)
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        int32_t n_tok = 1;
+        if (n_expert_used > 0 && ids.size() % (size_t) n_expert_used == 0) {
+            n_tok = (int32_t) (ids.size() / (size_t) n_expert_used);
+        }
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_tok)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
@@ -1429,6 +1444,7 @@ struct llama_moe_cache::impl {
         const auto t2 = std::chrono::steady_clock::now();
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        overlap_small = &st == &stats_small;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
@@ -1490,8 +1506,11 @@ struct llama_moe_cache::impl {
         } else {
             memcpy(out, now, n_expert*sizeof(int32_t));
         }
-        (stats_small).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-        tok_cur.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        // the wait counts where copy_h counted the layer (always stats_small for single-token decode)
+        (overlap_small ? stats_small : stats_large).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (overlap_small) {
+            tok_cur.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        }
         return true;
     }
 
@@ -1715,6 +1734,10 @@ bool llama_moe_cache::get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expe
 
 int llama_moe_cache::overlap_level() const {
     return pimpl->overlap_level;
+}
+
+int64_t llama_moe_cache::overlap_max_tokens() const {
+    return pimpl->overlap_level != 0 ? pimpl->overlap_max_tokens : 0;
 }
 
 size_t llama_moe_cache::active_bytes() const {

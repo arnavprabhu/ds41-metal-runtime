@@ -2383,13 +2383,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // MoE cache overlap mode (decode of one token): the layer is split in two, the first split (hit map) plans the layer and starts
     // reading the missing experts, and computes the shared expert (level 1) and the experts already in the arena (level 2) while
-    // the experts are read; the second split (fill map) waits for the read and computes the rest
+    // the experts are read; the second split (fill map) waits for the read and computes the rest. LLAMA_DSV41_MOE_OVERLAP_NT=1:
+    // also ubatches of up to 16 tokens (overlap_max_tokens); the passes are per (token, expert) row, so nothing below changes
     ggml_tensor * slots   = nullptr;
     ggml_tensor * slots_h = nullptr;
     ggml_tensor * slots_m = nullptr;
     ggml_tensor * overlap_map_m = nullptr;
     int overlap = 0;
-    if (moe_overlap_hook && moe_cache != nullptr && arch == LLM_ARCH_DEEPSEEK41 && n_tokens == 1 && moe_cache->overlap_level() != 0 &&
+    if (moe_overlap_hook && moe_cache != nullptr && arch == LLM_ARCH_DEEPSEEK41 && n_tokens >= 1 && n_tokens <= moe_cache->overlap_max_tokens() &&
             gate_up_exps == nullptr && gate_exps != nullptr && up_exps != nullptr && down_exps != nullptr &&
             up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr &&
             up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
