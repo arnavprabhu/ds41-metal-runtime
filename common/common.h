@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -403,7 +404,31 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (needs_rs_seq) {
+            return draft.n_max;
+        }
+
+        // n-gram / lookup drafters: deterministic point-mass drafts, but a partial acceptance still needs the cheap
+        // in-graph rollback (n_rs_seq snapshot planes) instead of checkpoint + replay. Drafts longer than n_rs_seq
+        // fall back to the checkpoint path. Cap with LLAMA_SPEC_RS_MAX (default 16, 0 = old behaviour).
+        int32_t n_ngram = 0;
+        for (auto t : types) {
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: n_ngram = std::max<int32_t>(n_ngram, ngram_simple.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:  n_ngram = std::max<int32_t>(n_ngram, ngram_map_k.size_m);  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n_ngram = std::max<int32_t>(n_ngram, ngram_map_k4v.size_m); break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:    n_ngram = std::max<int32_t>(n_ngram, ngram_mod.n_max);    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:  n_ngram = std::max<int32_t>(n_ngram, 8);                  break;
+                default: break;
+            }
+        }
+        if (n_ngram > 0) {
+            const char * e = getenv("LLAMA_SPEC_RS_MAX");
+            const int32_t cap = e ? atoi(e) : 16;
+            return (uint32_t) std::max<int32_t>(0, std::min(n_ngram, cap));
+        }
+
+        return 0u;
     }
 };
 
