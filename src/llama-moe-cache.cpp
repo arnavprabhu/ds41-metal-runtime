@@ -733,7 +733,15 @@ struct llama_moe_cache::impl {
             phase, allocated, filled, filled/1024.0/1024.0, allocated/1024.0/1024.0);
     }
 
+    void overlap_drain() {
+        if (overlap_fill_pending) {
+            llama_exps_prefetch::upload_end();
+            overlap_fill_pending = false;
+        }
+    }
+
     ~impl() {
+        overlap_drain();
         pred_wait();
         log_arena("teardown");
         log_stats();
@@ -856,7 +864,8 @@ struct llama_moe_cache::impl {
         const layer & l = layers[il];
         group & g = groups[l.ig];
         GGML_ASSERT(backend == devices[g.id].backend);
-        GGML_ASSERT(!overlap_fill_pending);
+        // a graph aborted between split 1 and split 2 leaves an upload in flight: drain it before planning again
+        overlap_drain();
 
         const int n_nodes = ggml_graph_n_nodes(graph);
         const ggml_tensor * lookup = nullptr;

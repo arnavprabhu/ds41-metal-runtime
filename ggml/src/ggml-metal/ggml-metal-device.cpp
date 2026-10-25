@@ -1101,7 +1101,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
-                if (ggml_metal_ds41_q5k() && tsrc1 == GGML_TYPE_F32) {
+                if (ggml_metal_ds41_q5k() && tsrc1 == GGML_TYPE_F32 && op->src[1]->nb[1] % 16 == 0) {
                     // x2 (row per lane group) when the 4 parallel block slots of x1 would be unbalanced
                     const int nb = ne00/256; // QK_K
                     if (nb < 8 && nb % 4 != 0) {
