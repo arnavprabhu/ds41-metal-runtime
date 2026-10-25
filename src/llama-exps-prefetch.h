@@ -25,6 +25,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 struct ggml_tensor;
@@ -76,6 +77,15 @@ void upload_end();
 // same as upload() on a separate pool (LLAMA_DSV41_STAGE_THREADS, default 8), callable from one background thread
 // concurrently with upload() on the scheduler thread
 void upload_bg(const std::vector<upload_job> & jobs);
+
+// speculative prefetch queue (LLAMA_DSV41_PF_THREADS workers, default 6): items are started in submission order but
+// never while a demand batch (upload/upload_begin) still has untaken jobs. An item is all the jobs of one expert.
+// pf_cancel() succeeds only if no job of the item has started (the caller must then forget the slot's contents);
+// pf_wait() returns when every job of a non-cancelled item is done.
+std::shared_ptr<void> pf_submit(std::vector<upload_job> && jobs);
+bool pf_cancel(const std::shared_ptr<void> & h);
+void pf_wait(const std::shared_ptr<void> & h);
+bool pf_done(const std::shared_ptr<void> & h);
 
 // time the caller spent in ggml_backend_synchronize before an upload (stats only)
 void upload_add_sync_us(uint64_t us);

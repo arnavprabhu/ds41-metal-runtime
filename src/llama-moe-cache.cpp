@@ -172,6 +172,178 @@ struct llama_moe_cache::impl {
         uint64_t wait_us = 0;
     } pst;
 
+    // LLAMA_DSV41_MOE_PREDICT=2: look-ahead into the prefetch queue. At the plan of layer il (copy_h) the experts predicted
+    // for layer il+1 (router of il+1 applied to il's FFN input, computed with il's own router) are read into victim slots
+    // that layer il does not use, behind the demand reads (the queue yields to them). At the plan of il+1 the predicted
+    // experts that were selected are kept (those still in flight are masked out of the hit map and awaited by the fill-map
+    // split), the others are cancelled if unstarted, else awaited before the plan so no slot has two writers.
+    struct pf_entry {
+        int32_t expert;
+        int32_t slot;
+        std::shared_ptr<void> h;
+        bool needed = false;
+    };
+    std::vector<pf_entry> pf_pend;
+    int32_t pf_layer = -1;
+    std::vector<int32_t> pf_ids;
+    struct pf_stats {
+        size_t layers = 0, cand = 0, taken = 0, bytes = 0;
+        size_t actual = 0, pred_in_actual = 0, used = 0, cancelled = 0, wasted_started = 0, late = 0, inflight_masked = 0;
+        uint64_t resolve_wait_us = 0, join_wait_us = 0;
+    } pfs;
+
+    static float pf_bonus() {
+        static const float v = [] { const char * e = getenv("LLAMA_DSV41_PF_BONUS"); return e ? (float) atof(e) : 1.0f; }();
+        return v;
+    }
+
+    void pf_launch(ggml_backend_t backend, int32_t il) {
+        const int32_t nl = il + 1;
+        if (nl >= (int32_t) pred.size() || pred[nl] == nullptr || layers[nl].ig < 0 || pf_layer >= 0) {
+            return;
+        }
+        const layer & L = layers[nl];
+        group & G = groups[L.ig];
+        if (devices[G.id].backend != backend) {
+            return;
+        }
+        const is_shared_fn is_shared = get_is_shared(backend);
+        if (!is_shared || pred[nl]->data == nullptr || pred[nl]->buffer == nullptr || !is_shared(pred[nl]->buffer)) {
+            return;
+        }
+        std::vector<int>      fds(L.experts.size());
+        std::vector<uint64_t> offs(L.experts.size());
+        for (size_t ip = 0; ip < L.experts.size(); ++ip) {
+            const ggml_tensor * w    = L.experts[ip];
+            const ggml_tensor * bank = G.banks[ip];
+            if (bank->buffer == nullptr || bank->data == nullptr || !is_shared(bank->buffer) ||
+                    !moe_fill_lookup(w->data, ggml_nbytes(w), &fds[ip], &offs[ip])) {
+                return;
+            }
+        }
+        const size_t n_pred = ggml_nelements(pred[nl]);
+        pf_ids.resize(n_pred);
+        memcpy(pf_ids.data(), pred[nl]->data, n_pred*sizeof(int32_t));
+        for (int32_t e : pf_ids) {
+            if (e < 0 || e >= G.lru.n_expert) {
+                pf_ids.clear();
+                return;
+            }
+        }
+        // layer il's own slots stay untouched (its ids were planned just before)
+        groups[layers[il].ig].lru.prefetch_begin(il, ids.data(), ids.size());
+        if (layers[il].ig != L.ig) {
+            G.lru.prefetch_begin(il, nullptr, 0); // different group: nothing of layer il lives there
+        }
+        pfs.layers++;
+        pfs.cand += n_pred;
+        pf_layer = nl;
+        pf_pend.clear();
+        for (size_t r = 0; r < n_pred; ++r) {
+            moe_cache_lru::fill f;
+            if (!G.lru.prefetch_take(nl, pf_ids[r], pf_bonus(), f)) {
+                continue;
+            }
+            std::vector<llama_exps_prefetch::upload_job> pj;
+            size_t slot_bytes = 0;
+            for (size_t ip = 0; ip < L.experts.size(); ++ip) {
+                const ggml_tensor * w    = L.experts[ip];
+                ggml_tensor       * bank = G.banks[ip];
+                const size_t expert_size = w->nb[2];
+                slot_bytes += expert_size;
+                llama_exps_prefetch::add_upload(pj, fds[ip], offs[ip] + (size_t) f.expert*expert_size,
+                        (char *) bank->data + (size_t) f.slot*expert_size, expert_size, (const char *) w->data + (size_t) f.expert*expert_size);
+            }
+            pfs.taken++;
+            pfs.bytes += slot_bytes;
+            if (!G.filled[f.slot]) {
+                G.filled[f.slot] = true;
+                G.filled_bytes += slot_bytes;
+            }
+            pf_pend.push_back({ f.expert, f.slot, llama_exps_prefetch::pf_submit(std::move(pj)), false });
+        }
+        G.lru.prefetch_end();
+        if (layers[il].ig != L.ig) {
+            groups[layers[il].ig].lru.prefetch_end();
+        }
+    }
+
+    // plan of layer il: score the prediction, cancel/await the wrong guesses. Returns with every non-needed item settled;
+    // needed items that are still in flight stay in pf_pend (needed = true) for pf_masked()/pf_join()
+    void pf_resolve(int32_t il) {
+        if (pf_layer != il) {
+            pf_layer = -1;
+            pf_pend.clear();
+            return;
+        }
+        group & G = groups[layers[il].ig];
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < ids.size(); ++i) {
+            bool dup = false;
+            for (size_t j = 0; j < i && !dup; ++j) {
+                dup = ids[j] == ids[i];
+            }
+            if (dup) {
+                continue;
+            }
+            pfs.actual++;
+            pfs.pred_in_actual += std::find(pf_ids.begin(), pf_ids.end(), ids[i]) != pf_ids.end();
+        }
+        std::vector<pf_entry> keep;
+        for (auto & en : pf_pend) {
+            if (std::find(ids.begin(), ids.end(), en.expert) != ids.end()) {
+                en.needed = true;
+                pfs.used++;
+                if (!llama_exps_prefetch::pf_done(en.h)) {
+                    pfs.inflight_masked++;
+                    keep.push_back(en);
+                }
+                continue;
+            }
+            if (llama_exps_prefetch::pf_cancel(en.h)) {
+                G.lru.unmap(il, en.expert, en.slot);
+                pfs.cancelled++;
+            } else {
+                pfs.wasted_started++;
+                llama_exps_prefetch::pf_wait(en.h);
+            }
+        }
+        pf_pend = std::move(keep);
+        pf_layer = pf_pend.empty() ? -1 : il;
+        pfs.resolve_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // needed prefetches that were still in flight at the plan: hidden from the hit map, awaited before the fill-map split
+    void pf_mask(std::vector<int32_t> & before) {
+        for (const auto & en : pf_pend) {
+            before[en.expert] = -1;
+        }
+    }
+    void pf_join() {
+        if (pf_pend.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (auto & en : pf_pend) {
+            llama_exps_prefetch::pf_wait(en.h);
+        }
+        pf_pend.clear();
+        pf_layer = -1;
+        pfs.join_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // everything settled before a path that does not know about the queue
+    void pf_flush() {
+        for (auto & en : pf_pend) {
+            if (!en.needed && llama_exps_prefetch::pf_cancel(en.h)) {
+                groups[layers[pf_layer].ig].lru.unmap(pf_layer, en.expert, en.slot);
+            } else {
+                llama_exps_prefetch::pf_wait(en.h);
+            }
+        }
+        pf_pend.clear();
+        pf_layer = -1;
+    }
+
     void pred_wait() {
         if (pred_busy) {
             const auto t0 = std::chrono::steady_clock::now();
@@ -232,7 +404,11 @@ struct llama_moe_cache::impl {
             }
         }
         size_t n_hit = 0;
-        if (!G.lru.plan(nl, pred_ids.data(), pred_ids.size(), pred_fills, n_hit)) {
+        // the slots layer il reads (hits on the GPU now, fills in the next split) are not victims
+        groups[layers[il].ig].lru.prefetch_begin(il, ids.data(), ids.size());
+        const bool planned = G.lru.plan(nl, pred_ids.data(), pred_ids.size(), pred_fills, n_hit);
+        groups[layers[il].ig].lru.prefetch_end();
+        if (!planned) {
             return;
         }
         // the experts layer il is about to read must still be resident (victims come from the LRU head)
@@ -643,6 +819,15 @@ struct llama_moe_cache::impl {
 
     ~impl() {
         overlap_drain();
+        pf_flush();
+        if (pfs.layers > 0) {
+            fprintf(stderr, "llama_moe_cache: prefetch: layers = %zu, candidates = %zu, taken = %zu (%.2f MiB), recall (predicted in actual) = %.2f%%, "
+                "used = %zu (%.2f%% of taken, %.2f%% of actual), cancelled = %zu, wasted started = %zu, in flight at plan = %zu, "
+                "resolve wait = %.2f ms, join wait = %.2f ms\n",
+                pfs.layers, pfs.cand, pfs.taken, pfs.bytes/1024.0/1024.0, pfs.actual ? 100.0*pfs.pred_in_actual/pfs.actual : 0.0,
+                pfs.used, pfs.taken ? 100.0*pfs.used/pfs.taken : 0.0, pfs.actual ? 100.0*pfs.used/pfs.actual : 0.0,
+                pfs.cancelled, pfs.wasted_started, pfs.inflight_masked, pfs.resolve_wait_us/1000.0, pfs.join_wait_us/1000.0);
+        }
         pred_wait();
         log_arena("teardown");
         log_stats();
@@ -802,9 +987,16 @@ struct llama_moe_cache::impl {
 
         // the background prefetch of this layer's predicted misses must land before the plan (they count as hits)
         pred_resolve(il);
+        const bool pf_on = llama_moe_cache_predict_mode() == 2;
+        if (pf_on) {
+            pf_resolve(il);
+        }
 
         const int32_t n_expert = g.lru.n_expert;
         overlap_before.assign(g.lru.slot_map[il], g.lru.slot_map[il] + n_expert);
+        if (pf_on) {
+            pf_mask(overlap_before);
+        }
 
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
@@ -834,6 +1026,10 @@ struct llama_moe_cache::impl {
         overlap_fill_pending = !fills.empty();
         overlap_il = il;
         overlap_pending_bytes = bytes;
+        if (pf_on) {
+            // after the demand reads are queued: the look-ahead reads yield to them
+            pf_launch(backend, il);
+        }
         const auto t2 = std::chrono::steady_clock::now();
 
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
@@ -860,10 +1056,16 @@ struct llama_moe_cache::impl {
             llama_exps_prefetch::upload_end();
             overlap_fill_pending = false;
         }
+        if (llama_moe_cache_predict_mode() == 2) {
+            // prefetches of this layer that were still in flight at its plan
+            if (!pf_pend.empty() && pf_layer == il) {
+                pf_join();
+            }
+        }
         const auto t1 = std::chrono::steady_clock::now();
 
         // LLAMA_DSV41_MOE_PREDICT=1: read the predicted misses of the next layer while the GPU computes this one
-        if (llama_moe_cache_predict_enabled()) {
+        if (llama_moe_cache_predict_mode() == 1) {
             pred_launch(backend, il);
         }
 
@@ -896,6 +1098,7 @@ struct llama_moe_cache::impl {
         if (it == layer_of.end()) {
             return false;
         }
+        pf_flush();
         const int32_t il = it->second;
         const layer & l = layers[il];
         group & g = groups[l.ig];
@@ -1115,12 +1318,24 @@ void llama_moe_cache::set_graph(ggml_cgraph * gf) {
     pimpl->set_graph(gf);
 }
 
-bool llama_moe_cache_predict_enabled() {
-    static const bool on = [] {
+int llama_moe_cache_predict_mode() {
+    static const int mode = [] {
         const char * v = getenv("LLAMA_DSV41_MOE_PREDICT");
-        return v != nullptr && atoi(v) != 0;
+        return v != nullptr ? atoi(v) : 0;
     }();
-    return on;
+    return mode;
+}
+
+bool llama_moe_cache_predict_enabled() {
+    return llama_moe_cache_predict_mode() != 0;
+}
+
+int llama_moe_cache_predict_k() {
+    static const int k = [] {
+        const char * v = getenv("LLAMA_DSV41_PREDICT_K");
+        return v != nullptr ? std::max(1, std::min(16, atoi(v))) : 6;
+    }();
+    return k;
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

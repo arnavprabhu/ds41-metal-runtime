@@ -323,6 +323,29 @@ void add_upload(std::vector<upload_job> & jobs, int fd, uint64_t file_off, void 
 
 namespace {
 
+// demand (urgent) reads have priority over speculative prefetch: prefetch workers start no new job while the demand batch
+// still has untaken jobs
+struct pf_gate {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    bool                    urgent = false;
+};
+pf_gate & get_gate() {
+    static pf_gate * g = new pf_gate();
+    return *g;
+}
+void gate_set(bool urgent) {
+    auto & g = get_gate();
+    {
+        std::lock_guard<std::mutex> lk(g.mtx);
+        if (g.urgent == urgent) {
+            return;
+        }
+        g.urgent = urgent;
+    }
+    g.cv.notify_all();
+}
+
 struct upload_batch {
     const std::vector<upload_job> * jobs;
     std::atomic<size_t> next   { 0 };
@@ -377,11 +400,16 @@ struct upload_pool {
     }
 
     // pulls jobs of b until none are left; returns the number done by this thread
+    bool is_main = false;
+
     void drain(upload_batch & b) {
         const size_t n = b.jobs->size();
         for (;;) {
             const size_t i = b.next.fetch_add(1);
             if (i >= n) {
+                if (is_main) {
+                    gate_set(false);
+                }
                 break;
             }
             run_job((*b.jobs)[i]);
@@ -438,6 +466,9 @@ struct upload_pool {
             return;
         }
         async_t0 = std::chrono::steady_clock::now();
+        if (is_main) {
+            gate_set(true);
+        }
         async_b = new upload_batch();
         async_b->jobs = &jobs;
         {
@@ -478,6 +509,9 @@ struct upload_pool {
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        if (is_main) {
+            gate_set(true);
+        }
         upload_batch b;
         b.jobs = &jobs;
         {
@@ -512,7 +546,7 @@ struct upload_pool {
 
 // leaked on purpose (detached workers)
 upload_pool & get_upload() {
-    static upload_pool * p = new upload_pool();
+    static upload_pool * p = [] { auto * q = new upload_pool(); q->is_main = true; return q; }();
     return *p;
 }
 
@@ -548,6 +582,123 @@ void upload_end() {
 
 void upload_add_sync_us(uint64_t us) {
     get_upload().st.sync_us += us;
+}
+
+// ---- speculative prefetch queue (LLAMA_DSV41_MOE_PREDICT=2) ---------------------------------------------------------
+namespace {
+
+struct pf_item {
+    std::vector<upload_job> jobs;
+    size_t next = 0;
+    size_t done = 0;
+    bool   cancelled = false;
+};
+
+struct pf_queue {
+    std::mutex mtx; // protects items and every pf_item
+    std::condition_variable cv_work;
+    std::condition_variable cv_done;
+    std::deque<std::shared_ptr<pf_item>> items;
+    int n_workers = 0;
+    std::atomic<uint64_t> bytes_done { 0 };
+
+    void ensure_workers() {
+        if (n_workers > 0) {
+            return;
+        }
+        n_workers = std::max(1, env_int("LLAMA_DSV41_PF_THREADS", 6));
+        for (int i = 0; i < n_workers; ++i) {
+            std::thread([this] { worker(); }).detach();
+        }
+    }
+
+    [[noreturn]] void worker() {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+        for (;;) {
+            std::shared_ptr<pf_item> it;
+            size_t idx = 0;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                for (;;) {
+                    // drop finished/cancelled heads
+                    while (!items.empty() && (items.front()->cancelled || items.front()->next >= items.front()->jobs.size())) {
+                        items.pop_front();
+                    }
+                    if (!items.empty()) {
+                        auto & g = get_gate();
+                        bool urgent;
+                        {
+                            std::lock_guard<std::mutex> gl(g.mtx);
+                            urgent = g.urgent;
+                        }
+                        if (!urgent) {
+                            it  = items.front();
+                            idx = it->next++;
+                            break;
+                        }
+                        // demand reads are being issued: re-check shortly (the gate has no link to this lock)
+                        cv_work.wait_for(lk, std::chrono::microseconds(100));
+                        continue;
+                    }
+                    cv_work.wait(lk);
+                }
+            }
+            get_upload_bg().run_job(it->jobs[idx]);
+            bytes_done += it->jobs[idx].len;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (++it->done == it->jobs.size()) {
+                    cv_done.notify_all();
+                }
+            }
+        }
+    }
+};
+pf_queue & get_pf() {
+    static pf_queue * q = new pf_queue();
+    return *q;
+}
+
+} // namespace
+
+std::shared_ptr<void> pf_submit(std::vector<upload_job> && jobs) {
+    auto & q = get_pf();
+    auto it = std::make_shared<pf_item>();
+    it->jobs = std::move(jobs);
+    {
+        std::lock_guard<std::mutex> lk(q.mtx);
+        q.ensure_workers();
+        q.items.push_back(it);
+    }
+    q.cv_work.notify_all();
+    return it;
+}
+
+bool pf_cancel(const std::shared_ptr<void> & h) {
+    auto & q = get_pf();
+    auto * it = (pf_item *) h.get();
+    std::lock_guard<std::mutex> lk(q.mtx);
+    if (it->next != 0) {
+        return false;
+    }
+    it->cancelled = true;
+    return true;
+}
+
+void pf_wait(const std::shared_ptr<void> & h) {
+    auto & q = get_pf();
+    auto * it = (pf_item *) h.get();
+    std::unique_lock<std::mutex> lk(q.mtx);
+    q.cv_done.wait(lk, [&] { return it->done == it->jobs.size(); });
+}
+
+bool pf_done(const std::shared_ptr<void> & h) {
+    auto & q = get_pf();
+    auto * it = (pf_item *) h.get();
+    std::lock_guard<std::mutex> lk(q.mtx);
+    return it->done == it->jobs.size();
 }
 
 static void print_upload_stats() {

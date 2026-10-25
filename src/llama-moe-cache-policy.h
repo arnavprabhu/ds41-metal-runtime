@@ -136,6 +136,80 @@ struct moe_cache_lru {
         return plan_lfu(il, ids, n_ids, n_tokens, fills, n_hit);
     }
 
+    // ---- speculative prefetch (LLAMA_DSV41_MOE_PREDICT) ------------------------------------------------------------------
+    // prefetch_begin: the slots of the experts layer pl is reading right now may not be taken as victims until the next
+    // prefetch_begin/prefetch_end; prefetch_take gives a slot to expert e of layer il without counting a selection (no heat
+    // bump) when it is not resident and a victim exists whose heat is below heat(e) + bonus. unmap forgets a prefetch that was
+    // cancelled before any byte was read (the slot becomes empty).
+    std::vector<uint32_t> prot;
+    uint32_t prot_gen = 0;
+    bool prot_active = false;
+
+    void prefetch_begin(int32_t pl, const int32_t * ids, size_t n_ids) {
+        if (prot.size() != (size_t) n_slots) {
+            prot.assign(n_slots, 0);
+            prot_gen = 0;
+        }
+        if (++prot_gen == 0) {
+            std::fill(prot.begin(), prot.end(), 0);
+            prot_gen = 1;
+        }
+        prot_active = true;
+        for (size_t i = 0; i < n_ids; ++i) {
+            const int32_t s = slot_map[pl][ids[i]];
+            if (s >= 0) {
+                prot[s] = prot_gen;
+            }
+        }
+        rank_lru();
+    }
+    void prefetch_end() {
+        prot_active = false;
+    }
+    bool prefetch_take(int32_t il, int32_t e, float bonus, fill & out) {
+        int32_t * slots = slot_map[il];
+        if (slots[e] >= 0) {
+            return false;
+        }
+        int32_t best = -1;
+        float best_h = 0.0f;
+        int32_t best_r = 0;
+        bool best_empty = false;
+        for (int32_t s = 0; s < n_slots; ++s) {
+            if (prot[s] == prot_gen) {
+                continue;
+            }
+            const int32_t key = key_of[s];
+            const bool empty = key < 0;
+            const float h = empty ? 0.0f : heat[(size_t) key];
+            const int32_t r = lru_rank.empty() ? 0 : lru_rank[s];
+            const bool better = best < 0 || (empty && !best_empty) ||
+                (empty == best_empty && (h < best_h || (h == best_h && r < best_r)));
+            if (better) {
+                best = s; best_h = h; best_r = r; best_empty = empty;
+            }
+        }
+        if (best < 0) {
+            return false;
+        }
+        if (evict == evict_kind::lfu_decay && !best_empty && heat[(size_t) il*n_expert + e] + bonus <= best_h) {
+            return false;
+        }
+        if (key_of[best] >= 0) {
+            slot_map[key_of[best] / n_expert][key_of[best] % n_expert] = -1;
+        }
+        key_of[best] = il*n_expert + e;
+        slots[e] = best;
+        prot[best] = prot_gen;
+        out = { e, best };
+        return true;
+    }
+    void unmap(int32_t il, int32_t e, int32_t slot) {
+        MOE_CACHE_ASSERT(slot_map[il][e] == slot && key_of[slot] == il*n_expert + e);
+        slot_map[il][e] = -1;
+        key_of[slot] = -1;
+    }
+
 private:
     void read_env() {
         decay = k_decay_default;
@@ -305,6 +379,9 @@ private:
         int32_t best_r = 0;
         bool best_empty = false;
         for (int32_t s = 0; s < n_slots; ++s) {
+            if (prot_active && prot[s] == prot_gen) {
+                continue;
+            }
             const int32_t key = key_of[s];
             const bool empty = key < 0;
             if (!empty) {

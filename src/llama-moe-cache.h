@@ -54,5 +54,9 @@ private:
 // LLAMA_DSV41_MOE_PREDICT=1: decode graphs compute layer il+1's router on layer il's FFN input, and the cache
 // prefetches the predicted misses in the background (residency only, outputs unchanged)
 bool llama_moe_cache_predict_enabled();
+// 1 = old (prefetch after the fill of the layer, background thread), 2 = look-ahead into the prefetch queue at the plan of the layer
+int llama_moe_cache_predict_mode();
+// number of predicted experts per layer (LLAMA_DSV41_PREDICT_K, default 6, max 16)
+int llama_moe_cache_predict_k();
 
 using llama_moe_cache_ptr = std::unique_ptr<llama_moe_cache>;
