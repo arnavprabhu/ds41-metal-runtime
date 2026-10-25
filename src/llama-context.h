@@ -382,6 +382,7 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
         std::vector<llama_exps_prefetch::upload_job> jobs; // pread uploader scratch
+        uint64_t arena_experts = 0, file_experts = 0;      // LLAMA_DSV41_PREFILL_ARENA: experts copied from the arena / read from the file
 
         void reset() {
             ids = nullptr;
