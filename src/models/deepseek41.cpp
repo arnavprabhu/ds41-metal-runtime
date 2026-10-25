@@ -112,6 +112,22 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // long-prompt layer skip premise: from layer Y on, every layer has compressed attention fed by Y alone (Y owns the
+    // compressor state and the index keys; later index sources only add queries from their own hidden states). Then the
+    // rows of a prompt that precede its last (n_layer - Y)*(window - 1) + window ones need layers < Y and the compressor
+    // of Y, nothing else (see llama_context prompt skip)
+    hparams.dsv41_yoco = -1;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        bool ok = hparams.dsv41_kv_src[il] == (int32_t) il;
+        for (uint32_t j = il; ok && j < n_layer; ++j) {
+            ok = hparams.dsv4_compress_ratios[j] != 0 && hparams.dsv41_kv_src[j] == (int32_t) il;
+        }
+        if (ok) {
+            hparams.dsv41_yoco = (int32_t) il;
+            break;
+        }
+    }
+
     std::vector<uint32_t> e_layers;
     if (ista && !ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false)) {
         bool present = false;
@@ -174,6 +190,7 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         };
         LLAMA_LOG_INFO("%s: format = %s\n", __func__, ista ? "ISTA (HF-style keys, Engram constants as tensors)" : "llama.cpp (ple.* keys)");
         LLAMA_LOG_INFO("%s: kv_source_layers = [%s], index_source_layers = [%s]\n", __func__, join(kv_src).c_str(), join(idx_src).c_str());
+        LLAMA_LOG_INFO("%s: long-prompt skip layer (yoco) = %d\n", __func__, hparams.dsv41_yoco);
         LLAMA_LOG_INFO("%s: candidate: source_layer = %d, top_k_blocks = %u, block_size = %u\n", __func__,
                 hparams.dsv41_cand_src, hparams.dsv41_cand_topk_blocks, hparams.dsv41_cand_block_size);
         LLAMA_LOG_INFO("%s: engram: layers = [%s], max_ngram = %u, n_head = %u, head_dim = %u, pad_id = %u (mapped %d), "
@@ -697,7 +714,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         ggml_tensor * cand_pin,
-        int il) {
+        int il,
+        bool kv_only) {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -800,6 +818,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             // first consumer on this device: append the source's new rows to the local mirror
             ggml_build_forward_expand(gf, comp_ctx->cpy_k(ctx0, comp_row_of[hparams.dsv41_kv_src[il]], ci.state_write_idxs, il));
         }
+    }
+
+    if (kv_only) {
+        // long-prompt skip head: only the compressed rows / index keys of this layer are wanted. q, the window K and the
+        // attention are not part of the graph (nothing in it reads them)
+        return nullptr;
     }
 
     ggml_tensor * out = nullptr;
@@ -1071,6 +1095,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
+    // long-prompt layer skip (prompt head ubatch): layers before the skip layer in full, the skip layer only to fill its
+    // compressed rows and index keys; the rest of the layers read nothing else of these rows (llama_context prompt skip)
+    const int32_t yoco = hparams.dsv41_yoco;
+    const bool    head = yoco >= 0 && inp_dsv4->mctx->is_prompt_head();
+    inp_dsv4->head = head;
+
     // LLAMA_DSV41_ENGRAM_OFF=1 (debugging only): no Engram contribution at all
     static const bool engram_off = [] {
         const char * v = getenv("LLAMA_DSV41_ENGRAM_OFF");
@@ -1081,6 +1111,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
     for (size_t e = 0; ubatch.token && !engram_off && e < model.engram_layers.size(); ++e) {
         const int32_t il = model.engram_layers[e];
+        if (head && il > yoco) {
+            break; // layers are ascending: none of the remaining ones runs
+        }
         const ggml_tensor * tab = model.engram_table((int) e);
         ggml_tensor * ids = nullptr;
         if (host_gather && llm_graph_host_rows_supported(tab) && tab->ne[0] == (int64_t) model.engram_head_dim) {
@@ -1153,6 +1186,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
+
+        if (head && il == yoco) {
+            build_attention41(model, inp_dsv4, cur, inp_pos, cand_pin, il, true);
+            break;
+        }
 
         cur = build_attention41(model, inp_dsv4, cur, inp_pos, cand_pin, il);
 

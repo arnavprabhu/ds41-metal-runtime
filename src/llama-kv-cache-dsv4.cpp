@@ -1533,7 +1533,32 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
     const bool has_coupled = dsv4_batch_has_coupled(balloc.get_batch());
 
+    // long-prompt layer skip: the first prompt_head_rows rows form their own ubatches (one-shot request)
+    const uint32_t head_rows_req = prompt_head_rows;
+    prompt_head_rows = 0;
+
+    const auto split_limit = [&](uint32_t head_left) {
+        return head_left > 0 ? std::min(n_ubatch, head_left) : n_ubatch;
+    };
+    // flags[i]: ubatch i lies wholly in the head; all false unless the head rows were consumed exactly
+    const auto head_flags_of = [&](const std::vector<llama_ubatch> & ubatches) {
+        std::vector<uint8_t> flags(ubatches.size(), 0);
+        uint32_t left = head_rows_req;
+        for (size_t i = 0; i < ubatches.size() && left > 0; ++i) {
+            if (ubatches[i].n_tokens > left) {
+                break;
+            }
+            flags[i] = 1;
+            left -= ubatches[i].n_tokens;
+        }
+        if (left != 0) {
+            std::fill(flags.begin(), flags.end(), 0);
+        }
+        return flags;
+    };
+
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
+        auto flags = head_flags_of(ubatches);
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
 
         auto sinfos_raw_base_write = kv_raw->get_base()->prepare(ubatches_raw);
@@ -1548,13 +1573,15 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
 
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
 
-        return std::make_unique<llama_kv_cache_dsv4_context>(
+        auto res = std::make_unique<llama_kv_cache_dsv4_context>(
                 this,
                 std::move(sinfos_raw_base_write),
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
                 std::move(ubatches),
                 std::move(ubatches_raw));
+        res->set_head_flags(std::move(flags));
+        return res;
     };
 
     // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not
@@ -1567,11 +1594,13 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
+        uint32_t head_left = head_rows_req;
         while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
+            auto ubatch = balloc.split_simple(split_limit(head_left));
             if (ubatch.n_tokens == 0) {
                 break;
             }
+            head_left -= std::min(head_left, ubatch.n_tokens);
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
 
@@ -1591,19 +1620,21 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
+        uint32_t head_left = head_rows_req;
         while (true) {
             llama_ubatch ubatch;
             if (has_coupled) {
-                ubatch = balloc.split_seq(n_ubatch);
+                ubatch = balloc.split_seq(split_limit(head_left));
             } else {
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(split_limit(head_left), raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
                 break;
             }
+            head_left -= std::min(head_left, ubatch.n_tokens);
             ubatches.push_back(std::move(ubatch)); // NOLINT
         }
 

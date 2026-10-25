@@ -125,6 +125,10 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // long-prompt layer skip (see llama_set_prompt_total)
+    void set_prompt_total(llama_seq_id seq_id, int32_t n_total);
+    int32_t prompt_skip_ckpt_min_pos(int32_t n_total) const;
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -227,6 +231,11 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    // long-prompt layer skip: number of leading rows of this batch to run as prompt head ubatches, 0 = none
+    uint32_t prompt_skip_head_rows(const llama_batch_ext & batch, bool output_all);
+
+    std::array<int32_t, LLAMA_MAX_SEQ> prompt_total = {}; // per sequence, 0 = no hint
+
     //
     // output
     //

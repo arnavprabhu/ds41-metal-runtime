@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-moe-cache.h"
 #include "llama-exps-prefetch.h"
 #include "llama-ext.h"
@@ -1068,6 +1069,116 @@ size_t llama_context::moe_cache_auto_size() {
         phys/(1024.0*mib), frac, dense/(1024.0*mib), kv/(1024.0*mib), compute/(1024.0*mib), staging/(1024.0*mib), margin/(1024.0*mib),
         ((double) phys*frac - (dense + kv + compute + staging + margin))/(1024.0*mib), target/(1024.0*mib), lo/(1024.0*mib), hi/(1024.0*mib));
     return (size_t) target;
+}
+
+void llama_context::set_prompt_total(llama_seq_id seq_id, int32_t n_total) {
+    if (seq_id >= 0 && seq_id < (llama_seq_id) prompt_total.size()) {
+        prompt_total[seq_id] = std::max<int32_t>(n_total, 0);
+    }
+}
+
+// DeepSeek-V4.1 long-prompt layer skip (idea: Strata src/dsv41/ds4_model.cu "YOCO" prompt skip, MIT).
+// From the skip layer Y (first layer whose compressed attention is fed by Y alone) every layer reads earlier rows only
+// through Y's compressed rows / index keys and its own sliding window of `win` raw K rows. A prompt of n rows therefore
+// needs layers >= Y only on its last keep = (n_layer - Y)*(win - 1) + win rows (each layer sees `win - 1` rows further
+// back than the one above; rows before the cut are wrong in the upper layers but nothing that is kept reads them).
+// The rows before the cut run as "head" ubatches: layers < Y in full plus Y's compressor. Their raw K cells in the upper
+// layers stay as they were (finite). Only for a single sequence whose rows carry no outputs and whose total length is
+// known (llama_set_prompt_total).
+static bool dsv41_prompt_skip_enabled() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_DSV41_PROMPT_SKIP");
+        return v && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
+// rows kept through all layers (LLAMA_DSV41_PROMPT_SKIP_KEEP overrides, tests only)
+static int64_t dsv41_prompt_skip_keep(const llama_hparams & hp) {
+    static const int64_t keep_env = [] {
+        const char * v = getenv("LLAMA_DSV41_PROMPT_SKIP_KEEP");
+        return v ? (int64_t) atoll(v) : (int64_t) 0;
+    }();
+    return keep_env > 0 ? keep_env : (int64_t) (hp.n_layer() - hp.dsv41_yoco)*(hp.n_swa - 1) + hp.n_swa;
+}
+
+static int64_t dsv41_prompt_skip_min_rows() {
+    static const int64_t min_rows = [] {
+        const char * v = getenv("LLAMA_DSV41_PROMPT_SKIP_MIN");
+        return v ? (int64_t) atoll(v) : (int64_t) 1024;
+    }();
+    return min_rows;
+}
+
+int32_t llama_context::prompt_skip_ckpt_min_pos(int32_t n_total) const {
+    const auto & hp = model.hparams;
+    if (!dsv41_prompt_skip_enabled() || hp.dsv41_yoco < 0 || hp.n_swa == 0) {
+        return -1;
+    }
+    const int64_t keep = dsv41_prompt_skip_keep(hp);
+    if (n_total - keep < dsv41_prompt_skip_min_rows()) {
+        return -1;
+    }
+    // the layer above the skip layer's window rings (layer - 1 outputs) are exact from cut + (n_layer - yoco - 1)*(win - 1) + win
+    return (int32_t) (n_total - keep + (int64_t) (hp.n_layer() - hp.dsv41_yoco - 1)*(hp.n_swa - 1) + hp.n_swa);
+}
+
+uint32_t llama_context::prompt_skip_head_rows(const llama_batch_ext & batch, bool output_all) {
+    if (!dsv41_prompt_skip_enabled()) {
+        return 0;
+    }
+
+    const auto & hp = model.hparams;
+    if (hp.dsv41_yoco < 0 || hp.n_swa == 0 || output_all || cparams.embeddings || cparams.embeddings_nextn || !cparams.causal_attn) {
+        return 0;
+    }
+    for (bool b : cparams.embeddings_layer_inp) {
+        if (b) {
+            return 0;
+        }
+    }
+    if (batch.tokens.empty() || !sampling.samplers.empty()) {
+        return 0;
+    }
+
+    const int64_t keep     = dsv41_prompt_skip_keep(hp);
+    const int64_t min_rows = dsv41_prompt_skip_min_rows();
+
+    const auto & t0 = batch.tokens[0];
+    if (t0.seq_ids.size() != 1) {
+        return 0;
+    }
+    const llama_seq_id seq = *t0.seq_ids.begin();
+    if (seq < 0 || seq >= (llama_seq_id) prompt_total.size() || prompt_total[seq] <= 0) {
+        return 0;
+    }
+    const int64_t total = prompt_total[seq];
+    const int64_t p0    = t0.pos[0];
+
+    // the hint is spent once the prompt's last row is in a batch
+    const int64_t n = (int64_t) batch.tokens.size();
+    if (p0 + n >= total) {
+        prompt_total[seq] = 0;
+    }
+
+    const int64_t cut  = total - keep;
+    const int64_t rows = std::min<int64_t>(n, cut - p0);
+    if (cut - p0 < min_rows || rows <= 0) {
+        return 0;
+    }
+
+    for (int64_t i = 0; i < n; ++i) {
+        const auto & t = batch.tokens[i];
+        if (t.seq_ids.size() != 1 || *t.seq_ids.begin() != seq || t.pos[0] != p0 + i || t.has_embd ||
+                (i < rows && t.output)) {
+            return 0;
+        }
+    }
+
+    // stderr on purpose: the default log level hides INFO, and this is one line per prompt batch that is skipped
+    fprintf(stderr, "llama_context: prompt skip: seq %d, rows [%" PRId64 ", %" PRId64 ") of %" PRId64 " run as head (layers < %d only), keep %" PRId64 "\n",
+            seq, p0, p0 + rows, total, hp.dsv41_yoco, keep);
+    return (uint32_t) rows;
 }
 
 void llama_context::sched_reserve() {
@@ -2314,7 +2425,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const uint32_t skip_head_rows = prompt_skip_head_rows(batch_inp, output_all);
+
     while (true) {
+        if (skip_head_rows > 0) {
+            if (auto * kv_dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get())) {
+                kv_dsv4->set_prompt_head_rows(skip_head_rows);
+            }
+        }
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
             return -2;
@@ -4734,6 +4852,14 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_prompt_total(llama_context * ctx, llama_seq_id seq_id, int32_t n_total) {
+    ctx->set_prompt_total(seq_id, n_total);
+}
+
+int32_t llama_prompt_skip_ckpt_min_pos(const llama_context * ctx, int32_t n_total) {
+    return ctx->prompt_skip_ckpt_min_pos(n_total);
 }
 
 void llama_synchronize(llama_context * ctx) {
