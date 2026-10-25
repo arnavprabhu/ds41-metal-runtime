@@ -5869,6 +5869,72 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// DS41 routed experts (iter 014k): up = MUL_MAT_ID, gate = MUL_MAT_ID (same activations and ids), then swiglu /
+// swiglu_clamp. With GGML_METAL_DS41_MMID=1 Metal runs the three nodes as one kernel_mul_mm_id_glu dispatch.
+struct test_ds41_moe_glu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;   // n_ff_exp
+    const int64_t n;   // tokens
+    const int64_t k;   // n_embd
+    const bool clamp;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_MOE_GLU";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, m, n, k, clamp);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * 2 * m * k * n * n_used;
+    }
+
+    test_ds41_moe_glu(ggml_type type_a = GGML_TYPE_Q4_0, int n_mats = 16, int n_used = 6,
+            int64_t m = 256, int64_t n = 64, int64_t k = 256, bool clamp = true)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), clamp(clamp) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up_w, "up_exps");
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate_w, "gate_exps");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, up_w,   b, ids);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, b, ids);
+
+        ggml_tensor * out = clamp ? ggml_swiglu_clamp(ctx, gate, up, 7.0f) : ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -10099,6 +10165,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ds41_hc_post_moe(128, 1, 9));
     test_cases.emplace_back(new test_ds41_hc_post_moe(128, 8, 9));
     test_cases.emplace_back(new test_ds41_hc_mix(512, 8, 40));
+    // iter 014k: routed-expert gate + up + swiglu(_clamp) (GGML_METAL_DS41_MMID=1 fuses them on Metal)
+    for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M }) {
+        for (int64_t n : { 32, 33, 100 }) {
+            test_cases.emplace_back(new test_ds41_moe_glu(t, 16, 6, 256, n, 256, true));
+        }
+    }
+    test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_IQ2_XS, 8, 4, 192, 77, 512, false));
+    test_cases.emplace_back(new test_ds41_moe_glu(GGML_TYPE_F16,    32, 6, 128, 300, 256, true));
     test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q5_K, 256,  64, 8, 33));
     test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_F16,  256,  64, 8, 200));
     test_cases.emplace_back(new test_ds41_wo_a(GGML_TYPE_Q8_0, 256, 128, 4, 129));
@@ -12497,6 +12571,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
+        }
+        // routed experts gate + up + swiglu_clamp, real prefill shapes (DS41_MOE=1, iter 014k): 384 experts, 6 used,
+        // n_ff 2304, n_embd 5120; compare GGML_METAL_DS41_MMID=0 (two MUL_MAT_ID + GLU) vs =1 (one fused dispatch)
+        if (getenv("DS41_MOE")) {
+            for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
+                test_cases.emplace_back(new test_ds41_moe_glu(t, 384, 6, 2304, n, 5120, true));
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 384, 6, true, 2304, n, 5120));
+            }
         }
         // prefill traffic fusions (DS41_PF=1, iter 013k): set DS41_N=4096 (or 4096,4095,33) for ubatch shapes
         if (getenv("DS41_PF")) {

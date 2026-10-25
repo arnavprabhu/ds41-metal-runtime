@@ -612,6 +612,21 @@ typedef struct {
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne02;
+    uint64_t nb01;  // gate and up have the same layout
+    uint64_t nb02;
+    int32_t  ne11;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne20;
+    int32_t  ne0;
+    int32_t  ne1;
+    float    limit; // swiglu_clamp
+} ggml_metal_kargs_mul_mm_id_glu;
+
+typedef struct {
     int32_t  nei0;
     int32_t  nei1;
     uint64_t nbi1;

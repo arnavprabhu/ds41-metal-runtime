@@ -72,6 +72,9 @@ int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt);
 // strided wo_a store). Off by default; the graph-side half reads the same variable.
 bool ggml_metal_ds41_pfuse(void);
 
+// GGML_METAL_DS41_MMID=1: routed-expert gate + up + SWIGLU in one mat-mat dispatch (MUL_MAT_ID x2 + GLU fusion)
+bool ggml_metal_ds41_mmid(void);
+
 #ifdef __cplusplus
 }
 #endif

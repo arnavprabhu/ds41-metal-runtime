@@ -957,6 +957,60 @@ static bool ggml_metal_fusion_check_ds41_mm_perm(
     return ggml_can_fuse_subgraph_ext(gf, raw, 3, fusion->ops_all.data(), outputs, 1);
 }
 
+// MUL_MAT_ID + MUL_MAT_ID + GLU (GGML_METAL_DS41_MMID=1): the routed-expert up and gate products of one layer (same
+// activations, same ids, same weight layout) feeding a split swiglu / swiglu_clamp; kernel_mul_mm_id_glu computes both
+// products per entry tile and writes only the GLU. The encoder fuses only on the mat-mat path of tensor-API devices.
+static bool ggml_metal_fusion_check_ds41_mmid_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(mode);
+
+    if (!ggml_metal_ds41_mmid()) {
+        return false;
+    }
+
+    const ggml_tensor * a   = nodes[0];
+    const ggml_tensor * b   = nodes[1];
+    const ggml_tensor * glu = nodes[2];
+
+    const ggml_glu_op gop = ggml_get_glu_op(glu);
+    if (gop != GGML_GLU_OP_SWIGLU && gop != GGML_GLU_OP_SWIGLU_CLAMP) {
+        return false;
+    }
+    if (glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (!((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a))) {
+        return false;
+    }
+
+    for (const ggml_tensor * m : { a, b }) {
+        if (m->src[3] != nullptr || m->type != GGML_TYPE_F32 || m->src[1]->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(m) || m->src[0]->ne[0] % 32 != 0 || m->src[0]->ne[3] != 1) {
+            return false;
+        }
+    }
+
+    if (a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
+            a->src[0]->type != b->src[0]->type || !ggml_are_same_shape(a->src[0], b->src[0]) ||
+            a->src[0]->nb[1] != b->src[0]->nb[1] || a->src[0]->nb[2] != b->src[0]->nb[2] ||
+            ggml_get_op_params_i32(a, 3) != ggml_get_op_params_i32(b, 3) ||
+            !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, glu) ||
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+
+    const int raw[3]     = { node_idxs[idx], node_idxs[idx + 1], node_idxs[idx + 2] };
+    const int outputs[1] = { node_idxs[idx + 2] };
+    const ggml_op ops[3] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+    return ggml_can_fuse_subgraph_ext(gf, raw, 3, ops, outputs, 1);
+}
+
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
 static const std::vector<ggml_op> ops_norm_mul_add     = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP_SCALE };
@@ -1007,6 +1061,7 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
 static const std::vector<ggml_op> ops_ds41_mm_perm = { GGML_OP_MUL_MAT, GGML_OP_PERMUTE, GGML_OP_CONT };
+static const std::vector<ggml_op> ops_ds41_mmid_glu = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
 
 static const std::vector<ggml_op> ops_ds41_hc_gate = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE };
 static const std::vector<ggml_op> ops_ds41_router  = { GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_ADD };
@@ -1046,6 +1101,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_DS41_ROUTER,    ops_ds41_router,            {1},    false, ggml_metal_fusion_check_ds41_router },
     { GGML_METAL_FUSION_DS41_MOE_W,     ops_ds41_moe_w,             {},     true,  ggml_metal_fusion_check_ds41_moe_w },
     { GGML_METAL_FUSION_DS41_MM_PERM,   ops_ds41_mm_perm,           {},     true,  ggml_metal_fusion_check_ds41_mm_perm },
+    { GGML_METAL_FUSION_DS41_MMID_GLU,  ops_ds41_mmid_glu,          {},     true,  ggml_metal_fusion_check_ds41_mmid_glu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1101,6 +1157,9 @@ void ggml_metal_fusion_add_alloc_deps(
             }
             // keep the default allocation unchanged when the DS41 prefill fusions are off
             if (fusion.id == GGML_METAL_FUSION_DS41_MM_PERM && !ggml_metal_ds41_pfuse()) {
+                continue;
+            }
+            if (fusion.id == GGML_METAL_FUSION_DS41_MMID_GLU && !ggml_metal_ds41_mmid()) {
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {

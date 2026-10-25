@@ -945,6 +945,217 @@ kernel void kernel_mul_mm_id(
     }
 }
 
+#ifdef GGML_METAL_HAS_TENSOR
+constant bool FC_mul_mm_id_glu_clamp [[function_constant(FC_MUL_MM + 8)]];
+
+// DS41 prefill (iter 014k, GGML_METAL_DS41_MMID): routed-expert gate and up in one pass, SWIGLU in the store.
+// Same entry tiles (prepass), tile shape (64 rows x 32 entries, K step 32), dequantization, src1 conversion and
+// matmul2d descriptors as kernel_mul_mm_id, so each accumulator is the one the separate gate / up dispatches
+// produce; the GLU is applied to those values exactly as kernel_swiglu(_clamp) does. One src1 tile serves both
+// weight tiles, one barrier pair per step covers twice the math, and neither gate nor up is written to memory.
+template<typename S0, typename S0_4x4, typename S1, typename S1_2x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T1, typename T1_2x4>
+kernel void kernel_mul_mm_id_glu(
+        constant ggml_metal_kargs_mul_mm_id_glu & args,
+        device const char * src0g,
+        device const char * src0u,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst,
+        device const char * amax,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    constexpr short NR1H = NR1/2;
+
+    threadgroup S0 * sag = (threadgroup S0 *)(shmem);
+    threadgroup S0 * sau = (threadgroup S0 *)(shmem + 4096);
+    threadgroup S1 * sb  = (threadgroup S1 *)(shmem + 8192);
+
+    threadgroup float * scg = (threadgroup float *)(shmem);
+    threadgroup float * scu = (threadgroup float *)(shmem + 8192);
+
+    const int tile = tgpig.x;
+    const int r0   = tgpig.y*NR0;
+
+    device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+
+    if (tile >= (int) tpe_u32[0]) {
+        return;
+    }
+
+    const int im  = tpe_u32[1 + 3*tile];
+    const int idb = tpe_u32[1 + 3*tile + 1];
+
+    const short nr1 = (short) ((tpe_u32[1 + 3*tile + 2] < NR1) ? tpe_u32[1 + 3*tile + 2] : NR1);
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short il0 = (tiitg % NL0);
+
+    const uint64_t offset0 = im*args.nb02;
+    const short    offset1 = il0/nl;
+
+    const short iy = 8*(tiitg % NL1);
+
+    const float s1_inv   = FC_mul_mm_id_amax ? ((device const float *) amax)[0] : 1.0f;
+    const float s1_scale = FC_mul_mm_id_amax ? ((device const float *) amax)[1] : 1.0f;
+
+    auto tAg = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sag, dextents<int32_t, 2>(NK, NR0));
+    auto tAu = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sau, dextents<int32_t, 2>(NK, NR0));
+
+    auto tB0 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb,           dextents<int32_t, 2>(NK, NR1H));
+    auto tB1 = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb + NR1H*NK, dextents<int32_t, 2>(NK, NR1H));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(NR1H, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    short il = il0;
+
+    const int id = ids_i32[idb + lr1];
+
+    const short i11 = (id % args.ne20) % args.ne11;
+    const short i12 = (id / args.ne20);
+
+    device const block_q * xg = (device const block_q *)(src0g + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * xu = (device const block_q *)(src0u + args.nb01*(r0 + lr0) + offset0) + offset1;
+
+    device const T1 * y = (device const T1 *)(src1
+        + args.nb12*i12
+        + args.nb11*i11
+        + args.nb10*iy);
+
+    const bool has_hi = nr1 > NR1H;
+
+    auto cG0 = mm.get_destination_cooperative_tensor<decltype(tAg), decltype(tB0), float>();
+    auto cG1 = mm.get_destination_cooperative_tensor<decltype(tAg), decltype(tB1), float>();
+    auto cU0 = mm.get_destination_cooperative_tensor<decltype(tAu), decltype(tB0), float>();
+    auto cU1 = mm.get_destination_cooperative_tensor<decltype(tAu), decltype(tB1), float>();
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        S0_4x4 temp_g;
+        S0_4x4 temp_u;
+        dequantize_func(xg, il, temp_g);
+        dequantize_func(xu, il, temp_u);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = i%8;
+            const short ly = (tiitg/NL0)%8;
+
+            *(sag + NK*(8*sy + ly) + 8*sx + lx) = temp_g[i/4][i%4];
+            *(sau + NK*(8*sy + ly) + 8*sx + lx) = temp_u[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)((*((device T1_2x4 *) y)) * (T1) s1_inv);
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        xg = (il < 2) ? xg + (2 + nl - 1)/nl : xg;
+        xu = (il < 2) ? xu + (2 + nl - 1)/nl : xu;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto sAg = tAg.slice(0, 0);
+        auto sAu = tAu.slice(0, 0);
+        auto sB0 = tB0.slice(0, 0);
+
+        mm.run(sB0, sAg, cG0);
+        mm.run(sB0, sAu, cU0);
+
+        if (has_hi) {
+            auto sB1 = tB1.slice(0, 0);
+
+            mm.run(sB1, sAg, cG1);
+            mm.run(sB1, sAu, cU1);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        auto tG0 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(scg, dextents<int32_t, 2>(NR0, NR1H));
+        auto tU0 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(scu, dextents<int32_t, 2>(NR0, NR1H));
+        cG0.store(tG0);
+        cU0.store(tU0);
+
+        if (has_hi) {
+            auto tG1 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(scg + NR1H*NR0, dextents<int32_t, 2>(NR0, NR1H));
+            auto tU1 = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(scu + NR1H*NR0, dextents<int32_t, 2>(NR0, NR1H));
+            cG1.store(tG1);
+            cU1.store(tU1);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int id = ids_i32[idb + j];
+
+        const short ide = id % args.ne20;
+        const short idt = id / args.ne20;
+
+        device float * D = (device float *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+
+        threadgroup const float * G = scg + j*NR0;
+        threadgroup const float * U = scu + j*NR0;
+
+        for (int i = tiisg; i < nr0; i += 32) {
+            // the values the separate mul_mm_id dispatches store, then kernel_swiglu(_clamp)
+            const float g0 = G[i] * s1_scale;
+            const float u0 = U[i] * s1_scale;
+            if (FC_mul_mm_id_glu_clamp) {
+                const float gate = min(g0, args.limit);
+                const float up   = clamp(u0, -args.limit, args.limit);
+                D[i] = gate / (1.0f + exp(-gate)) * up;
+            } else {
+                const float silu = g0 / (1.0f + exp(-g0));
+                D[i] = silu*u0;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_id_glu<half, half4x4, half, half2x4, half4x4, 1, dequantize_f16, float, float2x4>) mul_mm_id_glu;
+
+template [[host_name("kernel_mul_mm_id_glu_f16_f32")]]     kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, half4x4,       1,     dequantize_f16,     float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_q4_0_f32")]]    kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_q4_0,    2,     dequantize_q4_0,    float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_q8_0_f32")]]    kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_q8_0,    2,     dequantize_q8_0,    float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_q4_K_f32")]]    kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_q4_K,    QK_NL, dequantize_q4_K,    float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_q5_K_f32")]]    kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_q5_K,    QK_NL, dequantize_q5_K,    float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq2_xxs_f32")]] kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq2_xs_f32")]]  kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq2_xs,  QK_NL, dequantize_iq2_xs,  float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq2_s_f32")]]   kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq2_s,   QK_NL, dequantize_iq2_s,   float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq3_xxs_f32")]] kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq1_s_f32")]]   kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq1_s,   QK_NL, dequantize_iq1_s,   float, float2x4>;
+template [[host_name("kernel_mul_mm_id_glu_iq1_m_f32")]]   kernel mul_mm_id_glu kernel_mul_mm_id_glu<half, half4x4, half, half2x4, block_iq1_m,   QK_NL, dequantize_iq1_m,   float, float2x4>;
+#endif // GGML_METAL_HAS_TENSOR
+
 //
 // matrix-matrix multiplication
 //

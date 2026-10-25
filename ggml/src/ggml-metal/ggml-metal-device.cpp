@@ -1381,6 +1381,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_glu(ggml_metal_library_t lib, const ggml_tensor * op, bool clamp) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const ggml_type tsrc1 = op->src[1]->type;
+
+    const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_id_glu_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(name, 256, "%s_amax=%d_cl=%d", base, amax, clamp);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, amax,  FC_MUL_MM + 6);
+        ggml_metal_cv_set_bool(cv, clamp, FC_MUL_MM + 8);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    // loop: gate tile, up tile (64 x 32 half each), src1 tile (32 x 32 half); store: gate and up C tiles (64 x 32 f32 each)
+    res.smem = 16384;
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);

@@ -9,6 +9,14 @@
 
 #include <vector>
 
+bool ggml_metal_ds41_mmid(void) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_METAL_DS41_MMID");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 bool ggml_metal_ds41_pfuse(void) {
     static const bool on = [] {
         const char * v = getenv("GGML_METAL_DS41_PFUSE");

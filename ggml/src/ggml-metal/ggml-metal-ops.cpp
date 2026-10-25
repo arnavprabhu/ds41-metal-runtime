@@ -3028,6 +3028,18 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     const uint32_t r3 = 1;
 
     if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
+        // MUL_MAT_ID (up) + MUL_MAT_ID (gate) + GLU (GGML_METAL_DS41_MMID): one tile kernel for both products, writing
+        // only the GLU; the prepass of this node (same ids) describes the entry tiles of both
+        const ggml_tensor * glu = nullptr;
+        if (props_dev->has_tensor && ctx->use_fusion() && idx + 2 < ctx->n_nodes()) {
+            int n = 1;
+            const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+            if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_MMID_GLU && n == 3) {
+                glu = ctx->node(idx + 2);
+                ctx->count_fusions(fusion);
+            }
+        }
+
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -3119,6 +3131,55 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             // the next kernel has to wait for the amax data
             ggml_metal_op_concurrency_reset(ctx);
+        }
+
+        if (glu) {
+            const bool swapped = ggml_get_op_params_i32(glu, 1) != 0;
+            GGML_ASSERT(!swapped);
+
+            const ggml_tensor * mm_gate = glu->src[0];
+            const ggml_tensor * mm_up   = glu->src[1];
+
+            const bool clamp = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP;
+
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_glu(lib, op, clamp);
+
+            ggml_metal_kargs_mul_mm_id_glu args = {
+                /*.ne00  =*/ ne00,
+                /*.ne02  =*/ ne02,
+                /*.nb01  =*/ nb01,
+                /*.nb02  =*/ nb02,
+                /*.ne11  =*/ ne11,
+                /*.nb10  =*/ nb10,
+                /*.nb11  =*/ nb11,
+                /*.nb12  =*/ nb12,
+                /*.ne20  =*/ ne20,
+                /*.ne0   =*/ ne0,
+                /*.ne1   =*/ ne1,
+                /*.limit =*/ clamp ? ggml_get_op_params_f32(glu, 3) : 0.0f,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_gate->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mm_up->src[0]),   2);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids,  5);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu), 6);
+            ggml_metal_encoder_set_buffer  (enc, bid_amax, 7);
+
+            const size_t smem = pipeline.smem;
+
+            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            const int max_tiles = (int) ggml_metal_op_mul_mat_id_max_tiles(op);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
+
+            return 3;
         }
 
         {
