@@ -242,6 +242,8 @@ struct server_batch {
     }
 };
 
+#include "spec-cost.h"
+
 struct server_slot {
     int id;
 
@@ -995,6 +997,10 @@ private:
 
     server_batch batch;
 
+    // cost-aware draft-length controller (LLAMA_SPEC_CTRL=1) for deterministic n-gram drafts
+    spec_cost_ctrl spec_ctrl;
+    int            spec_ctrl_rows = 0; // rows of the pending decode when it is a pure single-slot generation step, else 0
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1401,6 +1407,7 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec_ctrl.init_from_env();
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -3521,6 +3528,17 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            if (spec_ctrl.enabled && !draft.empty() && ctx_dft == nullptr) {
+                // deterministic (n-gram) draft: any prefix is a valid draft, pick the width by tokens per measured ms
+                const int k = spec_ctrl.choose((int) draft.size());
+                if (k < (int) draft.size()) {
+                    draft.resize(k);
+                    if (!slot.spec_draft_q.empty()) {
+                        slot.spec_draft_q.resize(k);
+                    }
+                }
+            }
+
             slot.stats.n_draft_tokens += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3568,6 +3586,9 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+
+        // a pure single-slot generation step is what the cost controller measures
+        spec_ctrl_rows = (spec_ctrl.enabled && generating.size() == 1) ? (int) batch.size() : 0;
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -4289,12 +4310,17 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool ctrl_timed = spec_ctrl_rows > 0 && off == 0 && (int) batch.size() == spec_ctrl_rows && (int) batch.view.size() == spec_ctrl_rows;
+        const int64_t t_ctrl0 = ctrl_timed ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (ctrl_timed && ret == 0) {
+            spec_ctrl.observe_time(spec_ctrl_rows, (ggml_time_us() - t_ctrl0) / 1000.0);
+        }
 
         if (ret != 0) {
             {
@@ -4595,6 +4621,10 @@ private:
                 }
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+
+                if (spec_ctrl.enabled && !slot.spec_is_replay) {
+                    spec_ctrl.observe_accept((int) n_draft, (int) accepted.size() - 1);
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
