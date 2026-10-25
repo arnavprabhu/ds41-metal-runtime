@@ -1001,6 +1001,12 @@ static bool ggml_metal_ds41_iq(void) {
     return v;
 }
 
+// GGML_METAL_DS41_IQ1M=1 : IQ1_M mul_mv_id v2 (grid word decoded with integer ops, no value table; iter 011k)
+static bool ggml_metal_ds41_iq1m(void) {
+    static const bool v = ggml_metal_ds41_env("GGML_METAL_DS41_IQ1M");
+    return v;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1562,6 +1568,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         }
     }
 
+    // v2a: 6 rows per simdgroup, 2 simdgroups, grid from constant memory (12 rows per threadgroup)
+    // v2b: 4 row groups of 8 lanes x 4 rows, 4 simdgroups, grid in threadgroup memory (64 rows per threadgroup)
+    if (ggml_metal_ds41_iq1m() && tsrc0 == GGML_TYPE_IQ1_M && !split && tsrc1 == GGML_TYPE_F32 && ne00 % 256 == 0 && op->src[1]->nb[1] % 16 == 0) {
+        const bool x2 = (ne00/32) % 32 != 0;
+        if (!x2 && ne01 % 12 == 0) {
+            nsg = 2; nr0 =  6; smem = 0;      suffix = "_v2a";
+        } else if (x2 && (ne00/32) % 8 == 0 && ne01 % 64 == 0) {
+            nsg = 4; nr0 = 16; smem = 2048*4; suffix = "_v2b";
+        }
+    }
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
 
@@ -1999,6 +2016,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_attn(ggml_metal_library_t lib, int version) {
     const char * name = version >= 2 ? "kernel_dsv4_sparse_attn_v2_f16" : "kernel_dsv4_sparse_attn_f16";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_w(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_vec_idx_w";
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
@@ -2464,6 +2490,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d(ggml_m
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_hc_gate(ggml_metal_library_t lib) {
+    const char * name = "kernel_ds41_hc_gate_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_moe_w(ggml_metal_library_t lib) {
+    const char * name = "kernel_ds41_moe_w_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_router(ggml_metal_library_t lib) {
+    const char * name = "kernel_ds41_router_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
     }
 
     return res;

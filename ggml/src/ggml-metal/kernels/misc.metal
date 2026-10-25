@@ -399,6 +399,81 @@ kernel void kernel_snake(
     dst[idx] = T(xi + si * si * inv_b[c]);
 }
 
+// DeepSeek-V4 hc gate (iter 011k, GGML_METAL_DS41_FUSE): MUL(x, s[0]) -> ADD(base) -> sigmoid -> SCALE(scale, bias)
+// in one dispatch; each step rounds to float like the separate kernels (fp contraction off).
+kernel void kernel_ds41_hc_gate_f32(
+        constant ggml_metal_kargs_ds41_hc_gate & args,
+        device const char * x,
+        device const char * s,
+        device const char * b,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+#pragma clang fp contract(off)
+    const int i0 = tpig % args.ne0;
+    const int i1 = tpig / args.ne0;
+    if (i1 >= args.ne1) {
+        return;
+    }
+    const float xv = *(device const float *) (x + i0*args.nb00 + i1*args.nb01);
+    const float sv = *(device const float *) s;
+    const float bv = *(device const float *) (b + i0*args.nb10 + i1*args.nb11);
+    const float m  = xv*sv;
+    const float a  = m + bv;
+    const float g  = 1 / (1 + exp(-a));
+    *(device float *) (dst + i0*sizeof(float) + i1*args.nb1) = args.scale*g + args.bias;
+}
+
+// DeepSeek-V4 router scores (iter 011k, GGML_METAL_DS41_FUSE): softplus -> sqrt (probs, also written) -> + bias.
+// Same expressions as the unary softplus / sqrt and the binary add kernels.
+kernel void kernel_ds41_router_f32(
+        constant ggml_metal_kargs_ds41_router & args,
+        device const char * x,
+        device const char * b,
+        device       char * probs,
+        device       char * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    const int i0 = tpig % args.ne0;
+    const int i1 = tpig / args.ne0;
+    if (i1 >= args.ne1) {
+        return;
+    }
+    const float xv = *(device const float *) (x + i0*sizeof(float) + i1*args.nb01);
+    const float u  = exp(-fabs(xv));
+    const float pp = u*(1.0f - u*(0.5f - u*(1.0f/3.0f - u*(0.25f - u*(0.2f - u*(1.0f/6.0f))))));
+    const float sp = fmax(xv, 0.0f) + select(log(1.0f + u), pp, u < 0.0625f);
+    const float pr = sqrt(sp);
+    *(device float *) (probs + i0*sizeof(float) + i1*args.nb1p) = pr;
+    *(device float *) (dst   + i0*sizeof(float) + i1*args.nb1)  = pr + *(device const float *) (b + i0*sizeof(float) + i1*args.nb11);
+}
+
+// DeepSeek-V4 MoE weights (iter 011k, GGML_METAL_DS41_FUSE): gather the routing probabilities of the selected
+// experts, divide by (scale1*sum + bias1), apply the final scale. One simdgroup per token (n_used <= 32).
+kernel void kernel_ds41_moe_w_f32(
+        constant ggml_metal_kargs_ds41_moe_w & args,
+        device const char * probs,
+        device const char * ids,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int it = tgpig.x*ntg.y + sgitg;
+    if (it >= args.n_tokens) {
+        return;
+    }
+    float w = 0.0f;
+    if (tiisg < args.n_used) {
+        const int32_t id = *(device const int32_t *) (ids + tiisg*args.nb_i0 + it*args.nb_i1);
+        w = *(device const float *) (probs + id*args.nb_p1 + it*args.nb_p2);
+    }
+    const float sum = simd_sum(w);
+    const float s   = args.scale1*sum + args.bias1;
+    const float q   = w / s;
+    if (tiisg < args.n_used) {
+        *(device float *) (dst + tiisg*args.nb1 + it*args.nb2) = args.scale2*q + args.bias2;
+    }
+}
+
 template [[host_name("kernel_snake_f32")]]  kernel void kernel_snake<float>(constant ggml_metal_kargs_snake &, device const float *, device const float *, device const float *, device float *, uint, uint, uint);
 template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(constant ggml_metal_kargs_snake &, device const half *, device const float *, device const float *, device half *, uint, uint, uint);
 #if defined(GGML_METAL_HAS_BF16)

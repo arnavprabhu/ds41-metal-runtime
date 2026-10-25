@@ -4405,6 +4405,144 @@ struct test_snake_fuse : public test_case {
 };
 
 
+// DeepSeek-V4 MoE weights as built by build_moe_ffn (norm_w, sum + 1e-20, weight scale): get_rows of the probabilities
+// at the selected experts, sum_rows, scale_bias, div, scale (Metal fuses this chain with GGML_METAL_DS41_FUSE=1)
+struct test_ds41_moe_w_fuse : public test_case {
+    const int64_t n_exp;
+    const int64_t n_used;
+    const int64_t nt;
+    const float   w_scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_MOE_W";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_exp, n_used, nt, w_scale);
+    }
+
+    test_ds41_moe_w_fuse(int64_t n_exp = 384, int64_t n_used = 6, int64_t nt = 1, float w_scale = 1.5f)
+        : n_exp(n_exp), n_used(n_used), nt(nt), w_scale(w_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(probs, "probs");
+        ggml_tensor * sel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(sel, "sel");
+
+        ggml_tensor * ids = ggml_argsort_top_k(ctx, sel, n_used);
+        ggml_tensor * w = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_exp, nt), ids);
+        w = ggml_reshape_2d(ctx, w, n_used, nt);
+        ggml_tensor * sum = ggml_sum_rows(ctx, w);
+        sum = ggml_scale_bias(ctx, sum, 1.0f, 1e-20f);
+        w = ggml_div(ctx, w, sum);
+        w = ggml_reshape_3d(ctx, w, 1, n_used, nt);
+        w = ggml_scale(ctx, w, w_scale);
+        ggml_set_name(w, "out");
+        return w;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, 0.01f, 4.0f);
+        }
+    }
+};
+
+// DeepSeek-V4 router scores: probs = sqrt(softplus(logits)), biased = probs + bias; both are consumed (argsort on
+// biased, get_rows on probs) (Metal fuses this chain with GGML_METAL_DS41_FUSE=1)
+struct test_ds41_router_fuse : public test_case {
+    const int64_t n_exp;
+    const int64_t nt;
+    const bool    use_probs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_ROUTER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_exp, nt, use_probs);
+    }
+
+    test_ds41_router_fuse(int64_t n_exp = 384, int64_t nt = 1, bool use_probs = true)
+        : n_exp(n_exp), nt(nt), use_probs(use_probs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_exp, nt);
+        ggml_set_name(logits, "logits");
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_exp);
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * probs  = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+        ggml_tensor * biased = ggml_add(ctx, probs, bias);
+        ggml_tensor * out    = use_probs ? ggml_add(ctx, ggml_scale(ctx, biased, 0.5f), probs) : ggml_scale(ctx, biased, 0.5f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -20.0f, 8.0f);
+        }
+    }
+};
+
+// DeepSeek-V4 hc pre/post gate as built by build_hc_mixes: views of the [24, nt] mixes, a 1-element scale view,
+// a 4-element base view, sigmoid, scale_bias (Metal fuses this chain with GGML_METAL_DS41_FUSE=1)
+struct test_ds41_hc_gate_fuse : public test_case {
+    const int64_t nt;
+    const int     off;    // 0: pre, 4: post
+    const float   sc;
+    const float   bi;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DS41_HC_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(nt, off, sc, bi);
+    }
+
+    test_ds41_hc_gate_fuse(int64_t nt = 1, int off = 0, float sc = 1.0f, float bi = 1e-6f)
+        : nt(nt), off(off), sc(sc), bi(bi) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, nt);
+        ggml_set_name(mixes, "mixes");
+        ggml_tensor * hc_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(hc_scale, "hc_scale");
+        ggml_tensor * hc_base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+        ggml_set_name(hc_base, "hc_base");
+
+        ggml_tensor * x = ggml_view_2d(ctx, mixes, 4, nt, mixes->nb[1], off*sizeof(float));
+        ggml_tensor * s = ggml_view_1d(ctx, hc_scale, 1, (off/4)*sizeof(float));
+        ggml_tensor * b = ggml_view_1d(ctx, hc_base, 4, off*sizeof(float));
+
+        ggml_tensor * cur = ggml_mul(ctx, x, s);
+        cur = ggml_add(ctx, cur, b);
+        cur = ggml_sigmoid(ctx, cur);
+        cur = ggml_scale_bias(ctx, cur, sc, bi);
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -4.0f, 4.0f);
+        }
+    }
+};
+
+
 struct test_dsv4_hc : public test_case {
     static constexpr int64_t hc = 4;
 
@@ -9795,6 +9933,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
+    for (int64_t nt : { 1, 3, 8, 37 }) {
+        test_cases.emplace_back(new test_ds41_hc_gate_fuse(nt, 0, 1.0f, 1e-6f));
+        test_cases.emplace_back(new test_ds41_hc_gate_fuse(nt, 4, 2.0f, 0.0f));
+    }
+    for (int64_t nt : { 1, 2, 9 }) {
+        test_cases.emplace_back(new test_ds41_router_fuse(384, nt, true));
+        test_cases.emplace_back(new test_ds41_router_fuse(384, nt, false));
+    }
+    for (int64_t nt : { 1, 2, 9, 40 }) {
+        test_cases.emplace_back(new test_ds41_moe_w_fuse(384, 6, nt, 1.5f));
+        test_cases.emplace_back(new test_ds41_moe_w_fuse(64, 8, nt, 2.5f));
+    }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
@@ -12189,6 +12339,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  2304, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  5120, n, 2304, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 129280, n, 5120, {1, 1}, {1, 1}));
+        // router gate_inp (BF16, 384 x 5120) and hc_fn (F32, 24 x 20480)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  384, n,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,   24, n, 20480, {1, 1}, {1, 1}));
         // dense Q8_0: attn_q_a, attn_kv
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  1280, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   512, n, 5120, {1, 1}, {1, 1}));
@@ -12197,6 +12350,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
+        }
+        // decode sparse attention (DS41_FA=1): 64 heads, 1 KV head, dk = dv = 512, V view of K, index lists of
+        // n_kv_max entries (window only at short depth, window + top-k 512 at long depth)
+        if (getenv("DS41_FA")) {
+            for (int64_t nkv : { 128, 640 }) {
+                for (int64_t kv : { 4224, 131200 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, n, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, nkv));
+                }
+            }
         }
     }
     return test_cases;

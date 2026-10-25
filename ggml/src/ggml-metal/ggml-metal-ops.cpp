@@ -815,6 +815,15 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_ROUTER) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_router(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -1211,6 +1220,15 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_MOE_W) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_moe_w(ctx, idx);
+        }
+    }
+
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -3900,7 +3918,21 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             // GGML_METAL_DSV4_SATTN >= 2: coalesced builder (one simdgroup per mask row, 8 rows per threadgroup),
             // same lists; needs 8-byte aligned mask rows
             static const bool env_idx_v2 = getenv("GGML_METAL_DSV4_SATTN") && atoi(getenv("GGML_METAL_DSV4_SATTN")) >= 2;
-            if (env_idx_v2 && nb31 % 8 == 0 && nb32 % 8 == 0 && nb33 % 8 == 0 && (op->src[3]->view_offs % 8) == 0) {
+            // GGML_METAL_DS41_IDXW=1 (iter 011k): few long rows (decode at depth) -> one 32-simdgroup threadgroup per row
+            static const bool env_idx_w = getenv("GGML_METAL_DS41_IDXW") && atoi(getenv("GGML_METAL_DS41_IDXW")) != 0;
+            const bool aligned8 = nb31 % 8 == 0 && nb32 % 8 == 0 && nb33 % 8 == 0 && (op->src[3]->view_offs % 8) == 0;
+            if (env_idx_w && aligned8 && (int64_t) ne31*ne32*ne33 <= 64 && ne30 >= 8192) {
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_w(lib);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(int32_t), 0);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, 32*32, 1, 1);
+            } else
+            if (env_idx_v2 && aligned8) {
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_v2(lib);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
@@ -4225,6 +4257,12 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SNAKE) {
             ctx->count_fusions(fusion);
             return ggml_metal_op_snake_fused(ctx, idx);
+        }
+
+        // DeepSeek-V4 hc gate: mul -> add -> sigmoid -> scale
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_DS41_HC_GATE) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_ds41_hc_gate(ctx, idx);
         }
 
         // MoE output reduction: experts * weights -> weighted sum
@@ -5175,6 +5213,147 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     const int nth = 256;
     const int ntg = (total + nth - 1) / nth;
     ggml_metal_encoder_dispatch_threadgroups(enc, ntg, 1, 1, nth, 1, 1);
+
+    return 5;
+}
+
+// Dispatch the fused DeepSeek-V4 hc gate from the matched mul -> add -> sigmoid -> scale chain.
+int ggml_metal_op_ds41_hc_gate(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * mul = ctx->node(idx + 0);
+    const ggml_tensor * add = ctx->node(idx + 1);
+    ggml_tensor *       scl = ctx->node(idx + 3);
+
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * s = mul->src[1];
+    const ggml_tensor * b = add->src[1];
+
+    // the encode loop pre-checked the leading mul only, check the rest of the chain
+    for (int i = 1; i < 4; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_hc_gate args = {
+        /*.ne0   =*/ (int32_t) scl->ne[0],
+        /*.ne1   =*/ (int32_t) scl->ne[1],
+        /*.nb00  =*/ x->nb[0],
+        /*.nb01  =*/ x->nb[1],
+        /*.nb10  =*/ b->nb[0],
+        /*.nb11  =*/ b->ne[1] == 1 ? 0 : b->nb[1],
+        /*.nb1   =*/ scl->nb[1],
+        /*.scale =*/ ggml_get_op_params_f32(scl, 0),
+        /*.bias  =*/ ggml_get_op_params_f32(scl, 1),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_hc_gate(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(s),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(scl), 4);
+
+    const int n   = args.ne0*args.ne1;
+    const int nth = std::min(n, 256);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 4;
+}
+
+// Dispatch the fused DeepSeek-V4 router scores from the matched softplus -> sqrt -> add chain (writes sqrt and add).
+int ggml_metal_op_ds41_router(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * sp  = ctx->node(idx + 0);
+    ggml_tensor *       sq  = ctx->node(idx + 1);
+    ggml_tensor *       add = ctx->node(idx + 2);
+
+    const ggml_tensor * x = sp->src[0];
+    const ggml_tensor * b = add->src[1];
+
+    for (int i = 1; i < 3; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_router args = {
+        /*.ne0  =*/ (int32_t) add->ne[0],
+        /*.ne1  =*/ (int32_t) add->ne[1],
+        /*.nb01 =*/ x->nb[1],
+        /*.nb11 =*/ b->ne[1] == 1 ? 0 : b->nb[1],
+        /*.nb1p =*/ sq->nb[1],
+        /*.nb1  =*/ add->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_router(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(b),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(sq),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(add), 4);
+
+    const int n   = args.ne0*args.ne1;
+    const int nth = std::min(n, 256);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return 3;
+}
+
+// Dispatch the fused DeepSeek-V4 MoE weights from the matched get_rows -> sum_rows -> scale -> div -> scale chain.
+int ggml_metal_op_ds41_moe_w(ggml_metal_op_t ctx, int idx) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * gr  = ctx->node(idx + 0);
+    const ggml_tensor * s1  = ctx->node(idx + 2);
+    ggml_tensor *       out = ctx->node(idx + 4);
+
+    const ggml_tensor * probs = gr->src[0];
+    const ggml_tensor * ids   = gr->src[1];
+
+    for (int i = 1; i < 5; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    ggml_metal_kargs_ds41_moe_w args = {
+        /*.n_used   =*/ (int32_t) ids->ne[0],
+        /*.n_tokens =*/ (int32_t) ids->ne[1],
+        /*.nb_p1    =*/ probs->nb[1],
+        /*.nb_p2    =*/ probs->nb[2],
+        /*.nb_i0    =*/ ids->nb[0],
+        /*.nb_i1    =*/ ids->nb[1],
+        /*.nb1      =*/ out->nb[1],
+        /*.nb2      =*/ out->nb[2],
+        /*.scale1   =*/ ggml_get_op_params_f32(s1, 0),
+        /*.bias1    =*/ ggml_get_op_params_f32(s1, 1),
+        /*.scale2   =*/ ggml_get_op_params_f32(out, 0),
+        /*.bias2    =*/ ggml_get_op_params_f32(out, 1),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_ds41_moe_w(lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(probs), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out),   3);
+
+    const int nsg = std::max(1, std::min(8, args.n_tokens));
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_tokens + nsg - 1)/nsg, 1, 1, 32, nsg, 1);
 
     return 5;
 }

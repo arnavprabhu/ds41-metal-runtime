@@ -340,6 +340,90 @@ kernel void kernel_flash_attn_ext_vec_idx_v2(
 }
 template [[host_name("kernel_flash_attn_ext_vec_idx_v2")]] kernel void kernel_flash_attn_ext_vec_idx_v2<8>(constant ggml_metal_kargs_flash_attn_ext_vec_idx &, device const half *, device int *, uint3, ushort, ushort);
 
+// wide index lists for few, long mask rows (decode at depth; GGML_METAL_DS41_IDXW, iter 011k): one threadgroup of
+// NSGW simdgroups per mask row. Each simdgroup owns a contiguous chunk of the row: pass 1 counts its finite entries,
+// a prefix over the chunk counts gives each chunk's offset, pass 2 writes the positions (same ordered list and the
+// same n_kv_max cap as kernel_flash_attn_ext_vec_idx_v2). Rows must be 8-byte aligned (half4 loads).
+template<short NSGW>
+kernel void kernel_flash_attn_ext_vec_idx_w(
+        constant ggml_metal_kargs_flash_attn_ext_vec_idx & args,
+        device const half * mask,
+        device       int  * idx,
+        threadgroup  int  * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int i1 = tgpig[0];
+    const int i2 = tgpig[1];
+    const int i3 = tgpig[2];
+
+    device const half * pm = (device const half *) ((device const char *) mask + i1*args.nb31 + i2*args.nb32 + i3*args.nb33);
+    device int * pidx = idx + (((int64_t)i3*args.ne32 + i2)*args.ne31 + i1)*args.n_kv_max_padded;
+
+    const int n = args.ne30;
+    // chunk per simdgroup, a multiple of one step (4 entries x 32 lanes)
+    const int step  = 4*N_SIMDWIDTH;
+    const int chunk = ((n + NSGW - 1)/NSGW + step - 1)/step*step;
+    const int c0 = sgitg*chunk;
+    const int c1 = min(n, c0 + chunk);
+
+    auto load4 = [&](int i) -> bool4 {
+        half4 v;
+        if (i + 3 < c1) {
+            v = *((device const half4 *) (pm + i));
+        } else {
+            v = half4(-INFINITY);
+            for (short c = 0; c < 4; ++c) {
+                if (i + c < c1) {
+                    v[c] = pm[i + c];
+                }
+            }
+        }
+        return isfinite(v);
+    };
+
+    int cnt = 0;
+    for (int i0 = c0; i0 < c1; i0 += step) {
+        const bool4 f = load4(i0 + 4*tiisg);
+        cnt += (int) f.x + (int) f.y + (int) f.z + (int) f.w;
+    }
+    cnt = simd_sum(cnt);
+    if (tiisg == 0) {
+        shmem[sgitg] = cnt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int base = 0;
+    int total = 0;
+    for (short s = 0; s < NSGW; ++s) {
+        const int v = shmem[s];
+        base  += s < sgitg ? v : 0;
+        total += v;
+    }
+
+    for (int i0 = c0; i0 < c1 && base < args.n_kv_max; i0 += step) {
+        const int i = i0 + 4*tiisg;
+        const bool4 f = load4(i);
+        const int c = (int) f.x + (int) f.y + (int) f.z + (int) f.w;
+        int p = base + simd_prefix_exclusive_sum(c);
+        for (short k = 0; k < 4; ++k) {
+            if (f[k]) {
+                if (p < args.n_kv_max) {
+                    pidx[p] = i + k;
+                }
+                p++;
+            }
+        }
+        base += simd_sum(c);
+    }
+
+    const int count = min(total, args.n_kv_max);
+    for (int j = count + sgitg*N_SIMDWIDTH + tiisg; j < args.n_kv_max_padded; j += NSGW*N_SIMDWIDTH) {
+        pidx[j] = -1;
+    }
+}
+template [[host_name("kernel_flash_attn_ext_vec_idx_w")]] kernel void kernel_flash_attn_ext_vec_idx_w<32>(constant ggml_metal_kargs_flash_attn_ext_vec_idx &, device const half *, device int *, threadgroup int *, uint3, ushort, ushort);
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 
