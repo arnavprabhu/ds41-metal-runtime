@@ -3909,7 +3909,21 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             // GGML_METAL_DSV4_SATTN >= 2: coalesced builder (one simdgroup per mask row, 8 rows per threadgroup),
             // same lists; needs 8-byte aligned mask rows
             static const bool env_idx_v2 = getenv("GGML_METAL_DSV4_SATTN") && atoi(getenv("GGML_METAL_DSV4_SATTN")) >= 2;
-            if (env_idx_v2 && nb31 % 8 == 0 && nb32 % 8 == 0 && nb33 % 8 == 0 && (op->src[3]->view_offs % 8) == 0) {
+            // GGML_METAL_DS41_IDXW=1 (iter 011k): few long rows (decode at depth) -> one 32-simdgroup threadgroup per row
+            static const bool env_idx_w = getenv("GGML_METAL_DS41_IDXW") && atoi(getenv("GGML_METAL_DS41_IDXW")) != 0;
+            const bool aligned8 = nb31 % 8 == 0 && nb32 % 8 == 0 && nb33 % 8 == 0 && (op->src[3]->view_offs % 8) == 0;
+            if (env_idx_w && aligned8 && (int64_t) ne31*ne32*ne33 <= 64 && ne30 >= 8192) {
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_w(lib);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(int32_t), 0);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, 32*32, 1, 1);
+            } else
+            if (env_idx_v2 && aligned8) {
                 auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_v2(lib);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);

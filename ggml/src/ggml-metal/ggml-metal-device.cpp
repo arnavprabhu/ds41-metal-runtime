@@ -2023,6 +2023,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_attn
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_w(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_vec_idx_w";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_v2(ggml_metal_library_t lib) {
     const char * name = "kernel_flash_attn_ext_vec_idx_v2";
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

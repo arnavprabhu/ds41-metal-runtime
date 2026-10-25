@@ -12297,6 +12297,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
         }
+        // decode sparse attention (DS41_FA=1): 64 heads, 1 KV head, dk = dv = 512, V view of K, index lists of
+        // n_kv_max entries (window only at short depth, window + top-k 512 at long depth)
+        if (getenv("DS41_FA")) {
+            for (int64_t nkv : { 128, 640 }) {
+                for (int64_t kv : { 4224, 131200 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, n, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, nkv));
+                }
+            }
+        }
     }
     return test_cases;
 }
