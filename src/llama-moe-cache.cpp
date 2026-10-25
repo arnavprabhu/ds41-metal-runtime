@@ -77,6 +77,7 @@ struct llama_moe_cache::impl {
         // banks and their views
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
+        std::vector<ggml_backend_buffer_t> sub_bufs; // the buffers holding the banks (several if buf is a multi-buffer)
         size_t buf_size = 0;
     };
 
@@ -139,6 +140,63 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+
+    // LLAMA_DSV41_MOE_TOKSTATS=1: one stderr line per decode step (small ubatch through all cached layers): hits, misses,
+    // uploaded MiB, fill/sync/join ms. A step that starts > 2 s after the previous activity starts a new sequence (a prompt
+    // was processed in between), so "seq S step K" is the K-th decode step after a prompt. Instrumentation only.
+    struct tok_stat {
+        int32_t  n_tok = 0;
+        size_t   hits = 0, misses = 0, bytes = 0;
+        uint64_t fill_us = 0, sync_us = 0, wait_us = 0;
+    };
+    const bool tok_on = [] { const char * v = getenv("LLAMA_DSV41_MOE_TOKSTATS"); return v != nullptr && atoi(v) != 0; }();
+    int32_t  tok_first_il = -1;
+    tok_stat tok_cur;
+    int32_t  tok_seq = 0;
+    int32_t  tok_idx = 0;
+    std::chrono::steady_clock::time_point tok_last;
+
+    void tok_flush() {
+        if (tok_cur.n_tok == 0) {
+            return;
+        }
+        const size_t n = tok_cur.hits + tok_cur.misses;
+        fprintf(stderr, "llama_moe_cache: tokstat seq %d step %d: n_tok = %d, hits = %zu, misses = %zu, hit rate = %.2f%%, "
+            "MiB = %.2f, fill ms = %.2f, sync ms = %.2f, join wait ms = %.2f\n",
+            tok_seq, tok_idx, tok_cur.n_tok, tok_cur.hits, tok_cur.misses, n ? 100.0*tok_cur.hits/n : 0.0,
+            tok_cur.bytes/1024.0/1024.0, tok_cur.fill_us/1000.0, tok_cur.sync_us/1000.0, tok_cur.wait_us/1000.0);
+        tok_idx++;
+        tok_cur = tok_stat();
+    }
+
+    void tok_add(int32_t il, int32_t n_tok, size_t hits, size_t misses, size_t bytes, uint64_t fill_us, uint64_t sync_us) {
+        if (!tok_on) {
+            return;
+        }
+        if (tok_first_il < 0) {
+            for (int32_t i = 0; i < (int32_t) layers.size(); ++i) {
+                if (layers[i].ig >= 0) {
+                    tok_first_il = i;
+                    break;
+                }
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (il == tok_first_il) {
+            tok_flush();
+            if (tok_idx > 0 && now - tok_last > std::chrono::seconds(2)) {
+                tok_seq++;
+                tok_idx = 0;
+            }
+            tok_cur.n_tok = n_tok;
+        }
+        tok_cur.hits    += hits;
+        tok_cur.misses  += misses;
+        tok_cur.bytes   += bytes;
+        tok_cur.fill_us += fill_us;
+        tok_cur.sync_us += sync_us;
+        tok_last = now;
+    }
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -877,14 +935,35 @@ struct llama_moe_cache::impl {
                 if (!d.buf) {
                     throw std::runtime_error("failed to allocate the MoE cache buffers");
                 }
+                // an arena larger than the device's maximum buffer size (Metal maxBufferLength, 38.9 GiB on M5 Pro) is
+                // split over several buffers behind a multi-buffer wrapper: the banks live in the sub-buffers, so those
+                // are tested (the wrapper itself is never a shared Metal buffer)
                 const is_shared_fn is_shared = get_is_shared(d.backend);
-                // Shared Metal slots are written completely before their GPU map is published.
-                if (is_shared == nullptr || !is_shared(d.buf.get())) {
-                    ggml_backend_buffer_clear(d.buf.get(), 0);
-                    if (overlap_level != 0) {
-                        fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
-                        overlap_level = 0;
+                d.sub_bufs.clear();
+                // LLAMA_DSV41_MOE_SUBBUF_CHECK=0: old check of the wrapper only (a multi-buffer arena is cleared and runs without overlap)
+                static const bool subbuf_check = [] { const char * v = getenv("LLAMA_DSV41_MOE_SUBBUF_CHECK"); return v == nullptr || atoi(v) != 0; }();
+                for (ggml_tensor * t = subbuf_check ? ggml_get_first_tensor(d.ctx.get()) : nullptr; t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                    if (t->view_src == nullptr && t->buffer != nullptr &&
+                            std::find(d.sub_bufs.begin(), d.sub_bufs.end(), t->buffer) == d.sub_bufs.end()) {
+                        d.sub_bufs.push_back(t->buffer);
                     }
+                }
+                if (d.sub_bufs.empty()) {
+                    d.sub_bufs.push_back(d.buf.get());
+                }
+                bool all_shared = true;
+                for (ggml_backend_buffer_t b : d.sub_bufs) {
+                    // Shared Metal slots are written completely before their GPU map is published.
+                    if (is_shared == nullptr || !is_shared(b)) {
+                        ggml_backend_buffer_clear(b, 0);
+                        all_shared = false;
+                    }
+                }
+                fprintf(stderr, "llama_moe_cache: arena of %s in %zu buffer(s), %s\n", ggml_backend_name(d.backend), d.sub_bufs.size(),
+                    all_shared ? "all shared" : "not all shared");
+                if (!all_shared && overlap_level != 0) {
+                    fprintf(stderr, "llama_moe_cache: the arena of %s is not a shared buffer, LLAMA_DSV41_MOE_OVERLAP disabled\n", ggml_backend_name(d.backend));
+                    overlap_level = 0;
                 }
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
             }
@@ -940,10 +1019,11 @@ struct llama_moe_cache::impl {
         if (const char * ml = getenv("LLAMA_DSV41_MOE_MLOCK"); ml && atoi(ml) != 0) {
             // keep the arena resident (pageable otherwise between command buffers; Strata MAC.md). Pages are wired as they are touched.
             for (const device & d : devices) {
-                if (d.buf) {
-                    void * base = ggml_backend_buffer_get_base(d.buf.get());
-                    const int rc = mlock(base, d.buf_size);
-                    fprintf(stderr, "llama_moe_cache: mlock arena %.0f MiB: %s\n", d.buf_size/1024.0/1024.0, rc == 0 ? "ok" : strerror(errno));
+                for (ggml_backend_buffer_t b : d.sub_bufs) {
+                    void * base = ggml_backend_buffer_get_base(b);
+                    const size_t sz = ggml_backend_buffer_get_size(b);
+                    const int rc = mlock(base, sz);
+                    fprintf(stderr, "llama_moe_cache: mlock arena %.0f MiB: %s\n", sz/1024.0/1024.0, rc == 0 ? "ok" : strerror(errno));
                 }
             }
         }
@@ -1047,6 +1127,7 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        tok_flush();
         overlap_drain();
         pf_flush();
         warm_finish();
@@ -1295,6 +1376,11 @@ struct llama_moe_cache::impl {
         st.pread_calls += !fills.empty();
         st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        if (&st == &stats_small) {
+            tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
+                std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
         return true;
     }
 
@@ -1344,6 +1430,7 @@ struct llama_moe_cache::impl {
             memcpy(out, now, n_expert*sizeof(int32_t));
         }
         (stats_small).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        tok_cur.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         return true;
     }
 
@@ -1502,6 +1589,11 @@ struct llama_moe_cache::impl {
         st.fallback_calls += fallback_used;
         st.sync_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         st.fill_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        if (&st == &stats_small) {
+            tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
+                std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
 
         // the next copy synchronizes the backend before it changes the slot map again
         if (direct_map) {
