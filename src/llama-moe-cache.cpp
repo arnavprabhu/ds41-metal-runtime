@@ -1,5 +1,9 @@
 #include "llama-moe-cache.h"
 
+#include <sys/mman.h>
+#include <cerrno>
+#include <cstring>
+
 #include "llama-exps-prefetch.h"
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -933,6 +937,16 @@ struct llama_moe_cache::impl {
             }
         }
         log_arena("startup");
+        if (const char * ml = getenv("LLAMA_DSV41_MOE_MLOCK"); ml && atoi(ml) != 0) {
+            // keep the arena resident (pageable otherwise between command buffers; Strata MAC.md). Pages are wired as they are touched.
+            for (const device & d : devices) {
+                if (d.buf) {
+                    void * base = ggml_backend_buffer_get_base(d.buf.get());
+                    const int rc = mlock(base, d.buf_size);
+                    fprintf(stderr, "llama_moe_cache: mlock arena %.0f MiB: %s\n", d.buf_size/1024.0/1024.0, rc == 0 ? "ok" : strerror(errno));
+                }
+            }
+        }
         for (size_t ig = 0; ig < groups.size(); ++ig) {
             const group & g = groups[ig];
             fprintf(stderr, "llama_moe_cache: group %zu: %2zu layers, %s, %5d slots (%.1f%%, %.1f slots/layer)\n", ig,
@@ -944,6 +958,49 @@ struct llama_moe_cache::impl {
             }
             fprintf(stderr, "llama_moe_cache: group %zu layers:%s\n", ig, ls.c_str());
         }
+    }
+
+    // bytes of the slots in use (the buffer itself may be larger after shrink())
+    size_t active_bytes() const {
+        size_t res = 0;
+        for (const group & g : groups) {
+            size_t slot = 0;
+            for (const ggml_tensor * t : g.ref) {
+                slot += t->nb[2];
+            }
+            res += slot*(size_t) std::max(g.n_slots, 0);
+        }
+        return res;
+    }
+
+    // LLAMA_DSV41_MOE_CACHE_MIB=auto: the arena is allocated at the maximum size (untouched pages cost no memory) and, once the
+    // KV cache and compute buffers are known, only the first slots are used: every group keeps the same share of its size.
+    // Must be called before the first graph is computed (no slot is in use).
+    void shrink(size_t target) {
+        const size_t cur = active_bytes();
+        if (cur == 0 || target >= cur) {
+            return;
+        }
+        const double f = (double) target/(double) cur;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            const int32_t n = std::max<int32_t>(2*n_expert_used, (int32_t) (g.n_slots*f));
+            if (n >= g.n_slots) {
+                continue;
+            }
+            g.n_slots = n;
+            g.lru.init(layers.size(), g.lru.n_expert, n);
+            g.filled.assign(n, false);
+            for (int32_t il : g.layers) {
+                if (layers[il].slot_map != nullptr && layers[il].slot_map->data != nullptr) {
+                    g.lru.slot_map[il] = (int32_t *) layers[il].slot_map->data;
+                    memset(layers[il].slot_map->data, 0xff, ggml_nbytes(layers[il].slot_map));
+                }
+            }
+        }
+        fprintf(stderr, "llama_moe_cache: arena limited to %.2f MiB of %.2f MiB allocated\n", active_bytes()/1024.0/1024.0, cur/1024.0/1024.0);
     }
 
     static bool direct_enabled() {
@@ -1505,6 +1562,14 @@ bool llama_moe_cache::get_slot_maps(int32_t il, int64_t n_tokens, int64_t n_expe
 
 int llama_moe_cache::overlap_level() const {
     return pimpl->overlap_level;
+}
+
+size_t llama_moe_cache::active_bytes() const {
+    return pimpl->active_bytes();
+}
+
+void llama_moe_cache::shrink(size_t target) {
+    pimpl->shrink(target);
 }
 
 bool llama_moe_cache::copy_nosync(const ggml_tensor * src) const {

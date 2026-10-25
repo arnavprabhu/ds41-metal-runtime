@@ -41,6 +41,10 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // bytes of the arena slots in use, and shrinking it (before the first graph is computed) to at most target bytes
+    size_t active_bytes() const;
+    void   shrink(size_t target);
+
     // pointer to expert e of the host tensor w inside the arena if it is resident (CPU-addressable shared memory), else nullptr
     const void * resident_expert(const ggml_tensor * w, int64_t e);
 
