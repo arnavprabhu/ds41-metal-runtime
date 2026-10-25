@@ -841,15 +841,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
+        if (moe_cache_auto) {
+            // the arena is wired by Metal as a whole (touched or not), so it must be allocated at its final size: reserve the
+            // graphs with a small probe arena (the compute buffers do not depend on the number of slots), size the arena,
+            // then allocate it and reserve again
+            static const long long probe_mib = [] { const char * v = getenv("LLAMA_DSV41_MOE_PROBE_MIB"); return v ? atoll(v) : 2048LL; }();
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, (size_t) probe_mib << 20);
+            sched_reserve();
+            const size_t target = moe_cache_auto_size();
+            moe_cache.reset();
+            if (target > 0) {
+                cparams.moe_cache_size = target;
+                moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            }
+            sched_need_reserve = true;
+        } else if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
         sched_reserve();
-
-        if (moe_cache && moe_cache_auto) {
-            moe_cache_auto_size();
-        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1020,14 +1030,16 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 // LLAMA_DSV41_MOE_CACHE_MIB=auto: arena = RAM*frac - (dense weights + KV + compute buffers + prefill staging + margin), in
 // [LLAMA_DSV41_MOE_CACHE_MIN_MIB (4096), LLAMA_DSV41_MOE_CACHE_MAX_MIB (40960)]. frac = LLAMA_DSV41_MOE_RAM_FRAC (0.90),
 // margin = LLAMA_DSV41_MOE_MARGIN_MIB (3072).
-void llama_context::moe_cache_auto_size() {
+static double envd0(const char * k, double d) { const char * v = getenv(k); return v ? atof(v) : d; }
+
+size_t llama_context::moe_cache_auto_size() {
     uint64_t phys = 0;
     size_t len = sizeof(phys);
     if (sysctlbyname("hw.memsize", &phys, &len, nullptr, 0) != 0 || phys == 0) {
         LLAMA_LOG_WARN("%s: cannot read hw.memsize, arena stays at its maximum\n", __func__);
-        return;
+        return (size_t) (envd0("LLAMA_DSV41_MOE_CACHE_MAX_MIB", 40960.0)*1024.0*1024.0);
     }
-    auto envd = [](const char * k, double d) { const char * v = getenv(k); return v ? atof(v) : d; };
+    auto envd = envd0;
     const double mib = 1024.0*1024.0;
     const double frac = envd("LLAMA_DSV41_MOE_RAM_FRAC", 0.90);
     const double margin = envd("LLAMA_DSV41_MOE_MARGIN_MIB", 3072.0)*mib;
@@ -1055,7 +1067,7 @@ void llama_context::moe_cache_auto_size() {
     fprintf(stderr, "llama_moe_cache: auto arena: RAM %.1f GiB x %.2f - (dense %.2f + KV %.2f + compute %.2f + staging %.2f + margin %.2f GiB) = %.2f GiB -> %.2f GiB (clamp %.1f..%.1f)\n",
         phys/(1024.0*mib), frac, dense/(1024.0*mib), kv/(1024.0*mib), compute/(1024.0*mib), staging/(1024.0*mib), margin/(1024.0*mib),
         ((double) phys*frac - (dense + kv + compute + staging + margin))/(1024.0*mib), target/(1024.0*mib), lo/(1024.0*mib), hi/(1024.0*mib));
-    moe_cache->shrink((size_t) target);
+    return (size_t) target;
 }
 
 void llama_context::sched_reserve() {
