@@ -313,9 +313,6 @@ if (GGML_BUILD_TESTS)
     add_subdirectory(tests)
 endif ()
 
-if (GGML_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif ()
 
 #
 # install
@@ -404,89 +401,4 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
               ${CMAKE_CURRENT_BINARY_DIR}/ggml-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
 
-if (MSVC)
-    set(MSVC_WARNING_FLAGS
-        /wd4005  # Macro redefinition
-        /wd4244  # Conversion from one type to another type, possible loss of data
-        /wd4267  # Conversion from 'size_t' to a smaller type, possible loss of data
-        /wd4305  # Conversion from 'type1' to 'type2', possible loss of data
-        /wd4566  # Conversion from 'char' to 'wchar_t', possible loss of data
-        /wd4996  # Disable POSIX deprecation warnings
-        /wd4702  # Unreachable code warnings
-    )
-    set(MSVC_COMPILE_OPTIONS
-        "$<$<COMPILE_LANGUAGE:C>:/utf-8>"
-        "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
-    )
-    function(configure_msvc_target target_name)
-        if(TARGET ${target_name})
-            target_compile_options(${target_name} PRIVATE ${MSVC_WARNING_FLAGS})
-            target_compile_options(${target_name} PRIVATE ${MSVC_COMPILE_OPTIONS})
-        endif()
-    endfunction()
 
-    configure_msvc_target(ggml-base)
-    configure_msvc_target(ggml)
-    configure_msvc_target(ggml-cpu)
-    configure_msvc_target(ggml-cpu-x64)
-    configure_msvc_target(ggml-cpu-sse42)
-    configure_msvc_target(ggml-cpu-sandybridge)
-    # __FMA__ and __F16C__ are not defined in MSVC, however they are implied with AVX2/AVX512
-    # skipping            ggml-cpu-ivybridge
-    # skipping            ggml-cpu-piledriver
-    configure_msvc_target(ggml-cpu-haswell)
-    configure_msvc_target(ggml-cpu-skylakex)
-    configure_msvc_target(ggml-cpu-cannonlake)
-    configure_msvc_target(ggml-cpu-cascadelake)
-    configure_msvc_target(ggml-cpu-icelake)
-    # MSVC 2022 doesn't support BF16 intrinsics without `/arch:AVX10.1` ?!
-    # https://learn.microsoft.com/en-us/cpp/intrinsics/x64-amd64-intrinsics-list?view=msvc-170
-    # https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64?view=msvc-170
-    # skipping            ggml-cpu-cooperlake
-    # skipping            ggml-cpu-zen4
-    configure_msvc_target(ggml-cpu-alderlake)
-    # MSVC doesn't support AMX
-    # skipping            ggml-cpu-sapphirerapids
-
-    if (GGML_BUILD_EXAMPLES)
-        configure_msvc_target(common-ggml)
-        configure_msvc_target(common)
-
-        configure_msvc_target(mnist-common)
-        configure_msvc_target(mnist-eval)
-        configure_msvc_target(mnist-train)
-
-        configure_msvc_target(gpt-2-ctx)
-        configure_msvc_target(gpt-2-alloc)
-        configure_msvc_target(gpt-2-backend)
-        configure_msvc_target(gpt-2-sched)
-        configure_msvc_target(gpt-2-quantize)
-        configure_msvc_target(gpt-2-batched)
-
-        configure_msvc_target(gpt-j)
-        configure_msvc_target(gpt-j-quantize)
-
-        configure_msvc_target(magika)
-        configure_msvc_target(yolov3-tiny)
-        configure_msvc_target(sam)
-
-        configure_msvc_target(simple-ctx)
-        configure_msvc_target(simple-backend)
-    endif()
-
-    if (GGML_BUILD_TESTS)
-        configure_msvc_target(test-mul-mat)
-        configure_msvc_target(test-arange)
-        configure_msvc_target(test-backend-ops)
-        configure_msvc_target(test-cont)
-        configure_msvc_target(test-conv-transpose)
-        configure_msvc_target(test-conv-transpose-1d)
-        configure_msvc_target(test-conv1d)
-        configure_msvc_target(test-conv2d)
-        configure_msvc_target(test-conv2d-dw)
-        configure_msvc_target(test-customop)
-        configure_msvc_target(test-dup)
-        configure_msvc_target(test-opt)
-        configure_msvc_target(test-pool)
-    endif ()
-endif()
