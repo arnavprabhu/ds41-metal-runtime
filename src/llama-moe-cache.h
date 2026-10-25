@@ -51,6 +51,8 @@ public:
 
     // pointer to expert e of the host tensor w inside the arena if it is resident (CPU-addressable shared memory), else nullptr
     const void * resident_expert(const ggml_tensor * w, int64_t e);
+    // same, plus the backend buffer holding it (for device copies, LLAMA_DSV41_STAGE_BLIT)
+    const void * resident_expert(const ggml_tensor * w, int64_t e, ggml_backend_buffer_t * buf);
 
     // prefill arena seeding (LLAMA_DSV41_MOE_SEED_STAGE): give slots to up to max_n of the experts most selected by the
     // last n_rows prompt rows (counts [n_expert]) of the layer of host expert tensor w, copying their bytes from src(t, e).

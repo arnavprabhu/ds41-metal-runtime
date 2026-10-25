@@ -553,6 +553,24 @@ static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml
     return ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
 }
 
+// n copies src[i] -> dst[i] with one blit encoder: on the backend's queue, ordered after the queued work and before the
+// work queued later (like cpy_tensor_async), or (side) on a second queue concurrent with it, waited for by the next
+// synchronize; get_proc_address("ggml_backend_metal_cpy_tensors_async"). Used by the deepseek41 prefill staging
+// (LLAMA_DSV41_STAGE_BLIT) to copy MoE arena experts. false: nothing queued
+static bool ggml_backend_metal_cpy_tensors_async(ggml_backend_t backend, int n, const ggml_tensor * const * src, ggml_tensor * const * dst, bool side) {
+    if (!ggml_backend_is_metal(backend)) {
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const ggml_backend_buffer_t bs = src[i]->view_src ? src[i]->view_src->buffer : src[i]->buffer;
+        const ggml_backend_buffer_t bd = dst[i]->view_src ? dst[i]->view_src->buffer : dst[i]->buffer;
+        if (bs == nullptr || bd == nullptr || !ggml_backend_buffer_is_metal(bs) || !ggml_backend_buffer_is_metal(bd)) {
+            return false;
+        }
+    }
+    return ggml_metal_cpy_tensors_async((ggml_metal_t) backend->context, n, src, dst, side);
+}
+
 static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
@@ -954,6 +972,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_buffer_is_metal_shared") == 0) {
         return (void *)ggml_backend_buffer_is_metal_shared;
+    }
+    if (strcmp(name, "ggml_backend_metal_cpy_tensors_async") == 0) {
+        return (void *)ggml_backend_metal_cpy_tensors_async;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;

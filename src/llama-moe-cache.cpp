@@ -1262,7 +1262,7 @@ struct llama_moe_cache::impl {
 
     // LLAMA_DSV41_PREFILL_ARENA=1: address of expert e of the host tensor w inside the arena (shared memory), nullptr if it is
     // not resident or the arena is not CPU-addressable. Read-only: no heat, no recency change, bytes identical to the file.
-    const void * resident_expert(const ggml_tensor * w, int64_t e, int32_t * slot_out = nullptr) {
+    const void * resident_expert(const ggml_tensor * w, int64_t e, int32_t * slot_out = nullptr, ggml_backend_buffer_t * buf_out = nullptr) {
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return nullptr;
@@ -1280,6 +1280,9 @@ struct llama_moe_cache::impl {
         }
         if (slot_out) {
             *slot_out = slots[e];
+        }
+        if (buf_out) {
+            *buf_out = bank->buffer;
         }
         return (const char *) bank->data + (size_t) slots[e]*w->nb[2];
     }
@@ -1810,6 +1813,10 @@ int llama_moe_cache_predict_k() {
 
 const void * llama_moe_cache::resident_expert(const ggml_tensor * w, int64_t e) {
     return pimpl->resident_expert(w, e);
+}
+
+const void * llama_moe_cache::resident_expert(const ggml_tensor * w, int64_t e, ggml_backend_buffer_t * buf) {
+    return pimpl->resident_expert(w, e, nullptr, buf);
 }
 
 size_t llama_moe_cache::seed_layer(const ggml_tensor * w, const float * counts, int32_t n_rows, int32_t max_n,

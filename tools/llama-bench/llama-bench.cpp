@@ -2172,20 +2172,23 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
 
-    std::vector<llama_token> tokens(n_batch);
+    // the whole prompt up front (same rand() sequence as drawing it batch by batch)
+    std::vector<llama_token> prompt(n_prompt);
+    for (int i = 0; i < n_prompt; i++) {
+        prompt[i] = i == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+    }
 
     int n_processed = 0;
 
+    const llama_pos pos0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
     // DeepSeek-V4.1 long-prompt layer skip (LLAMA_DSV41_PROMPT_SKIP=1): the final length of this prompt, last-row logits only
-    llama_set_prompt_total(ctx, 0, (int32_t) (llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1 + n_prompt));
+    llama_set_prompt_total(ctx, 0, (int32_t) (pos0 + n_prompt));
+    // DeepSeek-V4.1 Engram prefetch (LLAMA_DSV41_ENGRAM_AHEAD=1): the coming tokens
+    llama_set_prompt_tokens(ctx, 0, prompt.data(), n_prompt, pos0);
 
     while (n_processed < n_prompt) {
         int n_tokens = std::min(n_prompt - n_processed, n_batch);
-        tokens[0]    = n_processed == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
-        for (int i = 1; i < n_tokens; i++) {
-            tokens[i] = std::rand() % n_vocab;
-        }
-        common_batch batch = common_batch_get_one(ctx, tokens.data(), n_tokens);
+        common_batch batch = common_batch_get_one(ctx, prompt.data() + n_processed, n_tokens);
         // only the prompt's last token produces logits (as in llama-server); an output inside a batch's head rows disables the
         // DSv4.1 prompt skip for that batch
         if (n_processed + n_tokens < n_prompt) {

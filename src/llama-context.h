@@ -127,6 +127,8 @@ struct llama_context {
 
     // long-prompt layer skip (see llama_set_prompt_total)
     void set_prompt_total(llama_seq_id seq_id, int32_t n_total);
+    // Engram prefetch hint (see llama_set_prompt_tokens)
+    void set_prompt_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n_tokens, llama_pos pos0);
     int32_t prompt_skip_ckpt_min_pos(int32_t n_total) const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);

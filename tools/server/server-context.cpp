@@ -4164,6 +4164,11 @@ private:
                             !has_mtmd && !input_tokens.has_mtmd && alora_scale <= 0 &&
                             (int64_t) slot.task->n_tokens() - (int64_t) slot.stats.n_prompt_cached >= skip_min_new ? (int32_t) slot.task->n_tokens() : 0;
                     llama_set_prompt_total(ctx_tgt, slot.id, skip_total);
+                    // Engram prefetch (LLAMA_DSV41_ENGRAM_AHEAD=1, else a no-op): the prompt's tokens by position (text only)
+                    if (!has_mtmd && !input_tokens.has_mtmd) {
+                        const auto & toks = input_tokens.get_tokens();
+                        llama_set_prompt_tokens(ctx_tgt, slot.id, toks.data(), (int32_t) toks.size(), 0);
+                    }
                     const int32_t skip_ckpt_min = skip_total > 0 ? llama_prompt_skip_ckpt_min_pos(ctx_tgt, skip_total) : -1;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;

@@ -1670,6 +1670,25 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     return false;
 }
 
+void llama_kv_cache_dsv4::set_prompt_tokens(llama_seq_id seq_id, const llama_token * tokens, int32_t n, llama_pos pos0) {
+    if (n <= 0 || !tokens) {
+        prompt_tokens.erase(seq_id);
+        return;
+    }
+    auto & pt = prompt_tokens[seq_id];
+    pt.first = pos0;
+    pt.second.assign(tokens, tokens + n);
+}
+
+const std::vector<llama_token> * llama_kv_cache_dsv4::get_prompt_tokens(llama_seq_id seq_id, llama_pos & pos0) const {
+    const auto it = prompt_tokens.find(seq_id);
+    if (it == prompt_tokens.end()) {
+        return nullptr;
+    }
+    pos0 = it->second.first;
+    return &it->second.second;
+}
+
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
@@ -2271,6 +2290,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    kv(kv),
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->is_overlap(), true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),

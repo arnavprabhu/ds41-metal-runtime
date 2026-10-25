@@ -22,6 +22,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx);
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
 bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
+// n copies src[i] -> dst[i] (same sizes) in one blit encoder, ordered like ggml_metal_cpy_tensor_async; side: on a second
+// queue instead, unordered against the main queue (the caller orders it by synchronizing; ggml_metal_synchronize waits
+// for it). false (nothing queued) if a tensor is not in a Metal buffer
+bool ggml_metal_cpy_tensors_async(ggml_metal_t ctx, int n, const struct ggml_tensor * const * src, struct ggml_tensor * const * dst, bool side);
 
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
 void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
