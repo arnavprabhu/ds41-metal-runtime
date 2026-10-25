@@ -284,6 +284,62 @@ kernel void kernel_flash_attn_ext_vec_idx(
     }
 }
 
+// coalesced index lists: one simdgroup per mask row, half4 per lane (128 mask entries a step), the positions of the
+// finite entries by a simdgroup prefix sum
+template<short NR>
+kernel void kernel_flash_attn_ext_vec_idx_v2(
+        constant ggml_metal_kargs_flash_attn_ext_vec_idx & args,
+        device const half * mask,
+        device       int  * idx,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int i1 = tgpig[0]*NR + sgitg;
+    const int i2 = tgpig[1];
+    const int i3 = tgpig[2];
+    if (i1 >= args.ne31) {
+        return;
+    }
+
+    device const half * pm = (device const half *) ((device const char *) mask + i1*args.nb31 + i2*args.nb32 + i3*args.nb33);
+    device int * pidx = idx + (((int64_t)i3*args.ne32 + i2)*args.ne31 + i1)*args.n_kv_max_padded;
+
+    const int n = args.ne30;
+    int base = 0;
+    for (int i0 = 0; i0 < n && base < args.n_kv_max; i0 += 4*N_SIMDWIDTH) {
+        const int i = i0 + 4*tiisg;
+        half4 v;
+        if (i + 3 < n) {
+            v = *((device const half4 *) (pm + i));
+        } else {
+            v = half4(-INFINITY);
+            for (short c = 0; c < 4; ++c) {
+                if (i + c < n) {
+                    v[c] = pm[i + c];
+                }
+            }
+        }
+        const bool4 f = isfinite(v);
+        const int cnt = (int) f.x + (int) f.y + (int) f.z + (int) f.w;
+        int p = base + simd_prefix_exclusive_sum(cnt);
+        for (short c = 0; c < 4; ++c) {
+            if (f[c]) {
+                if (p < args.n_kv_max) {
+                    pidx[p] = i + c;
+                }
+                p++;
+            }
+        }
+        base += simd_sum(cnt);
+    }
+
+    const int count = min(base, args.n_kv_max);
+    for (int j = count + tiisg; j < args.n_kv_max_padded; j += N_SIMDWIDTH) {
+        pidx[j] = -1;
+    }
+}
+template [[host_name("kernel_flash_attn_ext_vec_idx_v2")]] kernel void kernel_flash_attn_ext_vec_idx_v2<8>(constant ggml_metal_kargs_flash_attn_ext_vec_idx &, device const half *, device int *, uint3, ushort, ushort);
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 
