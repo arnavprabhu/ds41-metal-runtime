@@ -1007,6 +1007,25 @@ static bool ggml_metal_ds41_iq1m(void) {
     return v;
 }
 
+// GGML_METAL_DET=1: run-to-run deterministic variants (see ggml-metal-device.h); GGML_METAL_DET_<X> overrides one
+static bool ggml_metal_det_env(const char * name) {
+    const char * v = getenv(name);
+    if (v != nullptr) {
+        return atoi(v) != 0;
+    }
+    return ggml_metal_ds41_env("GGML_METAL_DET");
+}
+
+bool ggml_metal_det_topk(void) {
+    static const bool v = ggml_metal_det_env("GGML_METAL_DET_TOPK");
+    return v;
+}
+
+bool ggml_metal_det_fuse(void) {
+    static const bool v = ggml_metal_det_env("GGML_METAL_DET_FUSE");
+    return v;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1727,7 +1746,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_radix(ggml
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_top_k_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->type));
+    // GGML_METAL_DET_TOPK: ordered compaction (ascending indices, ties lowest index first)
+    snprintf(base, 256, "kernel_top_k_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->type), ggml_metal_det_topk() ? "_det" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
