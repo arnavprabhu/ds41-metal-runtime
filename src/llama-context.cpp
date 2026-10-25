@@ -2803,6 +2803,23 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // LLAMA_DSV41_DECODE_PROF=1: every decode call of 1..16 tokens is a profiled step (ggml-backend.h)
+    static const bool dprof = ggml_decode_prof_enabled();
+    struct dprof_scope {
+        uint64_t step = 0;
+        int64_t  t0   = 0;
+        ~dprof_scope() {
+            if (step != 0) {
+                ggml_decode_prof_add(step, GGML_DECODE_PROF_DECODE_US, (double) (ggml_time_us() - t0));
+            }
+        }
+    } dp;
+    if (dprof) {
+        ggml_decode_prof_begin((int) batch_inp.tokens.size());
+        dp.step = ggml_decode_prof_step();
+        dp.t0   = ggml_time_us();
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

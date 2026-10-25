@@ -12,6 +12,8 @@
 
 #import <Metal/Metal.h>
 
+#include <mach/mach_time.h>
+
 #undef MIN
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -85,7 +87,90 @@ struct ggml_metal {
 
     // GGML_METAL_OP_PROFILE=1: per-op GPU time attribution (see ggml_metal_prof_*)
     struct ggml_metal_prof * prof;
+
+    // LLAMA_DSV41_DECODE_PROF=1: committed command buffers whose GPU timestamps are not accounted yet (see ggml_metal_dprof_*)
+    bool dprof;
+    struct ggml_metal_dprof_cb * dp_pend;
+    int    dp_n_pend, dp_cap_pend;
+    double dp_prev_end;  // host seconds, GPUEndTime of the last accounted command buffer
+    uint64_t dp_prev_step;
 };
+
+// ---------------------------------------------------------------------------------------------------------
+// LLAMA_DSV41_DECODE_PROF=1
+//
+// Every committed command buffer is retained with the decode step that was open at commit time. Once completed
+// (drained at synchronize) its GPUStartTime/GPUEndTime give the GPU busy time of the step (union, command buffers
+// may overlap), the GPU idle gaps between consecutive command buffers of the step, the idle lead before its first
+// one, and the submit latency (GPUStartTime - commit time) of a graph's first command buffer when the GPU was idle.
+// The synchronize itself books its wait time and, when it had to block, the wake-up latency
+// (return time - GPUEndTime of the waited command buffer). Host times use the GPUStartTime time base (mach time).
+// ---------------------------------------------------------------------------------------------------------
+
+struct ggml_metal_dprof_cb {
+    id<MTLCommandBuffer> cb;
+    uint64_t step;
+    double   t_commit; // host seconds, 0 = not measured
+};
+
+static double ggml_metal_host_time_s(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    return (double) mach_absolute_time() * tb.numer / tb.denom * 1e-9;
+}
+
+static void ggml_metal_dprof_push(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, double t_commit) {
+    if (ctx->dp_n_pend == ctx->dp_cap_pend) {
+        ctx->dp_cap_pend = ctx->dp_cap_pend ? 2*ctx->dp_cap_pend : 256;
+        ctx->dp_pend = realloc(ctx->dp_pend, ctx->dp_cap_pend * sizeof(ctx->dp_pend[0]));
+    }
+    [cmd_buf retain];
+    ctx->dp_pend[ctx->dp_n_pend++] = (struct ggml_metal_dprof_cb) { cmd_buf, ggml_decode_prof_step(), t_commit };
+    ggml_decode_prof_add(0, GGML_DECODE_PROF_CBS, 1);
+}
+
+// account and release the leading finished command buffers (all of them if all == true)
+static void ggml_metal_dprof_drain(ggml_metal_t ctx, bool all) {
+    int i = 0;
+    for (; i < ctx->dp_n_pend; ++i) {
+        struct ggml_metal_dprof_cb * e = &ctx->dp_pend[i];
+        const MTLCommandBufferStatus status = [e->cb status];
+        if (!all && status != MTLCommandBufferStatusCompleted && status != MTLCommandBufferStatusError) {
+            break;
+        }
+        if (status == MTLCommandBufferStatusCompleted && e->step != 0) {
+            const double t0 = [e->cb GPUStartTime];
+            const double t1 = [e->cb GPUEndTime];
+            if (t1 >= t0 && t0 > 0.0) {
+                const double busy = t1 - MAX(t0, ctx->dp_prev_end);
+                if (busy > 0.0) {
+                    ggml_decode_prof_add(e->step, GGML_DECODE_PROF_GPU_US, busy*1e6);
+                }
+                if (ctx->dp_prev_end > 0.0 && t0 > ctx->dp_prev_end) {
+                    ggml_decode_prof_add(e->step, e->step == ctx->dp_prev_step ? GGML_DECODE_PROF_GPU_IDLE_US : GGML_DECODE_PROF_GPU_LEAD_US,
+                            (t0 - ctx->dp_prev_end)*1e6);
+                }
+                if (e->t_commit > 0.0 && ctx->dp_prev_end < e->t_commit && t0 >= e->t_commit) {
+                    ggml_decode_prof_add(e->step, GGML_DECODE_PROF_SUBMIT_US, (t0 - e->t_commit)*1e6);
+                    ggml_decode_prof_add(e->step, GGML_DECODE_PROF_SUBMIT_N, 1);
+                }
+                ctx->dp_prev_end = MAX(ctx->dp_prev_end, t1);
+            }
+            ctx->dp_prev_step = e->step;
+        } else if (status == MTLCommandBufferStatusCompleted) {
+            const double t1 = [e->cb GPUEndTime];
+            ctx->dp_prev_end  = MAX(ctx->dp_prev_end, t1);
+            ctx->dp_prev_step = 0;
+        }
+        [e->cb release];
+    }
+    if (i > 0) {
+        memmove(ctx->dp_pend, ctx->dp_pend + i, (ctx->dp_n_pend - i) * sizeof(ctx->dp_pend[0]));
+        ctx->dp_n_pend -= i;
+    }
+}
 
 
 // ---------------------------------------------------------------------------------------------------------
@@ -447,6 +532,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             }
         }
 
+        res->dprof = ggml_decode_prof_enabled();
+
         res->gf = nil;
         res->encode_async = nil;
         for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
@@ -476,6 +563,12 @@ void ggml_metal_free(ggml_metal_t ctx) {
         free(ctx->prof->pend);
         free(ctx->prof);
         ctx->prof = nil;
+    }
+
+    if (ctx->dp_pend) {
+        ggml_metal_dprof_drain(ctx, true);
+        free(ctx->dp_pend);
+        ctx->dp_pend = NULL;
     }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
@@ -534,11 +627,55 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// GGML_METAL_SPIN_US=N: poll the status of the command buffer for up to N us before blocking in waitUntilCompleted
+// returns true if the command buffer finished (completed or failed) while polling
+static bool ggml_metal_cmd_buf_wait(id<MTLCommandBuffer> cmd_buf) {
+    const int spin_us = ggml_metal_spin_us();
+    if (spin_us > 0) {
+        const int64_t t0 = ggml_time_us();
+        do {
+            const MTLCommandBufferStatus status = [cmd_buf status];
+            if (status == MTLCommandBufferStatusCompleted || status == MTLCommandBufferStatusError) {
+                return true;
+            }
+        } while (ggml_time_us() - t0 < spin_us);
+    }
+
+    [cmd_buf waitUntilCompleted];
+
+    return false;
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    if (ctx->dprof) {
+        ggml_decode_prof_add(0, GGML_DECODE_PROF_SYNC_CALLS, 1);
+    }
+
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         const int64_t t_w = ctx->prof ? ggml_time_us() : 0;
-        [ctx->cmd_buf_last waitUntilCompleted];
+        if (ctx->dprof) {
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_last;
+            const MTLCommandBufferStatus status0 = [cmd_buf status];
+            const bool running = status0 != MTLCommandBufferStatusCompleted && status0 != MTLCommandBufferStatusError;
+            const double tw0 = ggml_metal_host_time_s();
+            const bool spin_hit = ggml_metal_cmd_buf_wait(cmd_buf);
+            const double tw1 = ggml_metal_host_time_s();
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_SYNCS, 1);
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_SYNC_US, (tw1 - tw0)*1e6);
+            if (running) {
+                ggml_decode_prof_add(0, GGML_DECODE_PROF_SYNC_BLOCKED, 1);
+                ggml_decode_prof_add(0, GGML_DECODE_PROF_SYNC_SPIN_HITS, spin_hit ? 1 : 0);
+                const double t_end = [cmd_buf GPUEndTime];
+                if (t_end >= tw0 && t_end <= tw1) {
+                    ggml_decode_prof_add(0, GGML_DECODE_PROF_WAKE_US, (tw1 - t_end)*1e6);
+                    ggml_decode_prof_add(0, GGML_DECODE_PROF_WAKE_N, 1);
+                }
+            }
+            ggml_metal_dprof_drain(ctx, false);
+        } else {
+            ggml_metal_cmd_buf_wait(ctx->cmd_buf_last);
+        }
         ctx->cmd_buf_last = nil;
         if (ctx->prof) {
             ctx->prof->sync_wait_s += (ggml_time_us() - t_w) * 1e-6;
@@ -654,6 +791,10 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
 
+        if (ctx->dprof) {
+            ggml_metal_dprof_push(ctx, cmd_buf, ggml_metal_host_time_s());
+        }
+
         [cmd_buf retain];
     }
 }
@@ -700,6 +841,10 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
 
+        if (ctx->dprof) {
+            ggml_metal_dprof_push(ctx, cmd_buf, ggml_metal_host_time_s());
+        }
+
         [cmd_buf retain];
     }
 }
@@ -722,6 +867,10 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         [ctx_dst->cmd_bufs_ext addObject:sync_cmd_buf];
         ctx_dst->cmd_buf_last = sync_cmd_buf;
+
+        if (ctx_dst->dprof) {
+            ggml_metal_dprof_push(ctx_dst, sync_cmd_buf, ggml_metal_host_time_s());
+        }
 
         [sync_cmd_buf retain];
 
@@ -752,6 +901,10 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         [ctx_src->cmd_bufs_ext addObject:cmd_buf];
         ctx_src->cmd_buf_last = cmd_buf;
 
+        if (ctx_src->dprof) {
+            ggml_metal_dprof_push(ctx_src, cmd_buf, ggml_metal_host_time_s());
+        }
+
         [cmd_buf retain];
 
         ggml_metal_event_wait(ctx_dst, ev_cpy);
@@ -773,6 +926,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (ctx->prof) {
         return ggml_metal_prof_graph_compute(ctx, gf);
     }
+
+    const double dp_t0 = ctx->dprof ? ggml_metal_host_time_s() : 0.0;
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -858,6 +1013,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             [cmd_buf enqueue];
 
             ctx->encode_async(n_cb);
+
+            if (ctx->dprof) {
+                // committed at the end of encode_async
+                ggml_metal_dprof_push(ctx, cmd_buf, ggml_metal_host_time_s());
+            }
         }
 
         // remember the command buffer for the next iteration
@@ -886,6 +1046,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (ctx->dprof) {
+            // queue order; the ones encode_async did not commit (abort callback) are not tracked
+            for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+                if (cb_idx < 2 || ctx->abort_callback == NULL) {
+                    ggml_metal_dprof_push(ctx, ctx->cmd_bufs[cb_idx].obj, 0.0);
+                }
+            }
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_GRAPHS, 1);
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_ENCODE_US, (ggml_metal_host_time_s() - dp_t0)*1e6);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -974,6 +1145,10 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
 
+        if (ctx->dprof) {
+            ggml_metal_dprof_push(ctx, cmd_buf, ggml_metal_host_time_s());
+        }
+
         [cmd_buf retain];
     }
 }
@@ -989,6 +1164,10 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
         [ctx->cmd_bufs_ext addObject:cmd_buf];
         ctx->cmd_buf_last = cmd_buf;
+
+        if (ctx->dprof) {
+            ggml_metal_dprof_push(ctx, cmd_buf, ggml_metal_host_time_s());
+        }
 
         [cmd_buf retain];
     }

@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -1895,12 +1896,160 @@ static inline double sched_now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// LLAMA_DSV41_DECODE_PROF=1: host overhead per decode step of 1..16 tokens (diagnostics only, see ggml-backend.h)
+struct ggml_decode_prof_state {
+    int        level = 0;
+    std::mutex mtx;
+    uint64_t   next_id = 1;
+    uint64_t   cur_id  = 0;  // open step, 0 = none
+    int        cur_cls = 0;  // 0 = 1-token steps, 1 = 2..16 tokens
+    int        cur_ntok = 0;
+    double     cur_t0  = 0;  // ms
+    double     cur[GGML_DECODE_PROF_COUNT] = {};
+    uint64_t   last_id = 0;  // last closed step (late GPU timestamps go straight to its class totals)
+    int        last_cls = 0;
+    double     tot[2][GGML_DECODE_PROF_COUNT] = {};
+    double     tot_wall[2] = {};
+    uint64_t   steps[2] = {}, tokens[2] = {};
+    long       every = 0;    // LLAMA_DSV41_DECODE_PROF_EVERY=N: print the summary every N closed steps too
+
+    void close_locked(double now) {
+        if (cur_id == 0) {
+            return;
+        }
+        const int k = cur_cls;
+        for (int i = 0; i < GGML_DECODE_PROF_COUNT; ++i) {
+            tot[k][i] += cur[i];
+        }
+        const double wall = now - cur_t0;
+        tot_wall[k] += wall;
+        steps[k]++;
+        tokens[k] += cur_ntok;
+        if (level >= 2) {
+            fprintf(stderr, "decode-prof: step %llu ntok %d wall_ms %.3f decode_ms %.3f gpu_busy_ms %.3f gpu_idle_ms %.3f gpu_lead_ms %.3f "
+                "splits %.0f cbs %.0f syncs %.0f blocked %.0f sync_ms %.3f wake_us %.1f moe_sync_ms %.3f moe_plan_ms %.3f moe_upwait_ms %.3f\n",
+                (unsigned long long) cur_id, cur_ntok, wall, cur[GGML_DECODE_PROF_DECODE_US]*1e-3, cur[GGML_DECODE_PROF_GPU_US]*1e-3,
+                cur[GGML_DECODE_PROF_GPU_IDLE_US]*1e-3, cur[GGML_DECODE_PROF_GPU_LEAD_US]*1e-3, cur[GGML_DECODE_PROF_SPLITS],
+                cur[GGML_DECODE_PROF_CBS], cur[GGML_DECODE_PROF_SYNCS], cur[GGML_DECODE_PROF_SYNC_BLOCKED], cur[GGML_DECODE_PROF_SYNC_US]*1e-3,
+                cur[GGML_DECODE_PROF_WAKE_N] > 0 ? cur[GGML_DECODE_PROF_WAKE_US]/cur[GGML_DECODE_PROF_WAKE_N] : 0.0,
+                cur[GGML_DECODE_PROF_COPY_SYNC_US]*1e-3, cur[GGML_DECODE_PROF_COPY_PLAN_US]*1e-3, cur[GGML_DECODE_PROF_COPY_UPWAIT_US]*1e-3);
+        }
+        last_id  = cur_id;
+        last_cls = cur_cls;
+        cur_id   = 0;
+        if (every > 0 && (steps[0] + steps[1]) % (uint64_t) every == 0) {
+            print_locked("running");
+        }
+    }
+
+    void print_locked(const char * when) const {
+        static const char * names[2] = { "tok1", "tok2-16" };
+        const char * spin = getenv("GGML_METAL_SPIN_US");
+        for (int k = 0; k < 2; ++k) {
+            if (steps[k] == 0) {
+                continue;
+            }
+            const double   n = (double) steps[k];
+            const double * t = tot[k];
+            const double gpu_ms = t[GGML_DECODE_PROF_GPU_US]*1e-3/n;
+            fprintf(stderr, "decode-prof: %s class=%s steps=%llu tokens=%llu spin_us=%s per-step ms: wall %.3f decode %.3f sched %.3f encode %.3f "
+                "sync %.3f gpu_busy %.3f gpu_idle %.3f gpu_lead %.3f host_exposed %.3f\n",
+                when, names[k], (unsigned long long) steps[k], (unsigned long long) tokens[k], spin ? spin : "0",
+                tot_wall[k]/n, t[GGML_DECODE_PROF_DECODE_US]*1e-3/n, t[GGML_DECODE_PROF_SCHED_US]*1e-3/n, t[GGML_DECODE_PROF_ENCODE_US]*1e-3/n,
+                t[GGML_DECODE_PROF_SYNC_US]*1e-3/n, gpu_ms, t[GGML_DECODE_PROF_GPU_IDLE_US]*1e-3/n, t[GGML_DECODE_PROF_GPU_LEAD_US]*1e-3/n,
+                tot_wall[k]/n - gpu_ms);
+            fprintf(stderr, "decode-prof: %s class=%s per-step counts: splits %.1f (gpu %.1f) graphs %.1f cbs %.1f sync_calls %.1f syncs %.1f "
+                "blocked %.1f spin_hits %.1f; per event us: sync %.1f wake %.1f (%.1f/step) submit %.1f (%.1f/step) encode/graph %.1f\n",
+                when, names[k], t[GGML_DECODE_PROF_SPLITS]/n, t[GGML_DECODE_PROF_SPLITS_GPU]/n, t[GGML_DECODE_PROF_GRAPHS]/n, t[GGML_DECODE_PROF_CBS]/n,
+                t[GGML_DECODE_PROF_SYNC_CALLS]/n, t[GGML_DECODE_PROF_SYNCS]/n, t[GGML_DECODE_PROF_SYNC_BLOCKED]/n, t[GGML_DECODE_PROF_SYNC_SPIN_HITS]/n,
+                t[GGML_DECODE_PROF_SYNCS] > 0 ? t[GGML_DECODE_PROF_SYNC_US]/t[GGML_DECODE_PROF_SYNCS] : 0.0,
+                t[GGML_DECODE_PROF_WAKE_N] > 0 ? t[GGML_DECODE_PROF_WAKE_US]/t[GGML_DECODE_PROF_WAKE_N] : 0.0, t[GGML_DECODE_PROF_WAKE_N]/n,
+                t[GGML_DECODE_PROF_SUBMIT_N] > 0 ? t[GGML_DECODE_PROF_SUBMIT_US]/t[GGML_DECODE_PROF_SUBMIT_N] : 0.0, t[GGML_DECODE_PROF_SUBMIT_N]/n,
+                t[GGML_DECODE_PROF_GRAPHS] > 0 ? t[GGML_DECODE_PROF_ENCODE_US]/t[GGML_DECODE_PROF_GRAPHS] : 0.0);
+            const double nc = t[GGML_DECODE_PROF_COPY_CALLS];
+            fprintf(stderr, "decode-prof: %s class=%s moe copy per-step: calls %.1f, ms: sync+ids %.3f plan %.3f upload_start %.3f upload_wait %.3f; "
+                "per call us: sync+ids %.1f plan %.1f upload_start %.1f upload_wait %.1f\n",
+                when, names[k], nc/n, t[GGML_DECODE_PROF_COPY_SYNC_US]*1e-3/n, t[GGML_DECODE_PROF_COPY_PLAN_US]*1e-3/n,
+                t[GGML_DECODE_PROF_COPY_UPSTART_US]*1e-3/n, t[GGML_DECODE_PROF_COPY_UPWAIT_US]*1e-3/n,
+                nc > 0 ? t[GGML_DECODE_PROF_COPY_SYNC_US]/nc : 0.0, nc > 0 ? t[GGML_DECODE_PROF_COPY_PLAN_US]/nc : 0.0,
+                nc > 0 ? t[GGML_DECODE_PROF_COPY_UPSTART_US]/nc : 0.0, nc > 0 ? t[GGML_DECODE_PROF_COPY_UPWAIT_US]/nc : 0.0);
+        }
+    }
+};
+
+// leaked on purpose: the backends may still add to it from their own teardown at exit
+static ggml_decode_prof_state * ggml_decode_prof_get() {
+    static ggml_decode_prof_state * s = [] {
+        const char * v = getenv("LLAMA_DSV41_DECODE_PROF");
+        if (v == nullptr || atoi(v) <= 0) {
+            return (ggml_decode_prof_state *) nullptr;
+        }
+        ggml_decode_prof_state * p = new ggml_decode_prof_state();
+        p->level = atoi(v);
+        const char * e = getenv("LLAMA_DSV41_DECODE_PROF_EVERY");
+        p->every = e ? atol(e) : 0;
+        atexit([] {
+            ggml_decode_prof_state * q = ggml_decode_prof_get();
+            std::lock_guard<std::mutex> lock(q->mtx);
+            q->print_locked("final");
+        });
+        return p;
+    }();
+    return s;
+}
+
+bool ggml_decode_prof_enabled(void) {
+    return ggml_decode_prof_get() != nullptr;
+}
+
+void ggml_decode_prof_begin(int n_tokens) {
+    ggml_decode_prof_state * s = ggml_decode_prof_get();
+    if (s == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s->mtx);
+    const double now = sched_now_ms();
+    s->close_locked(now);
+    if (n_tokens >= 1 && n_tokens <= 16) {
+        s->cur_id   = s->next_id++;
+        s->cur_cls  = n_tokens == 1 ? 0 : 1;
+        s->cur_ntok = n_tokens;
+        s->cur_t0   = now;
+        std::fill(s->cur, s->cur + GGML_DECODE_PROF_COUNT, 0.0);
+    }
+}
+
+uint64_t ggml_decode_prof_step(void) {
+    ggml_decode_prof_state * s = ggml_decode_prof_get();
+    if (s == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(s->mtx);
+    return s->cur_id;
+}
+
+void ggml_decode_prof_add(uint64_t step, enum ggml_decode_prof_counter c, double v) {
+    ggml_decode_prof_state * s = ggml_decode_prof_get();
+    if (s == nullptr || c < 0 || c >= GGML_DECODE_PROF_COUNT) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (s->cur_id != 0 && (step == 0 || step == s->cur_id)) {
+        s->cur[c] += v;
+    } else if (step != 0 && step == s->last_id) {
+        s->tot[s->last_cls][c] += v;
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
     ggml_sched_host_stats & hs = g_sched_host_stats;
     const bool hon = hs.on;
     double h_tot0 = hon ? sched_now_ms() : 0;
+    static const bool dprof = ggml_decode_prof_enabled();
+    const double dp_t0 = dprof ? sched_now_ms() : 0;
+    int dp_splits = 0, dp_splits_gpu = 0;
 
     int prev_backend_id = -1;
 
@@ -1908,6 +2057,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        if (dprof) {
+            dp_splits++;
+            dp_splits_gpu += split_backend_id != sched->n_backends - 1;
+        }
 
         double h0 = hon ? sched_now_ms() : 0;
         // ensure the previous split's async work has completed before we start
@@ -1991,6 +2145,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (hon) { hs.n_graphs++; hs.t_total += sched_now_ms() - h_tot0; }
+    if (dprof) {
+        ggml_decode_prof_add(0, GGML_DECODE_PROF_SCHED_US, (sched_now_ms() - dp_t0)*1e3);
+        ggml_decode_prof_add(0, GGML_DECODE_PROF_SPLITS, dp_splits);
+        ggml_decode_prof_add(0, GGML_DECODE_PROF_SPLITS_GPU, dp_splits_gpu);
+    }
     return GGML_STATUS_SUCCESS;
 }
 

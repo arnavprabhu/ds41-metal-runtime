@@ -1093,6 +1093,12 @@ struct llama_moe_cache::impl {
         fprintf(stderr, "llama_moe_cache: arena limited to %.2f MiB of %.2f MiB allocated\n", active_bytes()/1024.0/1024.0, cur/1024.0/1024.0);
     }
 
+    // LLAMA_DSV41_DECODE_PROF=1: the copy callbacks book their phases into the open decode step (ggml-backend.h)
+    static bool dprof_enabled() {
+        static const bool on = ggml_decode_prof_enabled();
+        return on;
+    }
+
     static bool direct_enabled() {
         static const bool on = [] {
             const char * v = getenv("LLAMA_DSV41_MOE_DIRECT");
@@ -1419,9 +1425,11 @@ struct llama_moe_cache::impl {
         }
 
         size_t bytes = 0;
+        const auto tu0 = std::chrono::steady_clock::now();
         if (!fills.empty()) {
             overlap_start_fill(backend, l, g, bytes);
         }
+        const auto tu1 = std::chrono::steady_clock::now();
         size_t slot_bytes = 0;
         for (const ggml_tensor * w : l.experts) {
             slot_bytes += w->nb[2];
@@ -1457,6 +1465,13 @@ struct llama_moe_cache::impl {
             tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
                 std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
+        if (dprof_enabled()) {
+            const double us_up = std::chrono::duration<double, std::micro>(tu1 - tu0).count();
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_CALLS, 1);
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_SYNC_US, std::chrono::duration<double, std::micro>(t1 - t0).count());
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_PLAN_US, std::chrono::duration<double, std::micro>(t2 - t1).count() - us_up);
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_UPSTART_US, us_up);
         }
         return true;
     }
@@ -1510,6 +1525,9 @@ struct llama_moe_cache::impl {
         (overlap_small ? stats_small : stats_large).wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         if (overlap_small) {
             tok_cur.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        }
+        if (dprof_enabled()) {
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_UPWAIT_US, std::chrono::duration<double, std::micro>(t1 - t0).count());
         }
         return true;
     }
@@ -1673,6 +1691,12 @@ struct llama_moe_cache::impl {
             tok_add(il, (int32_t) sel->ne[1], n_hit, fills.size(), bytes,
                 std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(),
                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
+        if (dprof_enabled()) {
+            // without overlap the plan includes the synchronous fill
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_CALLS, 1);
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_SYNC_US, std::chrono::duration<double, std::micro>(t1 - t0).count());
+            ggml_decode_prof_add(0, GGML_DECODE_PROF_COPY_PLAN_US, std::chrono::duration<double, std::micro>(t2 - t1).count());
         }
 
         // the next copy synchronizes the backend before it changes the slot map again

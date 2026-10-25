@@ -1488,9 +1488,36 @@ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev
     }
 }
 
+int ggml_metal_spin_us(void) {
+    static int spin_us = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char * val = getenv("GGML_METAL_SPIN_US");
+        spin_us = val && atoi(val) > 0 ? atoi(val) : 0;
+        if (spin_us > 0) {
+            GGML_LOG_INFO("%s: busy-poll command buffers / events for up to %d us before blocking\n", __func__, spin_us);
+        }
+    });
+    return spin_us;
+}
+
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = ev->obj;
-    const bool res = [event waitUntilSignaledValue:atomic_load_explicit(&ev->value, memory_order_relaxed) timeoutMS:60000];
+    const uint64_t value = atomic_load_explicit(&ev->value, memory_order_relaxed);
+
+    // GGML_METAL_SPIN_US: poll the signaled value before blocking
+    const int spin_us = ggml_metal_spin_us();
+    if (spin_us > 0) {
+        const int64_t t0 = ggml_time_us();
+        do {
+            if ([event signaledValue] >= value) {
+                GGML_UNUSED(dev);
+                return;
+            }
+        } while (ggml_time_us() - t0 < spin_us);
+    }
+
+    const bool res = [event waitUntilSignaledValue:value timeoutMS:60000];
     if (!res) {
         GGML_ABORT("%s: failed to wait for event\n", __func__);
     }
