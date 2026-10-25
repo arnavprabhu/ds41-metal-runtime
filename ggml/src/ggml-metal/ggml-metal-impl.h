@@ -367,6 +367,7 @@ typedef struct {
     int32_t  sect_1;
     int32_t  sect_2;
     int32_t  sect_3;
+    int32_t  i0s;     // first channel visited (even): > 0 only in place, where the channels before it are skipped anyway
     bool     src2;
     bool     inplace;
 } ggml_metal_kargs_rope;
@@ -1388,6 +1389,37 @@ typedef struct {
     uint64_t nb_d1;
     uint64_t nb_d2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_used;
+    uint64_t nb_e1;   // experts [n_embd, n_used, n_tokens], contiguous rows
+    uint64_t nb_e2;
+    uint64_t nb_w1;   // weights [1, n_used, n_tokens]
+    uint64_t nb_w2;
+    uint64_t nb_s1;   // shexp [n_embd, n_tokens]
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+    uint64_t nb_c2;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_dsv4_hc_post_moe;
+
+typedef struct {
+    int32_t  K;        // row width (multiple of 64)
+    int32_t  M;        // output rows (multiple of 8, <= 32)
+    int32_t  n_tokens;
+    int32_t  t0;       // first token of the tail kernel
+    uint64_t nb_w1;
+    uint64_t nb_x1;
+    uint64_t nb_d1;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_mix;
 
 typedef struct {
     int32_t  ne00;

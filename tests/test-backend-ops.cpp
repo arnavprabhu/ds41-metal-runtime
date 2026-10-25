@@ -4726,6 +4726,100 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// DS41 prefill (iter 013k): ggml_dsv4_hc_post_moe = MoE weighting + reduction + shared expert + hc_post in one op.
+// ref = true builds the unfused chain (MUL, expert views, ADD chain, ADD shexp, hc_post) for a perf baseline.
+struct test_ds41_hc_post_moe : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_used;
+    const int64_t n_tokens;
+    const bool    ref;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ref ? "DS41_MOE_POST_REF" : "DS41_HC_POST_MOE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_used, n_tokens, ref);
+    }
+
+    bool run_whole_graph() override { return ref; }
+
+    test_ds41_hc_post_moe(int64_t n_embd = 64, int64_t n_used = 6, int64_t n_tokens = 17, bool ref = false)
+        : n_embd(n_embd), n_used(n_used), n_tokens(n_tokens), ref(ref) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+        ggml_set_name(experts, "x");
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(shexp, "x");
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        ggml_tensor * comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+        ggml_set_name(comb, "comb");
+
+        if (ref) {
+            ggml_tensor * e = ggml_mul(ctx, experts, weights);
+            ggml_tensor * moe_out = nullptr;
+            for (int64_t i = 0; i < n_used; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx, e, n_embd, n_tokens, e->nb[2], i*e->nb[1]);
+                moe_out = moe_out ? ggml_add(ctx, moe_out, v) : v;
+            }
+            ggml_tensor * x = ggml_add(ctx, moe_out, shexp);
+            out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        } else {
+            out = ggml_dsv4_hc_post_moe(ctx, experts, weights, shexp, residual, post, comb);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// DS41 prefill (iter 013k): ggml_dsv4_hc_mix = mul_mat(w, rms_norm(x)) in one F32 pass (numeric tier: other order).
+// ref = true builds rms_norm + mul_mat (the current graph) for a perf baseline.
+struct test_ds41_hc_mix : public test_dsv4_hc {
+    const int64_t K;
+    const int64_t M;
+    const int64_t n_tokens;
+    const bool    ref;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ref ? "DS41_HC_MIX_REF" : "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(K, M, n_tokens, ref);
+    }
+
+    bool run_whole_graph() override { return ref; }
+
+    // fused: F32 accumulation in another order than the double CPU reference; ref: Metal mul_mm rounds w to F16
+    double max_nmse_err() override { return ref ? 5e-4 : 1e-6; }
+
+    test_ds41_hc_mix(int64_t K = 256, int64_t M = 24, int64_t n_tokens = 17, bool ref = false)
+        : K(K), M(M), n_tokens(n_tokens), ref(ref) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+        ggml_set_name(w, "hc_fn");
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
+        ggml_set_name(x, "x");
+
+        if (ref) {
+            out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, 1e-6f));
+        } else {
+            out = ggml_dsv4_hc_mix(ctx, w, x, 1e-6f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9956,6 +10050,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    // iter 013k: fused MoE reduce + hc_post, fused hc mixes (n_tokens around the 16-token groups and the tail kernel)
+    for (int64_t nt : { 1, 15, 16, 17, 33 }) {
+        test_cases.emplace_back(new test_ds41_hc_post_moe(64, 6, nt));
+        test_cases.emplace_back(new test_ds41_hc_mix(256, 24, nt));
+    }
+    test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, 7));
+    test_cases.emplace_back(new test_ds41_hc_post_moe(128, 1, 9));
+    test_cases.emplace_back(new test_ds41_hc_post_moe(128, 8, 9));
+    test_cases.emplace_back(new test_ds41_hc_mix(512, 8, 40));
+    test_cases.emplace_back(new test_ds41_hc_mix(512, 32, 40));
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
@@ -12350,6 +12454,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_ds41() {
         for (ggml_type t : { GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS }) {
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 2304, n, 5120));
             test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, nexp, 6, false, 5120, n, 2304));
+        }
+        // prefill traffic fusions (DS41_PF=1, iter 013k): set DS41_N=4096 (or 4096,4095,33) for ubatch shapes
+        if (getenv("DS41_PF")) {
+            // hc mixes: fused (numeric tier) vs RMS_NORM + MUL_MAT
+            test_cases.emplace_back(new test_ds41_hc_mix(20480, 24, n, false));
+            test_cases.emplace_back(new test_ds41_hc_mix(20480, 24, n, true));
+            // MoE reduce + shared expert + hc_post: fused vs MUL/VIEW/ADD chain + ADD + DSV4_HC_POST
+            test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, n, false));
+            test_cases.emplace_back(new test_ds41_hc_post_moe(5120, 6, n, true));
+            // plain hc_post (attention site) for the mapping
+            test_cases.emplace_back(new test_dsv4_hc_post(5120, n));
+            // q / indexer-q / attention-output RoPE of the 64-channel slice, copy vs in place (the in-place slice
+            // dispatch needs GGML_METAL_DS41_PFUSE=1); forward = false is ROPE_BACK
+            for (bool fwd : { true, false }) {
+                for (bool ip : { false, true }) {
+                    test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, fwd, ip, 448));
+                }
+            }
+            for (bool ip : { false, true }) {
+                test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {128, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f, 0.0f, 1.0f, false, 0, true, ip, 64));
+            }
+            // YaRN parameters of the compressed-attention layers (ext_factor != 0)
+            test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 0.25f, 1.0f, 1.0f, false, 0, true, true, 448));
+            test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512, 64, n, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 0.25f, 1.0f, 1.0f, false, 0, false, true, 448));
         }
         // decode sparse attention (DS41_FA=1): 64 heads, 1 KV head, dk = dv = 512, V view of K, index lists of
         // n_kv_max entries (window only at short depth, window + top-k 512 at long depth)

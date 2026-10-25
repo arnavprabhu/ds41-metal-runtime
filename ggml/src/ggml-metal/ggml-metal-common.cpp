@@ -9,6 +9,14 @@
 
 #include <vector>
 
+bool ggml_metal_ds41_pfuse(void) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_METAL_DS41_PFUSE");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return on;
+}
+
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
 // 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate
 // float[N] per threadgroup, so they are only available where that fits.

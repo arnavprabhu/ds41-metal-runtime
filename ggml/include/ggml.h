@@ -596,6 +596,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2750,6 +2751,28 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_post with the MoE output reduction and the shared expert folded in (DS41 prefill, GGML_METAL_DS41_PFUSE):
+    //   experts [n_embd, n_used, n_tokens], weights [1, n_used, n_tokens], shexp [n_embd, n_tokens]
+    //   x[i, t] = (sum_e experts[i, e, t]*weights[0, e, t]) + shexp[i, t]   (e in order, as MUL + ADD chain + ADD)
+    //   then as ggml_dsv4_hc_post(x, residual, post, comb); comb must not be NULL
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * shexp,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
+
+    // hc mixes: w [K, M] F32, x [K, n_tokens] F32 -> [M, n_tokens]
+    //   result[m, t] = sum_k w[k, m]*x[k, t]*s[t],  s[t] = 1/sqrt(mean_k x[k, t]^2 + eps)
+    //   i.e. ggml_mul_mat(w, ggml_rms_norm(x, eps)) in one pass over x (F32 accumulation; summation order differs)
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * x,
+            float                 eps);
 
     // custom operators
 

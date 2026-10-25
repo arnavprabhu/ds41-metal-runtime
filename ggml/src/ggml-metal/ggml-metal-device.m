@@ -1837,7 +1837,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
-                (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
+                (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3])) &&
+                // ggml_dsv4_hc_post_moe: float4 kernel, the weights ride in simdgroup lanes 20..31
+                (op->src[4] == NULL || (
+                    op->src[3] != NULL &&
+                    op->src[4]->type == GGML_TYPE_F32 &&
+                    op->src[5] != NULL && op->src[5]->type == GGML_TYPE_F32 &&
+                    op->src[0]->ne[1] >= 1 && op->src[0]->ne[1] <= 12 &&
+                    op->ne[0] % 4 == 0 &&
+                    op->src[0]->nb[0] == sizeof(float) && op->src[0]->nb[1] % 16 == 0 && op->src[0]->nb[2] % 16 == 0 &&
+                    op->src[5]->nb[0] == sizeof(float) && op->src[5]->nb[1] % 16 == 0 &&
+                    op->src[1]->nb[0] == sizeof(float) && op->src[1]->nb[1] % 16 == 0 && op->src[1]->nb[2] % 16 == 0 &&
+                    ggml_is_contiguous(op)));
+        case GGML_OP_DSV4_HC_MIX:
+            return has_simdgroup_mm && has_simdgroup_reduction &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->ne[0] % 64 == 0 &&
+                op->src[0]->ne[1] % 8 == 0 && op->src[0]->ne[1] <= 32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                op->nb[0] == sizeof(float);
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:

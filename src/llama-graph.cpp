@@ -2635,6 +2635,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
+    if (moe_defer_reduce) {
+        moe_defer_reduce = false;
+        if (!weight_before_ffn) {
+            // the caller fuses the weighting and the reduction (same arithmetic as the MUL + ADD chain below)
+            moe_defer_experts = experts;
+            moe_defer_weights = weights;
+            return nullptr;
+        }
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);

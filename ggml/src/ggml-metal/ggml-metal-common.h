@@ -68,6 +68,10 @@ int ggml_metal_mul_mv_mma_rt(const struct ggml_tensor * op);
 // the weights of K per simdgroup step of the few-row MMA kernel for a src0 type and rt src1 tiles, 0 if none takes the type
 int64_t ggml_metal_mul_mv_mma_k_step(enum ggml_type type, int rt);
 
+// GGML_METAL_DS41_PFUSE=1: DS41 prefill traffic fusions (in-place RoPE slice dispatch, fused MoE reduce + hc_post,
+// strided wo_a store). Off by default; the graph-side half reads the same variable.
+bool ggml_metal_ds41_pfuse(void);
+
 #ifdef __cplusplus
 }
 #endif

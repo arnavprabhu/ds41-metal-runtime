@@ -1072,6 +1072,12 @@ struct llm_graph_context {
     // layer work that does not need the routed experts (the shared expert) so that it runs while the experts are read
     mutable std::function<void()> moe_overlap_hook;
 
+    // DS41 prefill fusion (GGML_METAL_DS41_PFUSE): when set, build_moe_ffn stops before the router-weight MUL and the expert
+    // reduction, stores the unweighted expert outputs and the weights here and returns nullptr (cleared on use)
+    mutable bool          moe_defer_reduce = false;
+    mutable ggml_tensor * moe_defer_experts = nullptr;
+    mutable ggml_tensor * moe_defer_weights = nullptr;
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
