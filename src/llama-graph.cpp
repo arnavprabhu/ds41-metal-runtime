@@ -922,8 +922,22 @@ static void dsv4_set_kq_mask(
         const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
         const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
 
+        // LLAMA_DSV41_DEPTH: two fills per row (same values) instead of a select per entry: the masks are
+        // n_kv x n_tokens (up to 2^17 x 4096) and are written on the host for every ubatch
+        static const bool fill_rows = [] {
+            const char * v = getenv("LLAMA_DSV41_DEPTH");
+            return v && atoi(v) >= 1;
+        }();
+
         for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
             const int32_t n_visible = plan.n_visible[i];
+
+            if (fill_rows) {
+                const int64_t nv = std::clamp<int64_t>(n_visible, 0, dst->ne[0]);
+                std::fill_n(data + i*dst->ne[0],      nv,              fp16_zero);
+                std::fill_n(data + i*dst->ne[0] + nv, dst->ne[0] - nv, fp16_ninf);
+                continue;
+            }
 
             for (int64_t j = 0; j < dst->ne[0]; ++j) {
                 data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
