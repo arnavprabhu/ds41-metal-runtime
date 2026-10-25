@@ -3897,6 +3897,19 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 /*.n_kv_max_padded   =*/ n_kv_max_padded,
             };
 
+            // GGML_METAL_DSV4_SATTN >= 2: coalesced builder (one simdgroup per mask row, 8 rows per threadgroup),
+            // same lists; needs 8-byte aligned mask rows
+            static const bool env_idx_v2 = getenv("GGML_METAL_DSV4_SATTN") && atoi(getenv("GGML_METAL_DSV4_SATTN")) >= 2;
+            if (env_idx_v2 && nb31 % 8 == 0 && nb32 % 8 == 0 && nb33 % 8 == 0 && (op->src[3]->view_offs % 8) == 0) {
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_v2(lib);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline0);
+                ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne31 + 7)/8, ne32, ne33, 32*8, 1, 1);
+            } else {
             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(lib, op);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
@@ -3908,6 +3921,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nth = std::max(32, (nth/32)*32);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nth, 1, 1);
+            }
 
             need_sync = true;
         }
@@ -3954,13 +3968,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_op_concurrency_reset(ctx);
         }
 
-        // deepseek41 sparse prefill attention on the matrix units (GGML_METAL_DSV4_SATTN=1): 64 heads over one KV
-        // head with K == V, dk = dv = 512, F16 KV, over the index lists built above (kernel_dsv4_sparse_attn_f16)
+        // deepseek41 sparse prefill attention on the matrix units: 64 heads over one KV head with K == V,
+        // dk = dv = 512, F16 KV, over the index lists built above
+        //   GGML_METAL_DSV4_SATTN=1: kernel_dsv4_sparse_attn_f16 (simdgroup 8x8 matrices, 16 heads per threadgroup)
+        //   GGML_METAL_DSV4_SATTN=2: kernel_dsv4_sparse_attn_v2_f16 (matmul2d with K/V gathered into cooperative
+        //                            tensors, 32 heads per threadgroup; needs the tensor API, else falls back to 1)
         {
-            static const bool env_sattn = getenv("GGML_METAL_DSV4_SATTN") && atoi(getenv("GGML_METAL_DSV4_SATTN")) != 0;
+            static const int env_sattn = getenv("GGML_METAL_DSV4_SATTN") ? atoi(getenv("GGML_METAL_DSV4_SATTN")) : 0;
             const bool kv_same = op->src[1]->data == op->src[2]->data && op->src[1]->nb[1] == op->src[2]->nb[1] &&
                                  op->src[1]->buffer == op->src[2]->buffer;
-            if (env_sattn && use_sparse && ne01 > 32 && ne00 == 512 && ne20 == 512 && kv_same &&
+            if (env_sattn != 0 && use_sparse && ne01 > 32 && ne00 == 512 && ne20 == 512 && kv_same &&
                     op->src[1]->type == GGML_TYPE_F16 && ne12 == 1 && ne13 == 1 && ne03 == 1 && ne32 == 1 && ne33 == 1 &&
                     ne02 % 16 == 0 && !has_bias && !has_scap && op->src[1]->nb[0] == sizeof(ggml_fp16_t)) {
                 ggml_metal_kargs_dsv4_sparse_attn sargs = {
@@ -3974,7 +3991,33 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                     /*.scale           =*/ scale,
                     /*.has_sinks       =*/ has_sinks ? 1 : 0,
                 };
-                auto pipeline_sa = ggml_metal_library_get_pipeline_dsv4_sparse_attn(lib);
+
+                // v2: q rows read as float4, dst rows [row][head][512] f32 (the threadgroup keeps its half Q there)
+                const bool v2_ok = env_sattn >= 2 && props_dev->has_tensor && ne02 % 32 == 0 &&
+                                   op->src[0]->nb[0] == sizeof(float) && nb02 % 16 == 0 && nb01 % 16 == 0 &&
+                                   op->src[1]->nb[1] % 8 == 0 && ggml_is_contiguous(op);
+
+                if (v2_ok) {
+                    auto pipeline_sa = ggml_metal_library_get_pipeline_dsv4_sparse_attn(lib, 2);
+                    if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_sa) >= 512) {
+                        ggml_metal_encoder_set_pipeline(enc, pipeline_sa);
+                        ggml_metal_encoder_set_bytes   (enc, &sargs, sizeof(sargs), 0);
+                        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                        ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
+                        ggml_metal_encoder_set_buffer  (enc, bid_src4, 4);
+                        ggml_metal_encoder_set_buffer  (enc, bid_idx,  5);
+                        ggml_metal_encoder_set_buffer  (enc, bid_dst,  6);
+                        // scores f32 [32][64], probabilities f16 [32][64], row scales f32 [32], flag
+                        const size_t smem_sa = GGML_PAD(32*64*4 + 32*64*2 + 32*4 + 16, 16);
+                        GGML_ASSERT(smem_sa <= props_dev->max_theadgroup_memory_size);
+                        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem_sa, 0);
+                        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02/32, 1, 32, 16, 1);
+                        return 1;
+                    }
+                }
+
+                auto pipeline_sa = ggml_metal_library_get_pipeline_dsv4_sparse_attn(lib, 1);
                 ggml_metal_encoder_set_pipeline(enc, pipeline_sa);
                 ggml_metal_encoder_set_bytes   (enc, &sargs, sizeof(sargs), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);

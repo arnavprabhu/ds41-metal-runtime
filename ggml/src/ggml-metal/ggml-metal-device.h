@@ -217,7 +217,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t ns10,
         int32_t ns20);
 
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_attn(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_sparse_attn(ggml_metal_library_t lib, int version);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx_v2(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
