@@ -75,6 +75,14 @@ bool ggml_metal_ds41_pfuse(void);
 // GGML_METAL_DS41_MMID=1: routed-expert gate + up + SWIGLU in one mat-mat dispatch (MUL_MAT_ID x2 + GLU fusion)
 bool ggml_metal_ds41_mmid(void);
 
+// DS41 decode fusions (iter 016k), each off by default:
+// GGML_METAL_DS41_MVGLU=1: routed-expert gate + up + GLU in one mat-vec dispatch (MUL_MAT_ID x2 + GLU, < 32 tokens)
+bool ggml_metal_ds41_mvglu(void);
+// GGML_METAL_DS41_MVMOE=1: routed-expert down + router-weight MUL + expert ADD chain in one mat-vec dispatch
+bool ggml_metal_ds41_mvmoe(void);
+// GGML_METAL_DS41_RTOPK=1: router sqrt-softplus + bias + argsort + MoE weight gather/normalize in one dispatch
+bool ggml_metal_ds41_rtopk(void);
+
 #ifdef __cplusplus
 }
 #endif

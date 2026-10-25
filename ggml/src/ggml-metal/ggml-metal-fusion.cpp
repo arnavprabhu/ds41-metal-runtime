@@ -974,6 +974,11 @@ static bool ggml_metal_fusion_check_ds41_mmid_glu(
         return false;
     }
 
+    // the mat-mat path only (the decode mat-vec products have their own fusion, DS41_MV_GLU)
+    if (mode == GGML_METAL_FUSION_FULL && nodes[0]->src[2]->ne[1] < 32) {
+        return false;
+    }
+
     const ggml_tensor * a   = nodes[0];
     const ggml_tensor * b   = nodes[1];
     const ggml_tensor * glu = nodes[2];
@@ -1069,6 +1074,361 @@ static const std::vector<ggml_op> ops_ds41_moe_w   = {
     GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
 };
 
+// ---- DS41 decode fusions (iter 016k) ----------------------------------------
+
+// ggml_can_fuse_subgraph_ext over raw node indices, except that a MUL_MAT_ID accumulating into an earlier product
+// (ggml_mul_mat_id_acc: a view of src[3]) may view that external tensor: the fused kernels read src[3] for the rows
+// they skip, as the separate dispatches leave them
+static bool ggml_metal_ds41_can_fuse_raw(const ggml_cgraph * gf, const int * raw, int count, const int * outputs, int n_outputs) {
+    for (int i = 0; i < count; ++i) {
+        if (raw[i] < 0 || raw[i] >= gf->n_nodes) {
+            return false;
+        }
+
+        const ggml_tensor * node = gf->nodes[raw[i]];
+
+        if (!ggml_op_is_empty(node->op) && (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+
+        bool is_output = false;
+        for (int o = 0; o < n_outputs; ++o) {
+            is_output = is_output || outputs[o] == raw[i];
+        }
+
+        if (!is_output) {
+            if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return false;
+            }
+
+            int uses = 0;
+            for (int j = i + 1; j < count; ++j) {
+                const ggml_tensor * other = gf->nodes[raw[j]];
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (other->src[s] == node) {
+                        uses++;
+                    }
+                }
+            }
+            if (uses != ggml_node_get_use_count(gf, raw[i])) {
+                return false;
+            }
+        }
+
+        const bool acc = node->op == GGML_OP_MUL_MAT_ID && node->src[3] != nullptr;
+
+        for (const ggml_tensor * v = node->view_src; v; v = v->view_src) {
+            if (acc && v == node->src[3]) {
+                break;
+            }
+            bool internal = false;
+            for (int j = 0; j < count; ++j) {
+                internal = internal || gf->nodes[raw[j]] == v;
+            }
+            // external view sources only for weights (constant during the graph), as ggml_can_fuse_subgraph_ext
+            const bool constant = v->buffer != nullptr && (v->flags & GGML_TENSOR_FLAG_PARAM) == 0 &&
+                ggml_backend_buffer_get_usage(v->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            if (!internal && !constant) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// a routed-expert MUL_MAT_ID that has a DS41 decode mat-vec kernel (the encoder still falls back when the device or
+// the DS41 kernel flags select another kernel). FULL mode: fewer than 32 tokens (the mat-vec path)
+static bool ggml_metal_ds41_mv_mmid_ok(const ggml_tensor * m, ggml_metal_fusion_mode mode) {
+    if (m->op != GGML_OP_MUL_MAT_ID || m->type != GGML_TYPE_F32 || !ggml_is_contiguous(m)) {
+        return false;
+    }
+
+    const ggml_tensor * a = m->src[0];
+    const ggml_tensor * b = m->src[1];
+
+    if (a->type != GGML_TYPE_IQ1_M && a->type != GGML_TYPE_IQ2_XXS && a->type != GGML_TYPE_IQ2_XS) {
+        return false;
+    }
+    if (b->type != GGML_TYPE_F32 || b->nb[0] != sizeof(float) || a->ne[0] % 256 != 0 || a->ne[3] != 1 || b->ne[3] != 1) {
+        return false;
+    }
+    if (m->src[3] != nullptr && (m->src[3]->type != GGML_TYPE_F32 || !ggml_is_contiguous(m->src[3]) || !ggml_are_same_shape(m, m->src[3]))) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL && m->src[2]->ne[1] >= 32) {
+        return false;
+    }
+
+    return true;
+}
+
+// MUL_MAT_ID (gate) + MUL_MAT_ID (up) + GLU, mat-vec (GGML_METAL_DS41_MVGLU=1). write_gu: the products have other
+// consumers (the second overlap pass accumulates into them), so the fused kernel also stores them
+static bool ggml_metal_fusion_check_ds41_mv_glu_impl(
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode,
+              bool                      write_gu) {
+    if (!ggml_metal_ds41_mvglu()) {
+        return false;
+    }
+
+    const ggml_tensor * a   = nodes[0];
+    const ggml_tensor * b   = nodes[1];
+    const ggml_tensor * glu = nodes[2];
+
+    const ggml_glu_op gop = ggml_get_glu_op(glu);
+    if (gop != GGML_GLU_OP_SWIGLU && gop != GGML_GLU_OP_SWIGLU_CLAMP) {
+        return false;
+    }
+    if (glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    if (!((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a))) {
+        return false;
+    }
+
+    if (!ggml_metal_ds41_mv_mmid_ok(a, mode) || !ggml_metal_ds41_mv_mmid_ok(b, mode)) {
+        return false;
+    }
+
+    if (a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
+            a->src[0]->type != b->src[0]->type || !ggml_are_same_shape(a->src[0], b->src[0]) ||
+            a->src[0]->nb[1] != b->src[0]->nb[1] || a->src[0]->nb[2] != b->src[0]->nb[2] ||
+            !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, glu) ||
+            glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
+        return false;
+    }
+
+    const bool acc = a->src[3] != nullptr;
+    if ((b->src[3] != nullptr) != acc || (acc && write_gu)) {
+        return false;
+    }
+
+    const int raw[3] = { node_idxs[idx], node_idxs[idx + 1], node_idxs[idx + 2] };
+    if (write_gu) {
+        return ggml_metal_ds41_can_fuse_raw(gf, raw, 3, raw, 3);
+    }
+    const int outputs[1] = { raw[2] };
+    return ggml_metal_ds41_can_fuse_raw(gf, raw, 3, outputs, 1);
+}
+
+static bool ggml_metal_fusion_check_ds41_mv_glu(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    return ggml_metal_fusion_check_ds41_mv_glu_impl(nodes, gf, node_idxs, idx, mode, false);
+}
+
+static bool ggml_metal_fusion_check_ds41_mv_glu_wt(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    return ggml_metal_fusion_check_ds41_mv_glu_impl(nodes, gf, node_idxs, idx, mode, true);
+}
+
+// MUL_MAT_ID (down) + MUL (router weights) + VIEW per expert + ADD chain, mat-vec (GGML_METAL_DS41_MVMOE=1).
+// Unsafe: the raw sequence is checked here (the tail is the MOE_REDUCE pattern).
+static bool ggml_metal_fusion_check_ds41_mv_moe(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    if (!ggml_metal_ds41_mvmoe()) {
+        return false;
+    }
+
+    const ggml_tensor * mm = nodes[0];
+    if (!ggml_metal_ds41_mv_mmid_ok(mm, mode)) {
+        return false;
+    }
+
+    const int r = node_idxs[idx];
+    if (node_idxs[idx + 1] != r + 1) {
+        return false;
+    }
+
+    const std::vector<ggml_op> tail(fusion->ops_all.begin() + 1, fusion->ops_all.end());
+
+    ggml_metal_moe_reduce_match match;
+    if (!ggml_metal_fusion_match_moe_reduce(gf, r + 1, tail, &match) || match.experts != mm) {
+        return false;
+    }
+
+    const int n_used = (int) mm->ne[1];
+    if (n_used != (int) fusion->ops.size() - 1 || mm->src[2]->ne[0] != n_used) {
+        return false;
+    }
+
+    const int raw_end = r + match.node_count;
+    if (node_idxs[idx + (int) fusion->ops.size() - 1] != raw_end) {
+        return false;
+    }
+
+    // the down product is consumed only by the MUL (the tail itself was checked by the MOE_REDUCE matcher)
+    const int raw[2]     = { r, r + 1 };
+    const int outputs[1] = { r + 1 };
+    if (!ggml_metal_ds41_can_fuse_raw(gf, raw, 2, outputs, 1)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!match.weights->data || !match.dst->data || !mm->data) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ggml_metal_fusion_check_ds41_router(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode);
+
+static bool ggml_metal_fusion_check_ds41_moe_w(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode);
+
+// UNARY(softplus) + SQRT + (RESHAPE) + ADD + ARGSORT + (VIEW) + GET_ROWS + ... + SCALE (GGML_METAL_DS41_RTOPK=1): the
+// DS41_ROUTER chain, the descending argsort of its output (selected experts = the leading view) and the DS41_MOE_W
+// chain on the sqrt output in one kernel. Unsafe: raw order as build_moe_ffn emits it.
+static bool ggml_metal_fusion_check_ds41_rtopk(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    if (!ggml_metal_ds41_rtopk()) {
+        return false;
+    }
+
+    const std::vector<ggml_op> & ops_all = fusion->ops_all;
+
+    const int r = node_idxs[idx];
+    const int raw_count = (int) ops_all.size();
+    if (r + raw_count > gf->n_nodes || node_idxs[idx + (int) fusion->ops.size() - 1] != r + raw_count - 1) {
+        return false;
+    }
+
+    int raw[GGML_METAL_FUSION_MAX];
+    for (int i = 0; i < raw_count; ++i) {
+        raw[i] = r + i;
+        if (gf->nodes[r + i]->op != ops_all[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * sp   = gf->nodes[r + 0];
+    const ggml_tensor * sq   = gf->nodes[r + 1];
+    const ggml_tensor * pr3  = gf->nodes[r + 2];
+    const ggml_tensor * add  = gf->nodes[r + 3];
+    const ggml_tensor * as   = gf->nodes[r + 4];
+    const ggml_tensor * view = gf->nodes[r + 5];
+    const ggml_tensor * gr   = gf->nodes[r + 6];
+
+    // router scores (same conditions as the DS41_ROUTER fusion)
+    if (sq->src[0] != sp || add->src[0] != sq || pr3->src[0] != sq || pr3->view_src != sq) {
+        return false;
+    }
+    {
+        const ggml_tensor * rn[3] = { sp, sq, add };
+        if (!ggml_metal_fusion_check_ds41_router(fusion, rn, gf, node_idxs, idx, mode)) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous_rows(sp->src[0]) || add->ne[0] > 1024) {
+        return false;
+    }
+
+    // descending argsort of the selection scores, its leading view (the selected experts) feeds the GET_ROWS
+    if (as->src[0] != add || as->type != GGML_TYPE_I32 || !ggml_is_contiguous(as) ||
+            (enum ggml_sort_order) ggml_get_op_params_i32(as, 0) != GGML_SORT_ORDER_DESC || as->ne[0] != add->ne[0]) {
+        return false;
+    }
+    if (view->src[0] != as || view->view_src != as || view->view_offs != 0 || view->nb[1] != as->nb[1] ||
+            gr->src[0] != pr3 || gr->src[1] != view || view->ne[0] > 32) {
+        return false;
+    }
+
+    // MoE weights (same conditions as the DS41_MOE_W fusion; its check reads the raw chain at idx + 4)
+    {
+        static const ggml_metal_fusion moe_w(GGML_METAL_FUSION_DS41_MOE_W,
+                { GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE },
+                {}, true, nullptr);
+        if (!ggml_metal_fusion_check_ds41_moe_w(&moe_w, nodes + 4, gf, node_idxs, idx + 4, mode)) {
+            return false;
+        }
+    }
+
+    // argsort and its view are read outside (cache slots, prefetch), the weights are the last node
+    const int outputs[3] = { r + 4, r + 5, r + raw_count - 1 };
+    if (!ggml_metal_ds41_can_fuse_raw(gf, raw, raw_count, outputs, 3)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (!sp->src[0]->data || !as->data || !gf->nodes[r + raw_count - 1]->data) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static const std::vector<ggml_op> ops_ds41_mv_glu = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+
+static const std::vector<ggml_op> ops_ds41_mv_moe_2 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_ds41_mv_moe_3 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_ds41_mv_moe_4 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_ds41_mv_moe_5 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_ds41_mv_moe_6 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+static const std::vector<ggml_op> ops_ds41_mv_moe_7 = {
+    GGML_OP_MUL_MAT_ID, GGML_OP_MUL,
+    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+};
+
+static const std::vector<ggml_op> ops_ds41_rtopk = {
+    GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW,
+    GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_SCALE, GGML_OP_DIV, GGML_OP_RESHAPE, GGML_OP_SCALE
+};
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -1102,6 +1462,15 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_DS41_MOE_W,     ops_ds41_moe_w,             {},     true,  ggml_metal_fusion_check_ds41_moe_w },
     { GGML_METAL_FUSION_DS41_MM_PERM,   ops_ds41_mm_perm,           {},     true,  ggml_metal_fusion_check_ds41_mm_perm },
     { GGML_METAL_FUSION_DS41_MMID_GLU,  ops_ds41_mmid_glu,          {},     true,  ggml_metal_fusion_check_ds41_mmid_glu },
+    { GGML_METAL_FUSION_DS41_MV_GLU,    ops_ds41_mv_glu,            {},     true,  ggml_metal_fusion_check_ds41_mv_glu },
+    { GGML_METAL_FUSION_DS41_MV_GLU_WT, ops_ds41_mv_glu,            {0, 1}, true,  ggml_metal_fusion_check_ds41_mv_glu_wt },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_2,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_3,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_4,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_5,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_6,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_MV_MOE,    ops_ds41_mv_moe_7,          {},     true,  ggml_metal_fusion_check_ds41_mv_moe },
+    { GGML_METAL_FUSION_DS41_RTOPK,     ops_ds41_rtopk,             {3},    true,  ggml_metal_fusion_check_ds41_rtopk },
 };
 
 // ---- alloc deps -----------------------------------------------------------
@@ -1160,6 +1529,18 @@ void ggml_metal_fusion_add_alloc_deps(
                 continue;
             }
             if (fusion.id == GGML_METAL_FUSION_DS41_MMID_GLU && !ggml_metal_ds41_mmid()) {
+                continue;
+            }
+            // DS41 decode fusions: only with their flag, and only for the mat-vec (< 32 token) MUL_MAT_ID
+            if ((fusion.id == GGML_METAL_FUSION_DS41_MV_GLU || fusion.id == GGML_METAL_FUSION_DS41_MV_GLU_WT) &&
+                    (!ggml_metal_ds41_mvglu() || gf->nodes[i]->op != GGML_OP_MUL_MAT_ID || gf->nodes[i]->src[2]->ne[1] >= 32)) {
+                continue;
+            }
+            if (fusion.id == GGML_METAL_FUSION_DS41_MV_MOE &&
+                    (!ggml_metal_ds41_mvmoe() || gf->nodes[i]->op != GGML_OP_MUL_MAT_ID || gf->nodes[i]->src[2]->ne[1] >= 32)) {
+                continue;
+            }
+            if (fusion.id == GGML_METAL_FUSION_DS41_RTOPK && !ggml_metal_ds41_rtopk()) {
                 continue;
             }
             if (ggml_metal_fusion_match_raw_pattern(gf, i, fusion.ops_all)) {

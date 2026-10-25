@@ -146,6 +146,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_glu    (ggml_metal_library_t lib, const struct ggml_tensor * op, bool clamp);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+// DS41 decode expert fusions: moe = false: gate + up + GLU (mode 0 plain, 1 also stores gate / up, 2 second overlap pass),
+// moe = true: down + router weights + expert sum. pipeline == NULL when op would run a stock (non-DS41) mul_mv_id kernel
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_ds41    (ggml_metal_library_t lib, const struct ggml_tensor * op, bool moe, bool clamp, int mode, int n_used);
+size_t ggml_metal_library_ds41_mv_tab(const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -170,6 +174,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_col2im_1d
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_hc_gate (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_router  (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_moe_w   (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ds41_router_topk(ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_snake             (ggml_metal_library_t lib, enum ggml_type type);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw        (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tiled);

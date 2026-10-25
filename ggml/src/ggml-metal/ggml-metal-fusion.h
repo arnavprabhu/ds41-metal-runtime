@@ -48,6 +48,10 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_DS41_MOE_W,   // GET_ROWS + SUM_ROWS + SCALE + DIV + SCALE (MoE weight gather + normalize, GGML_METAL_DS41_FUSE)
     GGML_METAL_FUSION_DS41_MM_PERM, // MUL_MAT + PERMUTE + CONT (mat-mat store in the cont layout, GGML_METAL_DS41_PFUSE)
     GGML_METAL_FUSION_DS41_MMID_GLU, // MUL_MAT_ID (up) + MUL_MAT_ID (gate) + GLU (swiglu / swiglu_clamp), GGML_METAL_DS41_MMID
+    GGML_METAL_FUSION_DS41_MV_GLU,   // decode MUL_MAT_ID (gate) + MUL_MAT_ID (up) + GLU, mat-vec (GGML_METAL_DS41_MVGLU)
+    GGML_METAL_FUSION_DS41_MV_GLU_WT, // the same, gate and up also stored (first MoE cache overlap pass)
+    GGML_METAL_FUSION_DS41_MV_MOE,   // decode MUL_MAT_ID (down) + MUL + VIEWs + ADD chain, mat-vec (GGML_METAL_DS41_MVMOE)
+    GGML_METAL_FUSION_DS41_RTOPK,    // softplus + SQRT + ADD + ARGSORT + GET_ROWS + SUM_ROWS + SCALE + DIV + SCALE (GGML_METAL_DS41_RTOPK)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

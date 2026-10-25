@@ -1670,7 +1670,12 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                // a negative id (ggml_mul_mat_id_acc) skips the row: its output is left as it is
+                if (i02 < 0) {
+                    continue;
+                }
+
+                assert(i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

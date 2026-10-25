@@ -17,6 +17,26 @@ bool ggml_metal_ds41_mmid(void) {
     return on;
 }
 
+static bool ggml_metal_ds41_env_on(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
+bool ggml_metal_ds41_mvglu(void) {
+    static const bool on = ggml_metal_ds41_env_on("GGML_METAL_DS41_MVGLU");
+    return on;
+}
+
+bool ggml_metal_ds41_mvmoe(void) {
+    static const bool on = ggml_metal_ds41_env_on("GGML_METAL_DS41_MVMOE");
+    return on;
+}
+
+bool ggml_metal_ds41_rtopk(void) {
+    static const bool on = ggml_metal_ds41_env_on("GGML_METAL_DS41_RTOPK");
+    return on;
+}
+
 bool ggml_metal_ds41_pfuse(void) {
     static const bool on = [] {
         const char * v = getenv("GGML_METAL_DS41_PFUSE");
