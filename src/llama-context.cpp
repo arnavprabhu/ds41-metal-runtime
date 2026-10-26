@@ -2612,6 +2612,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (moe_cache) {
+        moe_cache->wait_idle();
+    }
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 

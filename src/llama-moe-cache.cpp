@@ -2110,6 +2110,12 @@ void llama_moe_cache::set_graph(ggml_cgraph * gf) {
     pimpl->set_graph(gf);
 }
 
+void llama_moe_cache::wait_idle() {
+    if (pimpl->gpures) {
+        pimpl->gr_wait_idle();
+    }
+}
+
 int llama_moe_cache_predict_mode() {
     static const int mode = [] {
         const char * v = getenv("LLAMA_DSV41_MOE_PREDICT");

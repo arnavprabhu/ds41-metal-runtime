@@ -68,6 +68,9 @@ public:
 
     // the graph about to be computed: picks up the next-layer prediction tensors (LLAMA_DSV41_MOE_PREDICT=1)
     void set_graph(ggml_cgraph * gf);
+    // LLAMA_DSV41_MOE_GPURES: wait until the worker has planned every layer of the previous graph; it reads that graph's
+    // tensors, so this must run before the graph is reset/rebuilt (a graph without outputs is not synchronized after it)
+    void wait_idle();
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
